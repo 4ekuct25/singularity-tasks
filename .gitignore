@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# секреты и локальные настройки — в репозиторий не попадают никогда
+*.env
+.env*
+!.env.example
+secrets.json
+*.pem
+*.key
+credentials*
+.claude/settings.local.json
+*.bak
+*.bak.*
