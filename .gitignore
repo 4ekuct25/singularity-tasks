@@ -13,3 +13,7 @@ credentials*
 .claude/settings.local.json
 *.bak
 *.bak.*
+
+# привязка к личному трекеру: локальная, в публичный репозиторий не уезжает
+.claude/singularity.json
+.agents/singularity.json
