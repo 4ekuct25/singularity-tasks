@@ -9,9 +9,13 @@
 # Источник правды — этот репозиторий. Каталоги целей перезаписываются целиком:
 # правки, сделанные прямо в них, теряются. В этом и смысл сверки.
 #
-# Формат SKILL.md общий для всех четырёх инструментов, различаются только пути.
-# ВАЖНО: у семейства Gemini пути разные — ~/.gemini/skills это Gemini CLI,
-# а Antigravity читает ~/.gemini/config/skills.
+# Формат SKILL.md общий для всех пяти инструментов, различаются только пути.
+# ВАЖНО, эти каталоги легко перепутать:
+#   ~/.gemini/skills         — Gemini CLI (не Antigravity!)
+#   ~/.gemini/config/skills  — Antigravity
+#   ~/.qwen/skills           — Qwen Code
+# Qwen сканирует ещё и ~/.agents/skills, но ставим только в один каталог: иначе он
+# прочитает скилл дважды и получит два одинаковых описания с теми же триггерами.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,7 +29,8 @@ DIFF_EXCL=(-x __pycache__ -x "*.pyc")
 TARGETS="claude|$HOME/.claude|$HOME/.claude/skills/singularity-tasks
 codex|$HOME/.codex|$HOME/.codex/skills/singularity-tasks
 opencode|$HOME/.config/opencode|$HOME/.config/opencode/skills/singularity-tasks
-antigravity|$HOME/.gemini/config|$HOME/.gemini/config/skills/singularity-tasks"
+antigravity|$HOME/.gemini/config|$HOME/.gemini/config/skills/singularity-tasks
+qwen|$HOME/.qwen|$HOME/.qwen/skills/singularity-tasks"
 
 mode="install"
 only=""

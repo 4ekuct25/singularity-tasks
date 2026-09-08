@@ -8,8 +8,8 @@
   2. macOS Keychain: security find-generic-password -s singularity-app -a rest-token
   3. ~/.claude/.singularity-token (chmod 600)
 
-Привязка репозитория к проекту трекера: <repo>/.claude/singularity.json
-(секретов не содержит, коммитится).
+Привязка репозитория к проекту трекера ищется в <repo>/.agents/singularity.json,
+затем .claude/singularity.json, затем в корне (секретов не содержит, коммитится).
 """
 
 import argparse
@@ -260,7 +260,7 @@ def assert_allowed(project_id, what="проект"):
     return chain[0]
 
 
-# Скилл раскатывается в Claude Code, Codex, OpenCode и Antigravity, поэтому
+# Скилл раскатывается в Claude Code, Codex, OpenCode, Antigravity и Qwen Code,
 # привязка репозитория не должна жить в каталоге одного из них. Новые репозитории
 # получают нейтральный `.agents/`, старый `.claude/` продолжает читаться.
 CONFIG_LOCATIONS = [
@@ -613,7 +613,7 @@ def cmd_init(args):
             plan.append(f"СОЗДАТЬ колонку «{want}» (роль {role})")
 
     # уже привязанный репозиторий переписываем на месте, новый получает
-    # нейтральный `.agents/` — он общий для всех четырёх инструментов
+    # нейтральный `.agents/` — он общий для всех пяти инструментов
     root = os.path.abspath(args.path)
     cfg_path = find_config(root)
     if not cfg_path or not cfg_path.startswith(root + os.sep):

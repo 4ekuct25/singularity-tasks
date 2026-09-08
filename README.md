@@ -11,7 +11,7 @@
 - `scripts/sing.py` — CLI поверх REST API v2, только stdlib
 - `references/api.md` — справочник по API и подводные камни
 
-Формат SKILL.md общий, поэтому один и тот же скилл работает в четырёх инструментах:
+Формат SKILL.md общий, поэтому один и тот же скилл работает в пяти инструментах:
 
 | Инструмент | Куда ставится |
 |---|---|
@@ -19,9 +19,12 @@
 | Codex CLI | `~/.codex/skills/singularity-tasks/` |
 | OpenCode | `~/.config/opencode/skills/singularity-tasks/` |
 | Antigravity | `~/.gemini/config/skills/singularity-tasks/` |
+| Qwen Code | `~/.qwen/skills/singularity-tasks/` |
 
-⚠️ У семейства Gemini пути легко перепутать: `~/.gemini/skills/` — это **Gemini CLI**,
-Antigravity читает `~/.gemini/config/skills/`.
+⚠️ Каталоги легко перепутать: `~/.gemini/skills/` — это **Gemini CLI**, Antigravity читает
+`~/.gemini/config/skills/`, а Qwen Code — `~/.qwen/skills/`. Qwen сканирует ещё и общий
+`~/.agents/skills/`, но копия ставится только в один каталог: из двух он прочитал бы скилл
+дважды и показал два одинаковых описания с теми же триггерами.
 
 Раскатка во все установленные инструменты — одной командой из репозитория-эталона:
 
