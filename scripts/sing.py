@@ -794,10 +794,21 @@ def cmd_show(args):
 
 def cmd_start(args):
     cfg, _ = load_config()
-    assert_task_allowed(args.id, cfg)
+    task = assert_task_allowed(args.id, cfg)
+    if not args.plan and not args.no_plan:
+        die(f"{args.id}: нужен план — что собираешься сделать, в двух-трёх пунктах.\n"
+            f"  sing.py start {args.id} --plan \"...\"\n"
+            "Задача на одно движение и планировать нечего — явно: --no-plan.")
     res = move_to_column(args.id, col_id(cfg, "wip"))
     who = mark_agent(args.id, cfg, args.agent)
-    print(f"{args.id}: {res} (в работе), тег {AGENT_TAG_PREFIX}{who}")
+    if args.plan:
+        # план пишем после захвата: если задачу перехватили, план не мусорит в чужой карточке
+        fresh = request("GET", f"/task/{args.id}")
+        request("PATCH", f"/task/{args.id}",
+                body={"note": note_append(fresh.get("note"),
+                                          f"ПЛАН ({AGENT_TAG_PREFIX}{who}): {args.plan}")})
+    print(f"{args.id}: {res} (в работе), тег {AGENT_TAG_PREFIX}{who}"
+          + (", план записан" if args.plan else ", без плана"))
 
 
 def cmd_release(args):
@@ -810,7 +821,8 @@ def cmd_release(args):
     task = assert_task_allowed(args.id, cfg)
     if args.report:
         request("PATCH", f"/task/{args.id}",
-                body={"note": note_append(task.get("note"), args.report)})
+                body={"note": note_append(task.get("note"),
+                                          "ВОЗВРАТ В ОЧЕРЕДЬ: " + args.report)})
     if int(task.get("checked") or 0) == 1:
         request("POST", f"/task/{args.id}/uncomplete")
     who = agent_name(cfg, args.agent)
@@ -833,10 +845,17 @@ def cmd_report(args):
 def cmd_done(args):
     cfg, _ = load_config()
     task = assert_task_allowed(args.id, cfg)
+    if not args.report and not args.no_report:
+        die(f"{args.id}: нужен результат — что сделано, чем проверено, каким коммитом.\n"
+            f"  sing.py done {args.id} --report \"...\"\n"
+            "Карточка без результата бесполезна: через неделю неясно, что именно закрыли.\n"
+            "Совсем нечего написать — явно: --no-report.")
     if args.report:
-        t = task
+        label = "НА ПРОВЕРКУ" if args.review else "РЕЗУЛЬТАТ"
+        who = agent_name(cfg, getattr(args, "agent", None))
         request("PATCH", f"/task/{args.id}",
-                body={"note": note_append(t.get("note"), args.report)})
+                body={"note": note_append(task.get("note"),
+                                          f"{label} ({AGENT_TAG_PREFIX}{who}): {args.report}")})
     mark_agent(args.id, cfg, getattr(args, "agent", None))
     role = "review" if args.review else "done"
     move_to_column(args.id, col_id(cfg, role))
@@ -942,8 +961,11 @@ def main():
     sp.add_argument("id")
     sp.set_defaults(fn=cmd_show)
 
-    sp = sub.add_parser("start", help="взять задачу в работу (вешает свой agent-тег)")
+    sp = sub.add_parser("start", help="взять задачу в работу: план, колонка, agent-тег")
     sp.add_argument("id")
+    sp.add_argument("--plan", help="что собираешься сделать, в двух-трёх пунктах")
+    sp.add_argument("--no-plan", action="store_true",
+                    help="осознанно без плана (задача на одно движение)")
     sp.add_argument("--agent", help="имя агента (по умолчанию $SINGULARITY_AGENT)")
     sp.set_defaults(fn=cmd_start)
 
@@ -955,7 +977,9 @@ def main():
 
     sp = sub.add_parser("done", help="закрыть задачу (или отправить на проверку)")
     sp.add_argument("id")
-    sp.add_argument("--report", help="текст отчёта в заметку")
+    sp.add_argument("--report", help="результат: что сделано, чем проверено, коммит")
+    sp.add_argument("--no-report", action="store_true",
+                    help="осознанно без результата")
     sp.add_argument("--review", action="store_true", help="в колонку review, не закрывать")
     sp.add_argument("--agent")
     sp.set_defaults(fn=cmd_done)
