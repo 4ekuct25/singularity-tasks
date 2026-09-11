@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -167,6 +168,13 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+# Сервер троттлит: на проекте в тысячу задач обход страниц ловит
+# `429 ThrottlerException`. Без повтора команда падает на ровном месте, причём
+# тем вернее, чем больше проект.
+RETRY_CODES = (429, 500, 502, 503, 504)
+RETRY_TRIES = 5
+
+
 def request(method, path, query=None, body=None, soft=False):
     """soft=True — вернуть None вместо выхода при HTTP-ошибке."""
     url = API + path
@@ -175,40 +183,98 @@ def request(method, path, query=None, body=None, soft=False):
         if clean:
             url += "?" + urllib.parse.urlencode(clean)
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", "Bearer " + get_token())
-    if data:
-        req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            raw = resp.read().decode()
-            return json.loads(raw) if raw.strip() else {}
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")[:500]
-        if soft:
-            return None
-        if e.code == 401:
-            die("401 Unauthorized: токен недействителен или ему не хватает прав.")
-        die(f"{method} {path} -> HTTP {e.code}: {detail}")
-    except urllib.error.URLError as e:
-        die(f"Сеть недоступна для {method} {path}: {e.reason}")
+    delay = 1.0
+    for attempt in range(RETRY_TRIES):
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", "Bearer " + get_token())
+        if data:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                raw = resp.read().decode()
+                return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:500]
+            if e.code in RETRY_CODES and attempt < RETRY_TRIES - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            if soft:
+                return None
+            if e.code == 401:
+                die("401 Unauthorized: токен недействителен или ему не хватает прав.")
+            die(f"{method} {path} -> HTTP {e.code}: {detail}")
+        except urllib.error.URLError as e:
+            if attempt < RETRY_TRIES - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            die(f"Сеть недоступна для {method} {path}: {e.reason}")
 
 
-def paged(path, key, query=None, limit=1000):
-    """Собрать все страницы списка."""
-    items, offset = [], 0
+PAGE_SIZE = 200          # окно одного запроса
+PAGE_HARD_CAP = 50000    # предохранитель: сервер, игнорирующий offset, не должен крутить вечно
+
+
+def paged(path, key, query=None, limit=None, page=PAGE_SIZE):
+    """Собрать ВСЕ страницы списка.
+
+    `limit=None` — без потолка: выборка идёт до пустой страницы. Прежний
+    потолок в 1000 по умолчанию молча резал хвост — на проекте в 1150 задач
+    board показывал «1000», и отличить это от правды было невозможно.
+    `limit` остался для тех, кому хватает первой страницы (doctor).
+
+    Два правила, за которые заплачено замером на живом API:
+
+    * **offset шагает по ЗАПРОШЕННОМУ окну, а не по числу отданных строк.**
+      Сервер при выборке задач post-фильтрует уже отобранные строки (см.
+      references/api.md), и `count` выходит меньше `maxCount`. Шаг по
+      `len(batch)` тогда сдвигает окно внахлёст: строки повторяются, хвост
+      не доезжает.
+    * **Выход — по пустой странице, а не по `offset >= total`.** `total`
+      считается сервером до post-фильтра, поэтому как условие остановки он
+      ненадёжен; здесь он нужен только чтобы заметить недобор. Цена честности —
+      один лишний запрос на вызов.
+    """
+    items, seen, offset, total = [], set(), 0, None
     q = dict(query or {})
-    while len(items) < limit:
-        q.update({"maxCount": min(200, limit - len(items)), "offset": offset,
-                  "paginationData": "true"})
-        resp = request("GET", path, query=q)
-        batch = resp.get(key, [])
-        items.extend(batch)
-        pg = resp.get("pagination") or {}
-        total = pg.get("total")
-        offset += max(len(batch), 1)
-        if not batch or (total is not None and offset >= total):
+    while True:
+        want = page if limit is None else min(page, limit - len(items))
+        if want <= 0:
             break
+        q.update({"maxCount": want, "offset": offset, "paginationData": "true"})
+        resp = request("GET", path, query=q)
+        batch = resp.get(key) or []
+        pg = resp.get("pagination") or {}
+        if pg.get("total") is not None:
+            total = pg["total"]
+        fresh = 0
+        for it in batch:
+            ident = it.get("id") if isinstance(it, dict) else None
+            if ident is not None:
+                if ident in seen:
+                    continue           # окна могут перекрыться — дубли не копим
+                seen.add(ident)
+            items.append(it)
+            fresh += 1
+        if not batch:
+            break
+        if fresh == 0:
+            # страница непустая, но вся из уже виденного: окно стоит на месте.
+            # Считать предохранителем число СОБРАННЫХ объектов тут нельзя — при
+            # дедупликации оно перестаёт расти, и цикл становится вечным.
+            die(f"GET {path}: сервер вернул страницу целиком из уже полученных "
+                f"объектов на offset={offset} — окно не двигается. Прерываю.")
+        offset += want
+        if limit is None and total is not None and len(items) >= total:
+            break     # собрали ровно столько, сколько обещал сервер — добор не нужен
+        if len(items) >= PAGE_HARD_CAP:
+            die(f"GET {path}: выборка перевалила {PAGE_HARD_CAP} объектов. "
+                "Прерываю, чтобы не крутить вечно.")
+    if limit is None and total is not None and len(items) < total:
+        # молчаливый недобор — ровно та ошибка, из-за которой правилась эта функция
+        print(f"⚠ GET {path}: сервер обещал {total} объектов, собрано {len(items)}. "
+              "Выборка неполная — выводы по ней делать нельзя.", file=sys.stderr)
     return items
 
 
