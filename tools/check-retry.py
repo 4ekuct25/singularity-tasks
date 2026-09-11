@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -97,6 +98,13 @@ def run(sing, name, script, method="GET", path="/task", body=None, soft=False,
     gaps = [round(STATE["log"][i + 1][2] - STATE["log"][i][2], 2)
             for i in range(attempts - 1)]
     message = err.getvalue().strip().replace("\n", " ")[:120]
+    return verdict(name, attempts, gaps, elapsed, outcome, message, expect, verbose)
+
+
+def verdict(name, attempts, gaps, elapsed, outcome, message, expect, verbose):
+    """Сверить замер с ожиданием и напечатать строку. Общая для всех сценариев:
+    молчащий сервер меряется другим способом, но судиться должен по тем же правилам.
+    """
     ok = True
     notes = []
     if expect:
@@ -120,44 +128,122 @@ def run(sing, name, script, method="GET", path="/task", body=None, soft=False,
     return ok
 
 
-def hang_check(sing):
-    """Сервер принял соединение и молчит — это НЕ «сеть недоступна».
+@contextlib.contextmanager
+def dead_server(mode):
+    """Сервер, который ПРИНЯЛ TCP-соединение и не ответил.
 
-    Диагностика, а не сценарий: connect-timeout urllib заворачивает в URLError,
-    а read-timeout прилетает голым TimeoutError из getresponse() — мимо обоих
-    except в request(). Печатаем факт, чинить — отдельной задачей.
+    Это не «порт закрыт» (там ConnectionRefused, и urllib заворачивает его в
+    URLError) и не HTTP-ошибка: соединение установлено, запрос ушёл, ответа нет.
+    urllib оборачивает в URLError только фазу установки соединения и отправки;
+    всё, что случилось в getresponse()/read(), прилетает как есть.
+
+        mode="silent" — молчит до победного: read-timeout, голый TimeoutError
+        mode="drop"   — дочитывает запрос и закрывает: EOF,
+                        http.client.RemoteDisconnected
+
+    Заглушка на http.server для этого не годится: она обязана ответить.
+    Отдаёт (базовый URL, список отметок времени приёма соединений) — считать
+    попытки больше нечем, до обработчика запросы не доходят.
     """
-    import socket
     lsock = socket.socket()
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     lsock.bind(("127.0.0.1", 0))
-    lsock.listen(5)
-    port = lsock.getsockname()[1]
-    accepted = []
+    lsock.listen(16)
+    # ⚠ ссылки на принятые соединения держим намеренно: без них сборщик мусора
+    # закроет сокет, и «молчание» превратится в EOF — другое исключение, другая
+    # ветка, сценарий проверит не то
+    accepted, stamps = [], []
 
-    def accept_forever():
+    def serve():
         while True:
             try:
-                accepted.append(lsock.accept()[0])   # приняли и молчим
-            except OSError:
+                conn, _ = lsock.accept()
+            except OSError:              # закрыли слушающий сокет — выходим
                 return
+            accepted.append(conn)
+            stamps.append(time.monotonic())
+            if mode == "drop":
+                # дочитываем запрос целиком и только потом рвём: закрыть раньше,
+                # чем клиент допишет, — это BrokenPipe на отправке, а он уже
+                # заворачивается в URLError и проверял бы старую ветку
+                conn.settimeout(5)
+                buf = b""
+                with contextlib.suppress(OSError):
+                    while b"\r\n\r\n" not in buf:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                conn.close()
 
-    threading.Thread(target=accept_forever, daemon=True).start()
-    saved = (sing.API, sing.NET_TIMEOUT)
-    sing.API, sing.NET_TIMEOUT = f"http://127.0.0.1:{port}", 2
-    started = time.monotonic()
+    threading.Thread(target=serve, daemon=True).start()
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            sing.request("GET", "/project")
-        outcome = "вернулись данные (?!)"
-    except SystemExit as e:
-        outcome = f"обработано, exit {e.code}"
-    except BaseException as e:                       # noqa: BLE001 — это и меряем
-        outcome = f"НЕОБРАБОТАННОЕ {type(e).__module__}.{type(e).__name__}: {e}"
+        yield f"http://127.0.0.1:{lsock.getsockname()[1]}", stamps
     finally:
-        sing.API, sing.NET_TIMEOUT = saved
         lsock.close()
-    print(f"\n[диагностика] сервер принял соединение и молчит (NET_TIMEOUT=2): "
-          f"{time.monotonic() - started:.2f} с, {outcome}")
+        for conn in accepted:
+            with contextlib.suppress(OSError):
+                conn.close()
+
+
+def hang_run(sing, name, mode="silent", method="GET", body=None, soft=False,
+             patch=None, expect=None, verbose=False):
+    """Прогнать сценарий против неотвечающего сервера и вернуть замер."""
+    with dead_server(mode) as (base, stamps):
+        saved = {k: getattr(sing, k) for k in (patch or {})}
+        saved["API"] = sing.API
+        sing.API = base
+        for k, v in (patch or {}).items():
+            setattr(sing, k, v)
+        err = io.StringIO()
+        started = time.monotonic()
+        try:
+            with contextlib.redirect_stderr(err):
+                result = sing.request(method, "/project", body=body, soft=soft)
+            outcome = "None" if result is None else f"ok {result}"
+        except SystemExit as e:
+            outcome = f"exit {e.code}"
+        except BaseException as e:       # noqa: BLE001 — необработанное и есть баг
+            outcome = f"НЕОБРАБОТАННОЕ {type(e).__module__}.{type(e).__name__}: {e}"
+        finally:
+            elapsed = time.monotonic() - started
+            for k, v in saved.items():
+                setattr(sing, k, v)
+    attempts = len(stamps)
+    gaps = [round(stamps[i + 1] - stamps[i], 2) for i in range(attempts - 1)]
+    message = err.getvalue().strip().replace("\n", " ")[:120]
+    return verdict(name, attempts, gaps, elapsed, outcome, message, expect, verbose)
+
+
+def hang_cases(sing, verbose=False):
+    """Сервер принял соединение и не ответил — это сетевой сбой, а не traceback.
+
+    NET_TIMEOUT=1 и NET_BACKOFF=0.5 на прогон: ждать по 45 с ради одного факта
+    незачем, а пропорции повторов от этого не меняются.
+    """
+    fast = {"NET_TIMEOUT": 1, "NET_BACKOFF": 0.5}
+    print()
+    cases = [
+        ("read-timeout на GET — тот же сетевой сбой: 3 попытки, паузы 0.5 + 1.0",
+         dict(patch=fast,
+              expect={"attempts": 3, "wait": (4.2, 5.8), "outcome": "exit 1",
+                      "stderr": "Сеть недоступна"})),
+        ("read-timeout на POST — не идемпотентен, ровно одна попытка",
+         dict(method="POST", body={"title": "x"}, patch=fast,
+              expect={"attempts": 1, "wait": (0.8, 2.0), "outcome": "exit 1",
+                      "stderr": "Сеть недоступна"})),
+        ("read-timeout при soft=True — None, а не необработанное исключение",
+         dict(soft=True, patch=fast,
+              expect={"attempts": 3, "wait": (4.2, 5.8), "outcome": "None"})),
+        ("соединение закрыто без ответа (RemoteDisconnected) — тоже сетевой сбой",
+         dict(mode="drop", patch=fast,
+              expect={"attempts": 3, "wait": (1.2, 2.6), "outcome": "exit 1",
+                      "stderr": "Сеть недоступна"})),
+    ]
+    passed = 0
+    for name, kw in cases:
+        passed += bool(hang_run(sing, name, verbose=verbose, **kw))
+    return passed, len(cases)
 
 
 def cli_check():
@@ -303,10 +389,11 @@ def main():
     passed = 0
     for name, script, kw in cases:
         passed += bool(run(sing, name, script, verbose=verbose, **kw))
-    hang_check(sing)
+    hang_passed, hang_total = hang_cases(sing, verbose)
+    passed += hang_passed
     srv.shutdown()
     srv.server_close()
-    total = len(cases)
+    total = len(cases) + hang_total
     print(f"\nсценариев: {total}, сошлось: {passed}, разошлось: {total - passed}")
     sys.exit(0 if passed == total else 1)
 
