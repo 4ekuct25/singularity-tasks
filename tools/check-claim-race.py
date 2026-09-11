@@ -17,6 +17,7 @@
 успевает закончить раньше, чем второй начнёт, и тест молча зеленеет.
 """
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -30,24 +31,16 @@ sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
 import sing  # noqa: E402
 
 
-def make_scratch(title):
-    root = sing.resolve_root()
-    p = sing.request("POST", "/project", body={"title": title, "parent": root["id"]})
-    p = p.get("project", p)
-    sing.forget_projects()
-    statuses = {s["id"]: s for s in sing.project_statuses(p["id"])}
-    cols = {}
-    for role, suf in sing.SYSTEM_SUFFIX.items():
-        sid = f"KS-{p['id']}{suf}"
-        if sid not in statuses:
-            sys.exit(f"у чернового проекта нет системной колонки {role} — тест негоден")
-        cols[role] = sid
-    for role, name in (("review", "На проверке"), ("blocked", "Заблокировано")):
-        st = sing.request("POST", "/kanban-status",
-                          body={"name": name, "projectId": p["id"],
-                                "kanbanOrder": 75000 if role == "review" else 150000})
-        cols[role] = st["id"]
-    return p, cols
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# Черновой проект заводится и сносится одним кодом на все проверки — иначе
+# «создай проект и добери колонки» живёт в трёх копиях и разъезжается.
+zz = _load("zz_project", os.path.join(HERE, "zz-project.py"))
 
 
 def main():
@@ -56,7 +49,7 @@ def main():
     ap.add_argument("--keep", action="store_true", help="не удалять черновой проект")
     args = ap.parse_args()
 
-    proj, cols = make_scratch("zz-race")
+    proj, cols = zz.create_draft(sing, "zz-race", with_columns=True)
     print(f"черновой проект: {proj['id']}")
     workdir = tempfile.mkdtemp(prefix="zz-race-")
     os.makedirs(os.path.join(workdir, ".agents"), exist_ok=True)
