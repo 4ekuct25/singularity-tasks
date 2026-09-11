@@ -725,9 +725,18 @@ def assert_task_allowed(task_id, cfg=None):
 
 
 def col_id(cfg, role):
+    """id колонки под роль — или отказ.
+
+    Асимметрия с `board` намеренная и одинаково честная: команда, которая двигает
+    задачу (`start`, `move`, `next`, `list`), без колонки сделать нечего — она
+    отказывает; `board` только читает и обязан показать остальную доску, поэтому
+    помечает роль и идёт дальше. Чего быть не должно ни там, ни там — молчаливая
+    подмена содержимого (см. board_layout).
+    """
     cid = (cfg.get("columns") or {}).get(role)
     if not cid:
-        die(f"В .claude/{CONFIG_NAME} нет колонки '{role}'. Перезапусти init.")
+        die(f"В привязке ({find_config() or CONFIG_NAME}) нет колонки '{role}'.\n"
+            "  посмотреть целиком: sing.py doctor  ·  починить: sing.py init --apply")
     return cid
 
 
@@ -974,6 +983,13 @@ def cmd_doctor(args):
             if not s.get("removed")}
     for role in COLUMN_ORDER:
         cid = (cfg.get("columns") or {}).get(role)
+        # Два разных диагноза, и путать их дорого: «пропала в трекере» отправляет
+        # искать, кто удалил колонку, хотя в привязке её id не было никогда —
+        # колонка при этом может спокойно жить на доске (её видно в board,
+        # в блоке «КОЛОНКИ МИМО ПРИВЯЗКИ»).
+        if not cid:
+            print(f"  ✗ {role:8} -> НЕТ В ПРИВЯЗКЕ — роли нет в {CONFIG_NAME}")
+            continue
         mark = "✓" if cid in live else "✗"
         print(f"  {mark} {role:8} -> {live.get(cid, 'КОЛОНКА ПРОПАЛА В ТРЕКЕРЕ')}")
     used_ids = set((cfg.get("columns") or {}).values())
@@ -1235,6 +1251,34 @@ def board_pad(holders):
     return pad
 
 
+UNBOUND_COLUMN = "колонки нет в привязке"
+
+
+def board_layout(cfg, by_col, statuses, limit):
+    """Разложить задачи по ролям: (роль, id колонки, название, все, показываемые).
+
+    Чистая — сети не трогает, поэтому проверяется без токена.
+
+    Роль, которой нет в привязке, получает cid=None и ЗАВЕДОМО ПУСТОЙ список.
+    Раньше здесь стояло `by_col.get(cid)`, а `by_col[None]` — это задачи ВНЕ
+    колонок: доска печатала их под каждой непривязанной ролью, то есть показывала
+    то, чего на доске нет, да ещё и повторно (T-278ad639). Пустой список — не
+    утверждение «задач нет»: задачи под эту роль могут стоять в живой колонке,
+    которую привязка потеряла, и тогда их видно в блоке «КОЛОНКИ МИМО ПРИВЯЗКИ».
+    """
+    layout = []
+    for role in COLUMN_ORDER:
+        cid = (cfg.get("columns") or {}).get(role)
+        items = by_col.get(cid, []) if cid else []
+        shown = items
+        if role == "done":  # закрытых копится много — показываем свежие
+            shown = sorted(items, key=lambda t: t.get("modificatedDate") or "",
+                           reverse=True)[:limit]
+        name = statuses.get(cid, "?") if cid else UNBOUND_COLUMN
+        layout.append((role, cid, name, items, sorted(shown, key=prio_of)))
+    return layout
+
+
 def cmd_board(args):
     cfg, _ = load_config()
     statuses = {s["id"]: s["name"] for s in project_statuses(cfg["projectId"])}
@@ -1246,16 +1290,7 @@ def cmd_board(args):
     # Раскладку считаем до печати: и теги, и ширина колонки держателя должны
     # опираться на то, что реально попадёт на экран, а не на весь проект —
     # иначе скрытые под --limit закрытые задачи раздвигали бы доску.
-    layout = []
-    for role in COLUMN_ORDER:
-        cid = (cfg.get("columns") or {}).get(role)
-        items = by_col.get(cid, [])
-        shown = items
-        if role == "done":  # закрытых копится много — показываем свежие
-            shown = sorted(items, key=lambda t: t.get("modificatedDate") or "",
-                           reverse=True)[:args.limit]
-        layout.append((role, cid, statuses.get(cid, "?"), items,
-                       sorted(shown, key=prio_of)))
+    layout = board_layout(cfg, by_col, statuses, args.limit)
     # задачу из дневника «вне колонок» показывать незачем: она закрыта и унесена
     # приложением, а не потеряна — сирота, которую надо чинить, выглядит иначе
     loose = [t for t in by_col.get(None, [])
@@ -1268,6 +1303,16 @@ def cmd_board(args):
     # Плохие новости — вперёд. Сирота без колонки и лишние колонки печатались
     # последними и ничем не выделялись: на живой сессии агент не заметил ни того,
     # ни другого за шесть вызовов подряд и завёл дубль задачи.
+    #
+    # Роль без колонки — первой: пока привязка неполная, доска неполна целиком,
+    # и половину команд (start/next/list/move) она всё равно не пустит.
+    # Диагноз «пропала в трекере» или «никогда не привязывали» ставит doctor —
+    # здесь только факт и ссылка на него.
+    unbound = [role for role, cid, *_ in layout if not cid]
+    if unbound:
+        print(f"\n⚠ РОЛЕЙ БЕЗ КОЛОНКИ — {len(unbound)} ({', '.join(unbound)}): "
+              "привязка неполная, задачи по этим ролям доска не покажет."
+              "\n  разобраться: sing.py doctor  ·  починить: sing.py init --apply")
     if loose:
         print(f"\n⚠ ВНЕ КОЛОНОК — {len(loose)}: задача есть, на доске её не видно."
               "\n  почини: sing.py move <id> <роль>")
@@ -1282,6 +1327,11 @@ def cmd_board(args):
             print(f"  {cid}  «{name}»  задач={len(by_col.get(cid, []))}")
 
     for role, cid, name, items, shown in layout:
+        if not cid:
+            # Счётчика намеренно нет: «— 0» читалось бы как «в колонке пусто», а
+            # про колонку, которой нет в привязке, доска не знает ничего.
+            print(f"\n[{role}] {name} — sing.py doctor")
+            continue
         print(f"\n[{role}] {name} — {len(items)}"
               + (f" (показаны {len(shown)})" if len(shown) < len(items) else ""))
         for t in shown:
