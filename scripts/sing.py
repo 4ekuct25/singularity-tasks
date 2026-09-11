@@ -1226,14 +1226,7 @@ def cmd_next(args):
     note = note_to_text(t.get("note"))
     if note:
         print("\n--- заметка ---\n" + note)
-    items = sorted(
-        (c for c in paged("/checklist-item", "checklistItems", {"parent": t["id"]})
-         if not c.get("removed")),
-        key=lambda c: (c.get("parentOrder") if c.get("parentOrder") is not None else 0))
-    if items:
-        print("\n--- чек-лист ---")
-        for c in items:
-            print(("  [x] " if c.get("done") else "  [ ] ") + c.get("title", ""))
+    print_checklist(checklist_items(t["id"]))
     print(f"\nВзять в работу: sing.py start {t['id']}")
 
 
@@ -1279,6 +1272,10 @@ def cmd_show(args):
     note = note_to_text(t.get("note"))
     if note:
         print("\n--- заметка ---\n" + note)
+    # Чек-лист `show` не показывал вовсе, хотя `next` показывал: карточка,
+    # открытая по T-id, выглядела как задача без шагов — и прогресс внутри
+    # задачи был не виден ровно там, где его смотрят.
+    print_checklist(checklist_items(args.id))
 
 
 def cmd_start(args):
@@ -1467,16 +1464,154 @@ def cmd_rm(args):
     print(f"{args.id}: удалена — {title}")
 
 
+def checklist_items(task_id):
+    """Пункты чек-листа задачи в ТОМ ЖЕ порядке, в каком их видит агент.
+
+    Один источник порядка на показ и на поиск — принципиально: ссылаться на
+    пункт по номеру можно только если нумерация в выводе `show`/`next` и
+    нумерация в `check` считаются одинаково. Разойдись сортировка — команда
+    молча отметит соседний пункт.
+    """
+    items = [c for c in paged("/checklist-item", "checklistItems", {"parent": task_id})
+             if not c.get("removed")]
+    return sorted(items, key=lambda c: (c.get("parentOrder")
+                                        if c.get("parentOrder") is not None else 0))
+
+
+def item_done(item):
+    return bool(item.get("done"))
+
+
+def print_checklist(items, indent="  "):
+    """Показать чек-лист с номерами и прогрессом.
+
+    Номер — не украшение: это дешёвый способ сослаться на пункт, и он обязан
+    быть в каждом выводе чек-листа, иначе агенту придётся делать лишний запрос
+    ради `CH-`id.
+    """
+    if not items:
+        return
+    ready = sum(1 for c in items if item_done(c))
+    print(f"\n--- чек-лист {ready}/{len(items)} ---")
+    for n, c in enumerate(items, 1):
+        print(f"{indent}{n}. " + ("[x] " if item_done(c) else "[ ] ")
+              + plain(c.get("title", "")))
+
+
+def resolve_item(items, ref):
+    """Найти пункт чек-листа по номеру из вывода, тексту или CH-id.
+
+    Три способа, потому что ссылаются на пункт трое разных: агент только что
+    прочитал `show`/`next` и держит в руках номер; человек смотрит в карточку и
+    называет пункт словами; скрипт знает `CH-`id. Требовать id было бы лишним
+    запросом на каждую отметку, а запрещать текст — заставлять человека считать
+    строки.
+
+    Неоднозначность — отказ, а не «возьму первый»: отмеченный не тот пункт
+    выглядит как выполненная работа, и никто не пойдёт это перепроверять.
+    """
+    ref = (ref or "").strip()
+    if ref.startswith("CH-"):
+        hit = next((c for c in items if c.get("id") == ref), None)
+        if not hit:
+            die(f"«{ref}»: такого пункта в чек-листе этой задачи нет.")
+        return hit
+    if re.fullmatch(r"\d+", ref):
+        n = int(ref)
+        if not 1 <= n <= len(items):
+            die(f"«{ref}»: в чек-листе {len(items)} пункт(ов), номера — от 1 "
+                f"до {len(items)}.")
+        return items[n - 1]
+    low = ref.casefold()
+    if not low:
+        die("Пустая ссылка на пункт: нужен номер, текст пункта или CH-id.")
+    # Точное совпадение бьёт подстроку: пункт «тесты» не должен спорить с
+    # пунктом «тесты на пагинацию», если назвали его целиком.
+    pool = [c for c in items if plain(c.get("title", "")).strip().casefold() == low]
+    if not pool:
+        pool = [c for c in items if low in plain(c.get("title", "")).casefold()]
+    if not pool:
+        die(f"«{ref}»: пункт не найден. Список — sing.py checklist <T-id>.")
+    if len(pool) > 1:
+        listing = "\n".join("    " + plain(c.get("title", "")) for c in pool)
+        die(f"«{ref}»: под описание подходит пунктов — {len(pool)}:\n{listing}\n"
+            "  уточни текст или сошлись на номер из вывода show/next.")
+    return pool[0]
+
+
 def cmd_checklist(args):
     cfg, _ = load_config(required=False)
     assert_task_allowed(args.id, cfg)
-    existing = [c for c in paged("/checklist-item", "checklistItems", {"parent": args.id})
-                if not c.get("removed")]
+    if not args.items:
+        # Без аргументов — показать: нумерованный список и есть тот вход, по
+        # которому потом зовут check, а отдельная команда ради этого лишняя.
+        items = checklist_items(args.id)
+        if not items:
+            print(f"{args.id}: чек-листа нет.")
+            return
+        print_checklist(items)
+        return
+    existing = checklist_items(args.id)
     base = max((c.get("parentOrder") or 0 for c in existing), default=-1) + 1
     for i, title in enumerate(args.items):
         request("POST", "/checklist-item",
                 body={"parent": args.id, "title": title, "parentOrder": base + i})
+    fresh = checklist_items(args.id)
+    # По коду ответа не верим (AGENTS.md §4): сверяем, что пункты реально легли.
+    added = len(fresh) - len(existing)
+    if added != len(args.items):
+        die(f"{args.id}: отправлено пунктов {len(args.items)}, а в задаче их стало "
+            f"больше на {added}. Сервер ответил, но применил не всё.")
     print(f"{args.id}: добавлено пунктов — {len(args.items)}")
+    print_checklist(fresh)
+
+
+def set_checklist(args, done):
+    """`check` / `uncheck`: отметить пункты и УБЕДИТЬСЯ, что отметка встала.
+
+    `POST /checklist-item/{id}/check` отвечает 200 и на пункте, который не
+    изменился, поэтому единственная настоящая проверка — перечитать список
+    тем же запросом, каким его показывают `show`/`next`, и посмотреть на `done`.
+    """
+    cfg, _ = load_config(required=False)
+    assert_task_allowed(args.id, cfg)
+    items = checklist_items(args.id)
+    if not items:
+        die(f"{args.id}: чек-листа нет — отмечать нечего.\n"
+            f"  завести: sing.py checklist {args.id} \"шаг 1\" \"шаг 2\"")
+    # Сначала разбираем ВСЕ ссылки и только потом пишем: отказ на третьем
+    # аргументе не должен оставить половину пунктов отмеченной.
+    targets, seen = [], set()
+    for ref in args.items:
+        hit = resolve_item(items, ref)
+        if hit["id"] not in seen:
+            seen.add(hit["id"])
+            targets.append(hit)
+    verb = "check" if done else "uncheck"
+    touched = [c for c in targets if item_done(c) != done]
+    for c in touched:
+        request("POST", f"/checklist-item/{c['id']}/{verb}")
+    fresh = {c["id"]: c for c in checklist_items(args.id)}
+    stuck = [c for c in touched if item_done(fresh.get(c["id"], c)) != done]
+    if stuck:
+        names = ", ".join(plain(c.get("title", "")) for c in stuck)
+        die(f"{args.id}: сервер ответил 200, но done не изменился у пунктов: {names}.\n"
+            "  Состояние трекера не изменилось так, как ожидалось.")
+    word = "отмечено" if done else "снято отметок"
+    skipped = len(targets) - len(touched)
+    tail = f", уже было — {skipped}" if skipped else ""
+    print(f"{args.id}: {word} — {len(touched)}{tail}")
+    print_checklist(sorted(fresh.values(),
+                           key=lambda c: (c.get("parentOrder")
+                                          if c.get("parentOrder") is not None else 0)))
+
+
+def cmd_check(args):
+    set_checklist(args, done=True)
+
+
+def cmd_uncheck(args):
+    set_checklist(args, done=False)
 
 
 # ------------------------------------------------------------- сверка с эталоном
@@ -1681,10 +1816,24 @@ def main():
     sp.add_argument("--yes", action="store_true", help="подтвердить удаление")
     sp.set_defaults(fn=cmd_rm)
 
-    sp = sub.add_parser("checklist", help="добавить пункты чек-листа в задачу")
+    sp = sub.add_parser("checklist", help="чек-лист задачи: показать или добавить пункты")
     sp.add_argument("id")
-    sp.add_argument("items", nargs="+")
+    sp.add_argument("items", nargs="*",
+                    help="пункты для добавления; без них — показать текущий чек-лист")
     sp.set_defaults(fn=cmd_checklist)
+
+    ITEM_REF = ("номер из вывода show/next, текст пункта "
+                "(точное совпадение или однозначная часть) либо CH-id")
+
+    sp = sub.add_parser("check", help="отметить пункт чек-листа выполненным")
+    sp.add_argument("id")
+    sp.add_argument("items", nargs="+", metavar="ПУНКТ", help=ITEM_REF)
+    sp.set_defaults(fn=cmd_check)
+
+    sp = sub.add_parser("uncheck", help="снять отметку с пункта чек-листа")
+    sp.add_argument("id")
+    sp.add_argument("items", nargs="+", metavar="ПУНКТ", help=ITEM_REF)
+    sp.set_defaults(fn=cmd_uncheck)
 
     args = p.parse_args()
     args.fn(args)
