@@ -612,29 +612,80 @@ def task_links(task_id, include_removed=False):
     return paged("/kanban-task-status", "kanbanTaskStatuses", q)
 
 
-def task_column(task_id):
-    live = [l for l in task_links(task_id) if not l.get("removed")]
+def task_project(task_id):
+    return request("GET", f"/task/{task_id}").get("projectId")
+
+
+_PROJECT_STATUS_IDS = {}
+
+
+def project_status_ids(project_id):
+    """id колонок проекта — множеством, с памяткой на процесс.
+
+    Системные колонки добавляются по детерминированному id, даже если GET их
+    ещё не отдал: в проекте, заведённом в приложении, список колонок бывает
+    пустым до первой синхронизации (см. references/api.md).
+    """
+    if project_id not in _PROJECT_STATUS_IDS:
+        ids = {s["id"] for s in project_statuses(project_id) if not s.get("removed")}
+        ids.update(system_status_id(project_id, role) for role in SYSTEM_SUFFIX)
+        _PROJECT_STATUS_IDS[project_id] = ids
+    return _PROJECT_STATUS_IDS[project_id]
+
+
+def board_links(task_id, project_id=None, include_removed=False):
+    """Связки задачи, относящиеся к доске ЕЁ проекта.
+
+    Связка у задачи не одна. Кроме колонки своего проекта бывает связка с
+    системной доской «Сегодня»: псевдопроект `P-TODAY` со своими колонками,
+    id связки `KTS-<taskId>-TODAY`. Брать первую попавшуюся нельзя — по живому
+    аккаунту таких связок половина, и все они у задач, лежащих в обычных
+    проектах. Поэтому связка выбирается по принадлежности её `statusId`
+    колонкам нужного проекта, как это делает column_map().
+
+    Живые связки идут первыми: помеченная удалённой — след снесённой колонки,
+    воскресить её PATCH-ем всё равно нельзя.
+    """
+    project_id = project_id or task_project(task_id)
+    own = project_status_ids(project_id) if project_id else set()
+    links = [l for l in task_links(task_id, include_removed=include_removed)
+             if l.get("statusId") in own]
+    return sorted(links, key=lambda l: bool(l.get("removed")))
+
+
+def task_column(task_id, project_id=None):
+    """Колонка задачи на доске её проекта. None — задача вне колонок.
+
+    project_id можно передать, чтобы не ходить за проектом задачи ещё раз;
+    без него проект берётся из самой задачи.
+    """
+    live = [l for l in board_links(task_id, project_id) if not l.get("removed")]
     return live[0]["statusId"] if live else None
 
 
-def move_to_column(task_id, status_id, fatal=True):
+def move_to_column(task_id, status_id, fatal=True, project_id=None):
     """Идемпотентно поставить задачу в колонку и УБЕДИТЬСЯ, что она там.
 
     POST /task/{id}/change-column не используется намеренно: на системных
     колонках проекта он отвечает 200, но связку не меняет. Правим связку сама.
 
-    Связка у задачи одна и её id детерминирован (`KTS-<taskId>`), поэтому повтор
-    здесь безопасен — в отличие от `POST /task`. Ради этого и повторяем: таймаут
-    ровно на этом запросе оставлял задачу вообще без колонки.
+    Id связки детерминирован (`KTS-<taskId>`), поэтому повтор здесь безопасен —
+    в отличие от `POST /task`. Ради этого и повторяем: таймаут ровно на этом
+    запросе оставлял задачу вообще без колонки.
+
+    ⚠ Правится только связка доски СВОЕГО проекта. PATCH по первой попавшейся
+    снял бы задачу с доски «Сегодня» — это порча данных пользователя, а не
+    косметика: связка там одна и переезжает целиком.
 
     fatal=False — вернуть None вместо die: вызывающий сам решит, что сказать
     (например, `add` обязан назвать уже созданный T-id, иначе его не найти).
     """
-    if task_column(task_id) == status_id:
+    project_id = project_id or task_project(task_id)
+    if task_column(task_id, project_id) == status_id:
         return "уже в колонке"
     action = None
     for attempt in range(1, NET_RETRIES + 1):
-        link = next(iter(task_links(task_id, include_removed=True)), None)
+        link = next(iter(board_links(task_id, project_id, include_removed=True)), None)
         if link and not link.get("removed"):
             request("PATCH", f"/kanban-task-status/{link['id']}",
                     body={"statusId": status_id}, soft=True)
@@ -644,11 +695,11 @@ def move_to_column(task_id, status_id, fatal=True):
             request("POST", "/kanban-task-status",
                     body={"taskId": task_id, "statusId": status_id}, soft=True)
             action = "привязана к колонке"
-        if task_column(task_id) == status_id:
+        if task_column(task_id, project_id) == status_id:
             return action
         if attempt < NET_RETRIES:
             time.sleep(NET_BACKOFF * attempt)
-    actual = task_column(task_id)
+    actual = task_column(task_id, project_id)
     if not fatal:
         return None
     die(f"{task_id}: перенос не применился за {NET_RETRIES} попытки — колонка "
@@ -842,9 +893,10 @@ def doctor_write_steps(cfg, results, probe):
 
     # todo -> wip -> todo: move_to_column сам перечитывает связку и падает,
     # если перенос не применился, — SystemExit ловится уровнем выше.
-    move_to_column(tid, col_id(cfg, "todo"))
-    move_to_column(tid, col_id(cfg, "wip"))
-    move_to_column(tid, col_id(cfg, "todo"))
+    pid = cfg["projectId"]
+    move_to_column(tid, col_id(cfg, "todo"), project_id=pid)
+    move_to_column(tid, col_id(cfg, "wip"), project_id=pid)
+    move_to_column(tid, col_id(cfg, "todo"), project_id=pid)
     _check(results, "канбан-связка", task_column(tid) == col_id(cfg, "todo"),
            "todo → wip → todo, колонка перечитана после каждого шага")
 
@@ -1344,7 +1396,7 @@ def cmd_show(args):
     print(brief(t))
     # Колонка и теги — не украшение: по карточке не было видно ни где задача на
     # доске, ни держит ли её уже другой агент, а инструментов над этим трекером пять.
-    cid = task_column(args.id)
+    cid = task_column(args.id, t.get("projectId"))
     roles = {v: k for k, v in (cfg or {}).get("columns", {}).items()}
     names = {s["id"]: s["name"] for s in project_statuses(t["projectId"])}
     where = "ВНЕ КОЛОНОК ⚠" if not cid else f"{names.get(cid, cid)} [{roles.get(cid, 'мимо привязки')}]"
@@ -1370,7 +1422,7 @@ def cmd_start(args):
             "Задача на одно движение и планировать нечего — явно: --no-plan.")
     # Захват — первым действием: проигравший гонку не должен успеть подвинуть доску.
     who = claim_task(args.id, cfg, args.agent, take_over=args.take_over)
-    res = move_to_column(args.id, col_id(cfg, "wip"))
+    res = move_to_column(args.id, col_id(cfg, "wip"), project_id=cfg["projectId"])
     if args.plan:
         # план пишем после захвата: если задачу перехватили, план не мусорит в чужой карточке
         fresh = request("GET", f"/task/{args.id}")
@@ -1398,7 +1450,7 @@ def cmd_release(args):
     who = agent_name(cfg, args.agent)
     tag_id = find_tag(AGENT_TAG_PREFIX + who)
     dropped = drop_task_tag(args.id, tag_id) if tag_id else False
-    move_to_column(args.id, col_id(cfg, "todo"))
+    move_to_column(args.id, col_id(cfg, "todo"), project_id=cfg["projectId"])
     print(f"{args.id}: возвращена в очередь"
           + (f", тег {AGENT_TAG_PREFIX}{who} снят" if dropped else ""))
 
@@ -1424,7 +1476,7 @@ def cmd_done(args):
     # штатным путём: `done` по задаче из очереди закрывал её с РЕЗУЛЬТАТОМ, но
     # вообще без ПЛАНА. Наблюдали на живой сессии — карточка T-fcbdb208.
     if not args.no_plan and "ПЛАН (" not in note_to_text(task.get("note")):
-        col = task_column(args.id)
+        col = task_column(args.id, cfg["projectId"])
         if col != col_id(cfg, "wip"):
             die(f"{args.id}: задача не бралась в работу — ни ПЛАНа в карточке, ни "
                 "колонки «в работе».\n"
@@ -1438,7 +1490,7 @@ def cmd_done(args):
                                           label=f"{label} ({AGENT_TAG_PREFIX}{who})")})
     mark_agent(args.id, cfg, getattr(args, "agent", None))
     role = "review" if args.review else "done"
-    move_to_column(args.id, col_id(cfg, role))
+    move_to_column(args.id, col_id(cfg, role), project_id=cfg["projectId"])
     if not args.review:
         request("POST", f"/task/{args.id}/complete")
     print(f"{args.id}: {'отправлена на проверку' if args.review else 'закрыта'}")
@@ -1450,7 +1502,7 @@ def cmd_block(args):
     request("PATCH", f"/task/{args.id}",
             body={"note": note_append(t.get("note"), args.reason, label="БЛОКЕР")})
     mark_agent(args.id, cfg, getattr(args, "agent", None))
-    move_to_column(args.id, col_id(cfg, "blocked"))
+    move_to_column(args.id, col_id(cfg, "blocked"), project_id=cfg["projectId"])
     print(f"{args.id}: заблокирована, причина записана в заметку")
 
 
@@ -1512,7 +1564,8 @@ def cmd_add(args):
     # Задача уже создана. Всё, что упадёт дальше, обязано назвать её id: без него
     # сироту не найти — на доске она проваливается в «вне колонок», и агент просто
     # создаёт задачу заново. Ровно так на живой сессии появился дубль.
-    if move_to_column(tid, col_id(cfg, args.column), fatal=False) is None:
+    if move_to_column(tid, col_id(cfg, args.column), fatal=False,
+                      project_id=cfg["projectId"]) is None:
         die(f"{tid}: СОЗДАНА, но осталась без колонки (сеть не дала привязать).\n"
             f"  задача существует, повторный add сделает дубль — почини её:\n"
             f"    sing.py move {tid} {args.column}")
@@ -1528,7 +1581,7 @@ def cmd_move(args):
     """
     cfg, _ = load_config()
     assert_task_allowed(args.id, cfg)
-    res = move_to_column(args.id, col_id(cfg, args.column))
+    res = move_to_column(args.id, col_id(cfg, args.column), project_id=cfg["projectId"])
     print(f"{args.id}: {res} — {args.column}")
 
 

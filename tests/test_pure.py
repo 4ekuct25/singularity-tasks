@@ -298,20 +298,27 @@ class MoveToColumnTest(unittest.TestCase):
     def setUp(self):
         self.calls = []
         self.addCleanup(setattr, sing, "request", sing.request)
-        self.addCleanup(setattr, sing, "task_links", sing.task_links)
+        self.addCleanup(setattr, sing, "board_links", sing.board_links)
+        self.addCleanup(setattr, sing, "task_project", sing.task_project)
+        # у задачи бывает связка с доской «Сегодня», поэтому move_to_column берёт
+        # связки не как есть, а через board_links — по колонкам своего проекта
+        sing.task_project = lambda tid: "P-1"
         self.addCleanup(setattr, sing, "task_column", sing.task_column)
         self.addCleanup(setattr, sing, "NET_BACKOFF", sing.NET_BACKOFF)
         sing.NET_BACKOFF = 0          # паузы в проверке ни к чему
         sing.request = lambda m, p, **kw: self.calls.append((m, p)) or {}
 
     def _links(self, link):
-        sing.task_links = lambda tid, include_removed=False: [link] if link else []
+        sing.board_links = (lambda tid, project_id=None, include_removed=False:
+                            [link] if link else [])
 
     def _columns(self, *sequence):
         it = iter(sequence)
         last = [None]
 
-        def col(tid):
+        # project_id добавился, когда task_column научился выбирать связку доски
+        # СВОЕГО проекта: у задачи бывает ещё связка с доской «Сегодня»
+        def col(tid, project_id=None):
             try:
                 last[0] = next(it)
             except StopIteration:
