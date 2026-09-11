@@ -14,6 +14,7 @@
 
 import argparse
 import email.utils
+import http.client
 import json
 import os
 import re
@@ -320,7 +321,21 @@ def request(method, path, query=None, body=None, soft=False):
             spent = (f" (попыток: {attempt}, ждали {waited:.1f} с)"
                      if attempt > 1 else "")
             die(f"{method} {path} -> HTTP {e.code}{spent}: {detail}")
-        except urllib.error.URLError as e:
+        except (urllib.error.URLError, TimeoutError,
+                http.client.HTTPException) as e:
+            # URLError покрывает только установку соединения и отправку запроса:
+            # urlopen заворачивает в неё OSError из h.request(). Всё, что случилось
+            # ПОСЛЕ отправки, прилетает как есть, мимо неё: сервер принял соединение
+            # и молчит — read-timeout из getresponse()/read() голым TimeoutError
+            # (с 3.10 socket.timeout — его псевдоним); оборвал ответ — RemoteDisconnected
+            # или IncompleteRead из http.client. Для вызывающего это тот же сетевой
+            # сбой, что и обрыв, и вести себя должен так же — иначе пользователь
+            # получает traceback вместо сообщения.
+            #
+            # Шире брать нельзя. OSError — общий предок URLError, HTTPError, TimeoutError
+            # и всего несетевого разом: except OSError проглотил бы и то, что обязано
+            # падать. HTTPException же из другой иерархии и HTTPError ему не родня,
+            # так что HTTP-ответы по-прежнему разбирает ветка выше.
             if attempt < net_attempts:
                 pause = NET_BACKOFF * attempt
                 time.sleep(pause)
@@ -328,7 +343,8 @@ def request(method, path, query=None, body=None, soft=False):
                 continue
             if soft:
                 return None
-            die(f"Сеть недоступна для {method} {path}: {e.reason}"
+            reason = getattr(e, "reason", e)     # .reason есть только у URLError
+            die(f"Сеть недоступна для {method} {path}: {reason}"
                 + (f" (попыток: {attempt})" if attempt > 1 else ""))
 
 
