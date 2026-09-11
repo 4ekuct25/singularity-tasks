@@ -10,6 +10,10 @@
 
 Привязка репозитория к проекту трекера ищется в <repo>/.agents/singularity.json,
 затем .claude/singularity.json, затем в корне (секретов не содержит, коммитится).
+
+Внутри репозитория-эталона самого скилла start и done дополнительно сверяют
+установленные копии с деревом (локально, без сети) и молчат, если всё совпадает.
+Отключается на запуск: SINGULARITY_NO_SYNC_CHECK=1.
 """
 
 import argparse
@@ -1475,6 +1479,80 @@ def cmd_checklist(args):
     print(f"{args.id}: добавлено пунктов — {len(args.items)}")
 
 
+# ------------------------------------------------------------- сверка с эталоном
+
+# Скилл живёт в репозитории-эталоне, а работают агенты с копиями, разложенными по
+# каталогам инструментов. Правило «после правки — раскатать, до работы — сверить»
+# было текстом в AGENTS.md и не сработало ни разу: правку помнят, раскатку нет.
+# Поэтому сверка висит на командах, которые рабочий цикл и так делает
+# обязательными, — их выполняет любой из пяти агентов и ровно в те два момента,
+# когда расхождение ещё можно отработать: перед началом правок и при закрытии.
+SYNC_CHECK_COMMANDS = {"start", "done"}
+
+
+def skill_repo_root(start=None):
+    """Корень репозитория-эталона этого скилла, если работа идёт именно в нём.
+
+    В любом другом репозитории сверять нечего и предупреждать не о чем. Признак —
+    install.sh рядом с SKILL.md именно этого скилла: одного install.sh мало,
+    он есть у половины репозиториев на диске.
+    """
+    d = os.path.abspath(start or os.getcwd())
+    while True:
+        skill = os.path.join(d, "SKILL.md")
+        if os.path.isfile(os.path.join(d, "tools", "install.sh")) and os.path.isfile(skill):
+            try:
+                with open(skill, encoding="utf-8") as f:
+                    head = f.read(512)
+            except OSError:
+                return None
+            return d if "name: singularity-tasks" in head else None
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def warn_if_skill_drifted(command):
+    """Предупредить, если установленные копии скилла разошлись с этим деревом.
+
+    Проверка локальная (сравнение файлов), без сети и без обращения к трекеру.
+    Три правила, от которых зависит, будут ли её читать:
+
+      * при совпадении не печатает ничего — гейт, который краснеет на каждом
+        действии, перестают читать;
+      * никогда не раскатывает сама: из worktree раскатка залила бы в общие
+        каталоги чужую незакоммиченную ветку;
+      * никогда не роняет команду — сверка не важнее задачи, ради которой её
+        позвали, поэтому любая её собственная поломка проходит молча.
+    """
+    if command not in SYNC_CHECK_COMMANDS or os.environ.get("SINGULARITY_NO_SYNC_CHECK"):
+        return
+    root = skill_repo_root()
+    if not root:
+        return
+    try:
+        r = subprocess.run(
+            ["bash", os.path.join(root, "tools", "install.sh"), "--check", "--quiet"],
+            cwd=root, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return
+    # 0 — совпадает; 1 — расхождение; прочее — сверить не удалось, это не повод шуметь
+    if r.returncode != 1:
+        return
+    targets = (r.stdout or "").strip() or "подробности ниже"
+    out = ["", f"⚠ установленные копии скилла разошлись с этим деревом: {targets}",
+           "  Либо правка ещё не раскатана, либо база этого дерева устарела:",
+           "  пять агентов сейчас работают не по тому, что ты видишь.",
+           "  Что именно разошлось: tools/install.sh --check"]
+    if os.path.isfile(os.path.join(root, ".git")):   # .git-файл => подключённый worktree
+        out.append("  Это worktree — отсюда не раскатывать: install.sh зальёт эту ветку"
+                   " в общие каталоги поверх работы параллельных сессий.")
+    else:
+        out.append("  Раскатать: tools/install.sh")
+    print("\n".join(out), file=sys.stderr)
+
+
 # --------------------------------------------------------------------------- CLI
 
 
@@ -1610,6 +1688,7 @@ def main():
 
     args = p.parse_args()
     args.fn(args)
+    warn_if_skill_drifted(args.cmd)
 
 
 if __name__ == "__main__":
