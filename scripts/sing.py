@@ -635,16 +635,45 @@ def col_id(cfg, role):
 # --------------------------------------------------------------------------- задачи
 
 
-def fetch_tasks(project_id):
-    return paged("/task", "tasks",
-                 {"projectId": project_id, "includeAllRecurrenceInstances": "true"})
+def fetch_tasks(project_id, include_archived=False):
+    q = {"projectId": project_id, "includeAllRecurrenceInstances": "true"}
+    if include_archived:
+        # Без флага сервер сам не отдаёт задачи с journalDate — клиентского
+        # фильтра мало, выборку надо расширять запросом.
+        q["includeArchived"] = "true"
+    return paged("/task", "tasks", q)
 
 
+# `journalDate` ≠ удаление. Проверено на живом API:
+#   POST /task/{id}/archive   -> journalDate=<время>, checked=1, removed=false,
+#                                deleteDate=null, связка с колонкой цела;
+#   POST /task/{id}/unarchive -> journalDate=null и checked обратно в 0;
+#   DELETE /task/{id}         -> removed=true, journalDate не трогается;
+#   deleteDate (корзина)      -> задача выпадает из выборки, но removed=false.
+# Выборку по умолчанию сервер режет по обоим признакам, но разными флагами:
+# архив возвращает `includeArchived=true`, удалённое и корзину — `includeRemoved=true`.
+# Поэтому «в дневнике» — это закрытая, живая задача, а не удалённая.
 def live_tasks(project_id):
-    """Всё, что не удалено и не в архиве, включая уже выполненное."""
+    """Всё, с чем можно РАБОТАТЬ: не удалено и не унесено в дневник.
+
+    Умышленно строгая: её читают open_tasks, next и list — брать в работу
+    задачу, которую приложение уже унесло в дневник, нельзя.
+    """
     return [t for t in fetch_tasks(project_id)
             if not t.get("removed") and not t.get("journalDate")
             and not t.get("deleteDate") and not t.get("isNote")]
+
+
+def board_tasks(project_id):
+    """То же плюс унесённое в дневник — для board.
+
+    Доска показывает историю: закрытая задача, которую приложение унесло в
+    дневник, обязана остаться в «Готово», иначе агент не видит сделанного и
+    заводит его заново. Удалённое и корзина (removed / deleteDate) не в счёт.
+    """
+    return [t for t in fetch_tasks(project_id, include_archived=True)
+            if not t.get("removed") and not t.get("deleteDate")
+            and not t.get("isNote")]
 
 
 def open_tasks(project_id):
@@ -1111,7 +1140,7 @@ def cmd_board(args):
     statuses = {s["id"]: s["name"] for s in project_statuses(cfg["projectId"])}
     cmap = column_map(cfg["projectId"])
     by_col = {}
-    for t in live_tasks(cfg["projectId"]):
+    for t in board_tasks(cfg["projectId"]):
         by_col.setdefault(cmap.get(t["id"]), []).append(t)
 
     # Раскладку считаем до печати: и теги, и ширина колонки держателя должны
@@ -1127,7 +1156,10 @@ def cmd_board(args):
                            reverse=True)[:args.limit]
         layout.append((role, cid, statuses.get(cid, "?"), items,
                        sorted(shown, key=prio_of)))
-    loose = [t for t in by_col.get(None, []) if int(t.get("checked") or 0) == 0]
+    # задачу из дневника «вне колонок» показывать незачем: она закрыта и унесена
+    # приложением, а не потеряна — сирота, которую надо чинить, выглядит иначе
+    loose = [t for t in by_col.get(None, [])
+             if int(t.get("checked") or 0) == 0 and not t.get("journalDate")]
     holders = board_holders([t for *_, shown in layout for t in shown] + loose)
     pad = board_pad(holders)
 
@@ -1154,6 +1186,9 @@ def cmd_board(args):
               + (f" (показаны {len(shown)})" if len(shown) < len(items) else ""))
         for t in shown:
             done = " ✓" if int(t.get("checked") or 0) == 1 else ""
+            # в дневнике = приложение унесло закрытую задачу из активного списка;
+            # на доске она остаётся, но в самом приложении её там уже не видно
+            done += " (в дневнике)" if t.get("journalDate") else ""
             print(pad(holders.get(t["id"])) + brief(t) + done)
 
 
