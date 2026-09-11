@@ -144,20 +144,31 @@ def claim_task(task_id, cfg, override=None, take_over=False):
             "параллельная работа.\n"
             f"  Взять всё равно (снимет чужие метки): sing.py start {task_id} "
             "--take-over ...")
-    for tid, _ in foreign:
-        drop_task_tag(task_id, tid)
-
-    add_task_tag(task_id, ensure_tag(my_title))
+    # ⚠ Снять чужое и поставить своё — ОДНИМ PATCH, а не двумя.
+    # Двумя было так: `tags=[]`, потом `tags=[мой]`. Между ними задача висит
+    # вообще без agent-метки, то есть выглядит свободной; а если второй PATCH
+    # не подтвердится, она такой и остаётся — исход хуже честного отказа.
+    # `tags` перезаписывается целиком, поэтому окна можно не иметь вовсе:
+    # сервер либо применит новый список (чужого нет, мой есть), либо не
+    # применит ничего (чужой на месте) — промежуточного состояния не бывает.
+    # Отсюда же ответ на «что делать с уже снятой чужой меткой»: её нечего
+    # возвращать. Компенсация была бы вторым запросом, который тоже может не
+    # дойти, и дырку она не закрывает, а удваивает.
+    set_task_tags(task_id, add=[ensure_tag(my_title)],
+                  drop=[tid for tid, _ in foreign], soft=True)
     time.sleep(CLAIM_SETTLE)
 
     fresh = request("GET", f"/task/{task_id}")
     marks = agent_tags_on(fresh)
     titles = [t for _, t in marks]
     if my_title not in titles:
-        # чужой PATCH tags затёр мою пометку: чтение-записью иначе и не бывает
-        die(f"{task_id}: захват не удержался — метку затёрли"
+        # чужой PATCH tags затёр мою пометку: чтение-записью иначе и не бывает.
+        # Сюда же попадает запись, так и не доехавшая из очереди синхронизации, —
+        # различать их незачем: исход один и тот же, задача не моя.
+        die(f"{task_id}: захват не удержался — моей метки на задаче нет"
             + (f" (сейчас {', '.join(titles)})" if titles else "")
-            + ".\n  Задачу взял другой агент. Возьми следующую: sing.py next")
+            + ".\n  Задачу взял другой агент либо запись не применилась. "
+            "Возьми следующую: sing.py next")
     if len(titles) > 1:
         # встречный захват. Правило одно у всех, поэтому победитель ровно один
         winner = min(titles)
@@ -175,31 +186,63 @@ def claim_task(task_id, cfg, override=None, take_over=False):
     return who
 
 
-def drop_task_tag(task_id, tag_id):
-    """Снять тег, не тронув остальные, и убедиться, что он снят."""
+# Сервер кладёт запись в очередь синхронизации и отвечает РАНЬШЕ, чем применит
+# её: на загруженной очереди немедленный GET после PATCH отдаёт ещё старый
+# список тегов. Одно чтение поэтому не способно отличить «сервер ещё не
+# применил» от «сервер не применил» — оно одинаково видит старое в обоих
+# случаях. Различает их только время: не применённое не появится и потом.
+# Та же болячка лечилась в `tools/zz-project.py` (delete_draft после DELETE).
+TAG_SETTLE_TRIES = 4     # перечитываний подтверждения, включая немедленное
+TAG_SETTLE_PAUSE = 1.0   # пауза между ними
+
+# Повторного PATCH здесь намеренно НЕТ. Запись не теряется — она отстаёт;
+# а повтор в этом месте переписал бы встречный захват и сломал правило
+# «победитель ровно один» (см. claim_task): затёртая метка обязана остаться
+# затёртой, иначе оба агента решат, что задача их.
+
+
+def set_task_tags(task_id, add=(), drop=(), soft=False):
+    """Переписать теги задачи ОДНИМ PATCH и подтвердить перечитыванием.
+
+    True — записали и подтвердили, False — писать было нечего.
+    Не подтвердилось за отведённые перечитывания: `die`, а при `soft=True` —
+    None. Докладывать об успехе по коду 200 этому API нельзя (AGENTS.md §4).
+    """
+    drop, add = set(drop), [t for t in add]
     task = request("GET", f"/task/{task_id}")
     tags = list(task.get("tags") or [])
-    if tag_id not in tags:
+    target = [t for t in tags if t not in drop]
+    for t in add:
+        if t not in target:
+            target.append(t)
+    if target == tags:
         return False
-    request("PATCH", f"/task/{task_id}",
-            body={"tags": [t for t in tags if t != tag_id]})
-    actual = request("GET", f"/task/{task_id}").get("tags") or []
-    if tag_id in actual:
-        die(f"{task_id}: тег не снялся, у задачи теги {actual}")
-    return True
+    request("PATCH", f"/task/{task_id}", body={"tags": target})
+
+    want = set(add)
+    for attempt in range(1, TAG_SETTLE_TRIES + 1):
+        actual = set(request("GET", f"/task/{task_id}").get("tags") or [])
+        if want <= actual and not (drop & actual):
+            return True
+        if attempt < TAG_SETTLE_TRIES:
+            time.sleep(TAG_SETTLE_PAUSE)
+    if soft:
+        return None
+    die(f"{task_id}: правка тегов не применилась за {TAG_SETTLE_TRIES} "
+        f"перечитываний ({TAG_SETTLE_PAUSE * (TAG_SETTLE_TRIES - 1):.0f} с) — "
+        f"у задачи теги {sorted(actual)}, ожидались {sorted(set(target))}.\n"
+        "  Это уже не лаг синхронизации. Метки задачи не изменились так, как "
+        "ожидалось: проверь её в трекере.")
+
+
+def drop_task_tag(task_id, tag_id):
+    """Снять тег, не тронув остальные, и убедиться, что он снят."""
+    return set_task_tags(task_id, drop=[tag_id])
 
 
 def add_task_tag(task_id, tag_id):
     """Добавить тег, не затирая уже висящие, и убедиться, что он применился."""
-    task = request("GET", f"/task/{task_id}")
-    tags = list(task.get("tags") or [])
-    if tag_id in tags:
-        return False
-    request("PATCH", f"/task/{task_id}", body={"tags": tags + [tag_id]})
-    actual = request("GET", f"/task/{task_id}").get("tags") or []
-    if tag_id not in actual:
-        die(f"{task_id}: тег не применился, у задачи теги {actual}")
-    return True
+    return set_task_tags(task_id, add=[tag_id])
 
 
 def desired_order(role, mapping, statuses):
