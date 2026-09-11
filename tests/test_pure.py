@@ -173,6 +173,61 @@ class BoardHolderTest(unittest.TestCase):
         self.assertEqual(holders, {"T-1": "@alpha,zeta"})
 
 
+class BoardLayoutTest(unittest.TestCase):
+    """Раскладка доски по ролям. Ловушка, ради которой тест написан: ключ None в
+    `by_col` — это задачи ВНЕ колонок, и роль, которой нет в привязке, получала
+    именно их (T-278ad639). Доска показывала задачи, которых в этой колонке нет."""
+
+    STATUSES = {"KS-T": "Новые", "KS-W": "В работе", "KS-D": "Готово",
+                "KS-B": "Заблокировано"}
+
+    def _by_col(self):
+        return {
+            "KS-T": [{"id": "T-1", "title": "в очереди"}],
+            None: [{"id": "T-loose1", "title": "вне колонок"},
+                   {"id": "T-loose2", "title": "вне колонок 2"}],
+        }
+
+    def _cfg(self, **columns):
+        return {"projectId": "P-x", "columns": columns}
+
+    def test_unbound_role_gets_nothing_not_the_loose_tasks(self):
+        cfg = self._cfg(todo="KS-T", wip="KS-W", done="KS-D", blocked="KS-B")
+        layout = {role: (cid, name, items)
+                  for role, cid, name, items, _ in
+                  sing.board_layout(cfg, self._by_col(), self.STATUSES, 10)}
+        cid, name, items = layout["review"]
+        self.assertIsNone(cid)
+        self.assertEqual(items, [], "роль без колонки забрала задачи вне колонок")
+        self.assertEqual(name, sing.UNBOUND_COLUMN)
+        # соседние роли не пострадали
+        self.assertEqual([t["id"] for t in layout["todo"][2]], ["T-1"])
+        self.assertEqual(layout["todo"][1], "Новые")
+
+    def test_every_missing_role_is_empty_not_a_copy_of_the_same_list(self):
+        """Пустая привязка — пять ролей, и ни одна не повторяет чужой список."""
+        layout = sing.board_layout(self._cfg(), self._by_col(), self.STATUSES, 10)
+        self.assertEqual([r for r, *_ in layout], sing.COLUMN_ORDER)
+        self.assertEqual([len(items) for *_, items, _ in layout], [0] * 5)
+
+    def test_bound_role_with_dead_column_keeps_its_tasks(self):
+        """Колонка в привязке есть, а в трекере её уже нет: это другой случай,
+        задачи по ней показываем (их и чинить), а диагноз ставит doctor."""
+        cfg = self._cfg(review="KS-GONE")
+        by_col = dict(self._by_col(), **{"KS-GONE": [{"id": "T-9", "title": "x"}]})
+        role, cid, name, items, _ = sing.board_layout(cfg, by_col, self.STATUSES, 10)[2]
+        self.assertEqual((role, cid, name), ("review", "KS-GONE", "?"))
+        self.assertEqual([t["id"] for t in items], ["T-9"])
+
+    def test_done_is_cut_by_limit_but_count_stays_full(self):
+        cfg = self._cfg(done="KS-D")
+        by_col = {"KS-D": [{"id": f"T-{i}", "modificatedDate": f"2026-01-0{i}"}
+                           for i in range(1, 5)]}
+        *_, items, shown = sing.board_layout(cfg, by_col, self.STATUSES, 2)[3]
+        self.assertEqual(len(items), 4, "счётчик колонки обязан считать все")
+        self.assertEqual([t["id"] for t in shown], ["T-4", "T-3"], "показаны не свежие")
+
+
 # --------------------------------------------------------------------- приоритет
 
 
