@@ -13,16 +13,33 @@
 """
 
 import argparse
+import email.utils
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 API = os.environ.get("SINGULARITY_API", "https://api.singularity-app.com/v2")
 CONFIG_NAME = "singularity.json"
+
+NET_TIMEOUT = 45
+NET_RETRIES = 3        # только для GET: повтор POST создаёт второй объект
+NET_BACKOFF = 1.5      # секунды, множатся на номер попытки
+
+# Отказ отказу рознь. 429 сервер отдаёт, ОТКАЗАВШИСЬ обслужить запрос: он не выполнен,
+# поэтому повтор безопасен для любого метода, включая POST. 5xx же означает «принял и
+# сломался» — запрос мог примениться, и повторять его можно только там, где повтор
+# ничего не создаёт, то есть на GET.
+HTTP_THROTTLED = 429
+HTTP_RETRY_5XX = (500, 502, 503, 504)
+THROTTLE_RETRIES = 4      # попыток на 429 — для любого метода
+RETRY_AFTER_CAP = 30      # секунды: потолок ОДНОЙ паузы, даже если Retry-After больше
+RETRY_WAIT_BUDGET = 90    # секунды: потолок суммарного ожидания на один запрос
 
 # Жёсткое ограничение области работы: агент имеет дело ТОЛЬКО с подпроектами внутри
 # этого проекта. Сам корень рабочим проектом быть не может. Намеренно константа, а не
@@ -87,6 +104,69 @@ def mark_agent(task_id, cfg=None, override=None):
     """
     who = agent_name(cfg, override)
     add_task_tag(task_id, ensure_tag(AGENT_TAG_PREFIX + who))
+    return who
+
+
+CLAIM_SETTLE = 1.5    # сколько ждать встречный захват, прежде чем считать задачу своей
+
+
+def agent_tags_on(task):
+    """Какие agent-теги висят на задаче: [(tag_id, 'agent:имя'), ...]."""
+    titles = {t["id"]: t["title"] for t in paged("/tag", "tags")}
+    return [(x, titles.get(x, x)) for x in (task.get("tags") or [])
+            if titles.get(x, "").startswith(AGENT_TAG_PREFIX)]
+
+
+def claim_task(task_id, cfg, override=None, take_over=False):
+    """Захватить задачу так, чтобы её не забрал одновременно второй агент.
+
+    Compare-and-swap этот API не умеет, поэтому захват оптимистичный: пометились
+    → подождали → перечитали → разошлись по детерминированному правилу. Гонка
+    воспроизводится (`tools/check-claim-race.py`): два `start` по одной задаче
+    давали то два тега на доске, то — хуже — два кода 0 при одном уцелевшем теге,
+    когда чтение-запись `tags` затирала чужую пометку. Второй агент при этом
+    считал задачу своей, а доска показывала первого.
+
+    Захват идёт ДО переноса колонки: проигравший не должен успеть подвинуть доску.
+    """
+    who = agent_name(cfg, override)
+    my_title = AGENT_TAG_PREFIX + who
+    task = request("GET", f"/task/{task_id}")
+    foreign = [(tid, t) for tid, t in agent_tags_on(task) if t != my_title]
+    if foreign and not take_over:
+        die(f"{task_id}: задача уже занята — {', '.join(t for _, t in foreign)}.\n"
+            "  Две сессии над одной задачей — это потерянный контекст, а не "
+            "параллельная работа.\n"
+            f"  Взять всё равно (снимет чужие метки): sing.py start {task_id} "
+            "--take-over ...")
+    for tid, _ in foreign:
+        drop_task_tag(task_id, tid)
+
+    add_task_tag(task_id, ensure_tag(my_title))
+    time.sleep(CLAIM_SETTLE)
+
+    fresh = request("GET", f"/task/{task_id}")
+    marks = agent_tags_on(fresh)
+    titles = [t for _, t in marks]
+    if my_title not in titles:
+        # чужой PATCH tags затёр мою пометку: чтение-записью иначе и не бывает
+        die(f"{task_id}: захват не удержался — метку затёрли"
+            + (f" (сейчас {', '.join(titles)})" if titles else "")
+            + ".\n  Задачу взял другой агент. Возьми следующую: sing.py next")
+    if len(titles) > 1:
+        # встречный захват. Правило одно у всех, поэтому победитель ровно один
+        winner = min(titles)
+        if winner != my_title:
+            for tid, t in marks:
+                if t == my_title:
+                    drop_task_tag(task_id, tid)
+            die(f"{task_id}: встречный захват, задача уходит к {winner}.\n"
+                "  Свою метку снял. Возьми следующую: sing.py next")
+        for tid, t in marks:
+            if t != my_title:
+                # чужую метку не снимаю: проигравший снимет её сам, а если он
+                # умер — останется след, по которому видно, что тут была гонка
+                print(f"  ⚠ встречный захват {t}: задача осталась за {my_title}")
     return who
 
 
@@ -179,19 +259,77 @@ def request(method, path, query=None, body=None, soft=False):
     req.add_header("Authorization", "Bearer " + get_token())
     if data:
         req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            raw = resp.read().decode()
-            return json.loads(raw) if raw.strip() else {}
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")[:500]
-        if soft:
+
+    def retry_after(headers):
+        """Retry-After: число секунд ИЛИ HTTP-дата. Нет/мусор -> None."""
+        raw = headers.get("Retry-After") if headers else None
+        if not raw:
             return None
-        if e.code == 401:
-            die("401 Unauthorized: токен недействителен или ему не хватает прав.")
-        die(f"{method} {path} -> HTTP {e.code}: {detail}")
-    except urllib.error.URLError as e:
-        die(f"Сеть недоступна для {method} {path}: {e.reason}")
+        raw = raw.strip()
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+        stamp = email.utils.parsedate_tz(raw)
+        if not stamp:
+            return None
+        # mktime_tz даёт UTC-эпоху, time.time() — тоже: часовой пояс уже учтён
+        return max(0.0, email.utils.mktime_tz(stamp) - time.time())
+
+    # Повторяем только то, что безопасно повторить. GET идемпотентен по определению;
+    # POST/PATCH — нет (повтор `POST /task` создаст второй объект), поэтому сетевой
+    # обрыв и 5xx на них отдаём вызывающему, который перечитывает состояние сам.
+    # Наблюдали, как цепочка из восьми `add` порвалась на `POST /kanban-task-status:
+    # timed out` и оставила задачу без колонки — тайм-ауты здесь штатный режим.
+    idempotent = method == "GET"
+    net_attempts = NET_RETRIES if idempotent else 1
+    attempt, waited = 0, 0.0
+    while True:
+        attempt += 1
+        try:
+            with urllib.request.urlopen(req, timeout=NET_TIMEOUT) as resp:
+                raw = resp.read().decode()
+                return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:500]
+            if e.code == HTTP_THROTTLED:
+                # 429 — сервер ОТКАЗАЛСЯ обслужить запрос, то есть не выполнил его.
+                # Это единственный класс отказа, где повтор безопасен для любого
+                # метода: второго объекта он создать не мог. Сколько ждать — говорит
+                # сервер (Retry-After), а не мы; своя пауза только если он молчит.
+                limit, pause = THROTTLE_RETRIES, retry_after(e.headers)
+                if pause is None:
+                    pause = NET_BACKOFF * attempt
+            elif e.code in HTTP_RETRY_5XX and idempotent:
+                # 5xx — запрос мог быть выполнен до сбоя, поэтому повтор только GET
+                limit, pause = NET_RETRIES, NET_BACKOFF * attempt
+            else:
+                limit, pause = 1, 0.0
+            budget_left = RETRY_WAIT_BUDGET - waited
+            if attempt < limit and budget_left > 0:
+                # потолки — чтобы команда не висела: сервер может попросить
+                # Retry-After: 3600, и столько ждать бессмысленно
+                pause = min(pause, RETRY_AFTER_CAP, budget_left)
+                time.sleep(pause)
+                waited += pause
+                continue
+            if soft:
+                return None
+            if e.code == 401:
+                die("401 Unauthorized: токен недействителен или ему не хватает прав.")
+            spent = (f" (попыток: {attempt}, ждали {waited:.1f} с)"
+                     if attempt > 1 else "")
+            die(f"{method} {path} -> HTTP {e.code}{spent}: {detail}")
+        except urllib.error.URLError as e:
+            if attempt < net_attempts:
+                pause = NET_BACKOFF * attempt
+                time.sleep(pause)
+                waited += pause
+                continue
+            if soft:
+                return None
+            die(f"Сеть недоступна для {method} {path}: {e.reason}"
+                + (f" (попыток: {attempt})" if attempt > 1 else ""))
 
 
 def paged(path, key, query=None, limit=1000):
@@ -215,8 +353,23 @@ def paged(path, key, query=None, limit=1000):
 # --------------------------------------------------------------------------- конфиг репо
 
 
+_PROJECTS_CACHE = []
+
+
 def all_projects():
-    return [p for p in paged("/project", "projects") if not p.get("removed")]
+    """Список проектов на процесс. Памятка не для скорости ради скорости:
+    `assert_allowed` зовётся на каждой команде, а `show` звал его дважды — два
+    одинаковых `/project` из трёх запросов, и каждый мог упасть в таймаут."""
+    if not _PROJECTS_CACHE:
+        _PROJECTS_CACHE.extend(p for p in paged("/project", "projects")
+                               if not p.get("removed"))
+    return _PROJECTS_CACHE
+
+
+def forget_projects():
+    """Сбросить памятку. Обязательна после создания проекта: иначе проверка
+    области ищет свежесозданный проект в списке, снятом до его появления."""
+    _PROJECTS_CACHE.clear()
 
 
 def resolve_root(projects=None):
@@ -339,15 +492,41 @@ def note_dump(ops):
     return json.dumps(ops, ensure_ascii=False)
 
 
-def note_append(note, text):
-    """Дописать абзац, приведя заметку к формату, который понимает приложение."""
+# Форматирование карточки — не украшение: отчёт из пяти фактов подряд читается как
+# стена текста. Словарь взят не из документации Quill, а из локальной базы самого
+# приложения — то, что оно пишет само, оно гарантированно и рисует:
+#   на тексте:            bold, italic, link, singularityBackgroundAttribute
+#   на переводе строки:   list=bullet|ordered|checked|unchecked, header=2|3, align, indent
+# Блочный атрибут в Quill вешается на "\n", а не на текст строки — отсюда две разные
+# ветки ниже. Перепутать легко, и приложение тогда покажет абзац без списка.
+def _body_ops(text):
+    """Текст в операции: строки, начинающиеся с «- » или «* », становятся списком."""
+    ops = []
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped[:2] in ("- ", "* "):
+            ops.append({"insert": stripped[2:]})
+            ops.append({"insert": "\n", "attributes": {"list": "bullet"}})
+        else:
+            ops.append({"insert": line + "\n"})
+    return ops
+
+
+def note_append(note, text, label=None):
+    """Дописать абзац, приведя заметку к формату, который понимает приложение.
+
+    label — подпись вроде «ПЛАН (agent:qwen)»: пишется жирным отдельной операцией,
+    чтобы в карточке было видно границу между записями, а не сплошной текст.
+    """
     ops = note_ops(note)
     if ops:
         tail = ops[-1].get("insert") if isinstance(ops[-1], dict) else None
         sep = "\n" if isinstance(tail, str) and tail.endswith("\n") else "\n\n"
-        ops.append({"insert": sep + text + "\n"})
-    else:
-        ops = [{"insert": text + "\n"}]
+        ops.append({"insert": sep})
+    if label:
+        ops.append({"insert": label, "attributes": {"bold": True}})
+        ops.append({"insert": ": "})
+    ops.extend(_body_ops(text))
     return note_dump(ops)
 
 
@@ -370,30 +549,43 @@ def task_column(task_id):
     return live[0]["statusId"] if live else None
 
 
-def move_to_column(task_id, status_id):
+def move_to_column(task_id, status_id, fatal=True):
     """Идемпотентно поставить задачу в колонку и УБЕДИТЬСЯ, что она там.
 
     POST /task/{id}/change-column не используется намеренно: на системных
     колонках проекта он отвечает 200, но связку не меняет. Правим связку сама.
+
+    Связка у задачи одна и её id детерминирован (`KTS-<taskId>`), поэтому повтор
+    здесь безопасен — в отличие от `POST /task`. Ради этого и повторяем: таймаут
+    ровно на этом запросе оставлял задачу вообще без колонки.
+
+    fatal=False — вернуть None вместо die: вызывающий сам решит, что сказать
+    (например, `add` обязан назвать уже созданный T-id, иначе его не найти).
     """
     if task_column(task_id) == status_id:
         return "уже в колонке"
-    link = next(iter(task_links(task_id, include_removed=True)), None)
     action = None
-    if link and not link.get("removed"):
-        request("PATCH", f"/kanban-task-status/{link['id']}",
-                body={"statusId": status_id}, soft=True)
-        action = "перемещена"
-    if task_column(task_id) != status_id:
-        # связки нет или она помечена удалённой (колонку снесли) — заводим заново
-        request("POST", "/kanban-task-status",
-                body={"taskId": task_id, "statusId": status_id}, soft=True)
-        action = "привязана к колонке"
+    for attempt in range(1, NET_RETRIES + 1):
+        link = next(iter(task_links(task_id, include_removed=True)), None)
+        if link and not link.get("removed"):
+            request("PATCH", f"/kanban-task-status/{link['id']}",
+                    body={"statusId": status_id}, soft=True)
+            action = "перемещена"
+        else:
+            # связки нет или она помечена удалённой (колонку снесли) — заводим заново
+            request("POST", "/kanban-task-status",
+                    body={"taskId": task_id, "statusId": status_id}, soft=True)
+            action = "привязана к колонке"
+        if task_column(task_id) == status_id:
+            return action
+        if attempt < NET_RETRIES:
+            time.sleep(NET_BACKOFF * attempt)
     actual = task_column(task_id)
-    if actual != status_id:
-        die(f"{task_id}: перенос не применился — колонка осталась {actual}. "
-            "Состояние трекера не изменилось так, как ожидалось.")
-    return action
+    if not fatal:
+        return None
+    die(f"{task_id}: перенос не применился за {NET_RETRIES} попытки — колонка "
+        f"осталась {actual}. Состояние трекера не изменилось так, как ожидалось.\n"
+        f"  починить вручную: sing.py move {task_id} <роль>")
 
 
 def assert_task_allowed(task_id, cfg=None):
@@ -440,14 +632,18 @@ def open_tasks(project_id):
 
 
 def column_map(project_id):
-    """taskId -> statusId для всего проекта (одним запросом на колонку)."""
-    m = {}
-    for st in project_statuses(project_id):
-        for link in paged("/kanban-task-status", "kanbanTaskStatuses",
-                          {"statusId": st["id"]}):
-            if not link.get("removed"):
-                m[link["taskId"]] = link["statusId"]
-    return m
+    """taskId -> statusId для проекта.
+
+    Запрос на колонку давал 8 обращений на пятиколоночной доске (`board` — 12
+    запросов, 2.4 с). Без фильтра эндпоинт отдаёт связки всего аккаунта одним
+    заходом (проверено: 46 штук, из них 8 этого проекта), и мы отбираем свои по
+    statusId. ⚠️ `?projectId=` он НЕ поддерживает: возвращает пустой список, а не
+    отказ, — фильтр, которого нет, выглядит как «связок нет».
+    """
+    mine = {s["id"] for s in project_statuses(project_id)}
+    return {link["taskId"]: link["statusId"]
+            for link in paged("/kanban-task-status", "kanbanTaskStatuses", {})
+            if not link.get("removed") and link.get("statusId") in mine}
 
 
 def prio_of(t):
@@ -485,13 +681,133 @@ def project_notes(project_id):
             if t.get("isNote") and not t.get("removed") and not t.get("deleteDate")]
 
 
+# В заголовке может лежать HTML: отправленное `banlist-ufm-cft.md` наблюдалось в
+# базе как <a href="http://banlist-ufm-cft.md">…</a>. Это НЕ REST — пять проб через
+# API вернули заголовки байт в байт; автолинковку делает клиент приложения при
+# синхронизации, уже после создания. Поэтому сверять сразу после записи бесполезно:
+# чистим на показе, чтобы HTML не лез в доску и в списки.
+# Разворачиваем ТОЛЬКО ссылку, а не любые угловые скобки: в заголовках этого
+# проекта `<details>` и `<ac:structured-macro>` — осмысленный текст задачи, и
+# общий стрип тегов их съедал, превращая заголовок в «Live-check FR12:  → expand».
+_LINK_RE = re.compile(r'<a\s[^>]*>(.*?)</a>', re.I | re.S)
+
+
+def plain(s):
+    return _LINK_RE.sub(r"\1", s or "")
+
+
 def brief(t, extra=""):
     prio = {0: "!высокий", 1: "обычный", 2: "низкий"}.get(prio_of(t), "?")
     dl = f" дедлайн={t['deadline'][:10]}" if t.get("deadline") else ""
-    return f"{t['id']}  [{prio}]{dl}  {t.get('title', '')}{extra}"
+    return f"{t['id']}  [{prio}]{dl}  {plain(t.get('title', ''))}{extra}"
 
 
 # --------------------------------------------------------------------------- команды
+
+
+# Название пробной задачи для `doctor --write`. Говорит само за себя: если уборка
+# всё-таки не отработает, человек увидит на доске не загадочный «test», а объяснение.
+PROBE_TITLE = "sing.py doctor --write: проба записи (удаляется сразу)"
+PROBE_MARK = "проба записи doctor --write"
+
+
+def _check(results, label, ok, detail=""):
+    """Записать и напечатать результат одного шага пробы."""
+    results.append((label, bool(ok)))
+    print(f"  {'✓' if ok else '✗'} {label:<22} {detail}")
+    return bool(ok)
+
+
+def doctor_write_steps(cfg, results, probe):
+    """Шаги пробы записи. Каждый шаг проверяется ПЕРЕЧИТЫВАНИЕМ состояния.
+
+    HTTP-код здесь ничего не доказывает: этот API умеет ответить 200, ничего не
+    сделав (`change-column` на системных колонках — ровно такой случай).
+    """
+    created = request("POST", "/task", body={"title": PROBE_TITLE,
+                                             "projectId": cfg["projectId"]})
+    probe["task"] = (created or {}).get("id")
+    tid = probe["task"]
+    back = request("GET", f"/task/{tid}", soft=True) if tid else None
+    if not _check(results, "POST /task",
+                  back and back.get("projectId") == cfg["projectId"]
+                  and back.get("title") == PROBE_TITLE,
+                  f"{tid} создана и перечитана в проекте" if back
+                  else "задача не создалась — прав на запись нет"):
+        return
+
+    request("PATCH", f"/task/{tid}",
+            body={"note": note_append(back.get("note"), PROBE_MARK)})
+    note = note_to_text((request("GET", f"/task/{tid}", soft=True) or {}).get("note"))
+    _check(results, "PATCH /task", PROBE_MARK in note,
+           "заметка записалась и прочиталась обратно" if PROBE_MARK in note
+           else "заметка не изменилась (ответ мог быть 200)")
+
+    # todo -> wip -> todo: move_to_column сам перечитывает связку и падает,
+    # если перенос не применился, — SystemExit ловится уровнем выше.
+    move_to_column(tid, col_id(cfg, "todo"))
+    move_to_column(tid, col_id(cfg, "wip"))
+    move_to_column(tid, col_id(cfg, "todo"))
+    _check(results, "канбан-связка", task_column(tid) == col_id(cfg, "todo"),
+           "todo → wip → todo, колонка перечитана после каждого шага")
+
+    item = request("POST", "/checklist-item",
+                   body={"parent": tid, "title": PROBE_MARK, "parentOrder": 0})
+    probe["item"] = (item or {}).get("id")
+    listed = [c["id"] for c in paged("/checklist-item", "checklistItems", {"parent": tid})
+              if not c.get("removed")]
+    _check(results, "чек-лист", probe["item"] and probe["item"] in listed,
+           f"пункт {probe['item']} создан и виден в задаче" if probe["item"] in listed
+           else "пункт не появился в задаче")
+
+    request("POST", f"/task/{tid}/complete")
+    checked_on = int((request("GET", f"/task/{tid}", soft=True) or {}).get("checked") or 0)
+    request("POST", f"/task/{tid}/uncomplete")
+    checked_off = int((request("GET", f"/task/{tid}", soft=True) or {}).get("checked") or 0)
+    _check(results, "complete/uncomplete", checked_on == 1 and checked_off == 0,
+           f"checked {checked_on} → {checked_off}")
+
+
+def doctor_write_cleanup(results, probe):
+    """Убрать пробу и УБЕДИТЬСЯ, что её больше нет. Вызывается всегда, из finally."""
+    if probe.get("item"):
+        request("DELETE", f"/checklist-item/{probe['item']}", soft=True)
+    tid = probe.get("task")
+    if not tid:
+        return
+    request("DELETE", f"/task/{tid}", soft=True)
+    left = request("GET", f"/task/{tid}", soft=True)
+    gone = left is None or left.get("removed") or left.get("deleteDate")
+    _check(results, "уборка пробы", gone,
+           "DELETE /task, задача больше не отдаётся — доска как была" if gone
+           else f"ПРОБА ОСТАЛАСЬ НА ДОСКЕ: {tid} — удалить руками")
+
+
+def doctor_write(cfg):
+    """`--write`: честно проверить права на запись, а не только на чтение.
+
+    Токен может быть read-only, и тогда всё ломается позже — на первом `start`,
+    посреди работы. Проба живёт секунды и удаляется в том же заходе.
+    """
+    print("\nПрава на ЗАПИСЬ (--write): пробная задача создаётся и удаляется здесь же")
+    results, probe = [], {"task": None, "item": None}
+    try:
+        doctor_write_steps(cfg, results, probe)
+    except SystemExit:
+        # die() уже написал причину в stderr; прерываться нельзя — надо убрать пробу
+        _check(results, "проба записи", False, "прервана ошибкой API (сообщение выше)")
+    except Exception as e:                       # уборка важнее красивого traceback
+        _check(results, "проба записи", False, f"прервана: {type(e).__name__}: {e}")
+    finally:
+        doctor_write_cleanup(results, probe)
+    ok = sum(1 for _, good in results if good)
+    if ok == len(results):
+        print(f"✓ токен умеет писать: {ok} из {len(results)} проверок")
+        return
+    failed = ", ".join(label for label, good in results if not good)
+    die(f"✗ запись прошла {ok} из {len(results)} проверок; не прошли: {failed}\n"
+        "  Права токена правятся только пересозданием токена "
+        "(me.singularity-app.com → API).")
 
 
 def cmd_doctor(args):
@@ -500,6 +816,8 @@ def cmd_doctor(args):
     cfg, path = load_config(required=False)
     if not cfg:
         print("· репозиторий не привязан — запусти init")
+        if getattr(args, "write", False):
+            die("Проверять запись негде: проба создаётся в привязанном проекте.", 2)
         return
     print(f"✓ привязка: {path}")
     print(f"  проект: {cfg.get('projectTitle')} ({cfg['projectId']})")
@@ -509,16 +827,33 @@ def cmd_doctor(args):
         cid = (cfg.get("columns") or {}).get(role)
         mark = "✓" if cid in live else "✗"
         print(f"  {mark} {role:8} -> {live.get(cid, 'КОЛОНКА ПРОПАЛА В ТРЕКЕРЕ')}")
+    used_ids = set((cfg.get("columns") or {}).values())
+    # Проверка по именам ловит «В работе» ×2, но пропускает главный случай: своя
+    # «К работе» и системная «Новые» — тот же смысл, разные имена. Поэтому судим
+    # по роли: системная колонка роли живёт, а скилл под эту роль взял другую.
+    suspect = {}
+    for role, suf in SYSTEM_SUFFIX.items():
+        sys_id = f"KS-{cfg['projectId']}{suf}"
+        if sys_id in live and (cfg.get("columns") or {}).get(role) != sys_id:
+            suspect[role] = sys_id
     seen = {}
     for cid, name in live.items():
         seen.setdefault(name.strip().lower(), []).append(cid)
     dups = {n: ids for n, ids in seen.items() if len(ids) > 1}
-    if dups:
-        print("  ⚠ на доске дубли колонок — вероятно, init создал их поверх системных:")
+    if suspect or dups:
+        print("  ⚠ доска раздвоена: рядом с колонками скилла живут системные.")
+        for role, sys_id in sorted(suspect.items()):
+            print(f"      роль {role:8} скилл держит {(cfg.get('columns') or {}).get(role)}"
+                  f" «{live.get((cfg.get('columns') or {}).get(role))}», "
+                  f"а системная {sys_id} «{live[sys_id]}» стоит рядом")
         for name, ids in dups.items():
             for cid in ids:
-                used = " (используется скиллом)" if cid in (cfg.get("columns") or {}).values() else ""
-                print(f"      «{name}» {cid}{used}")
+                mark = " (используется скиллом)" if cid in used_ids else ""
+                print(f"      одинаковое имя «{name}»: {cid}{mark}")
+        print("      системные колонки удалить нельзя — чинится переездом задач на "
+              "них и удалением своих (см. README, раздел про раздвоенную доску).")
+    if getattr(args, "write", False):
+        doctor_write(cfg)
 
 
 def cmd_projects(args):
@@ -538,6 +873,55 @@ def cmd_projects(args):
     hidden = len(projects) - len(items) - 1
     if hidden > 0:
         print(f"\nСкрыто вне области действия скилла: {hidden}")
+
+
+def plan_columns(project_id, names, existing, own_columns, plan):
+    """Разложить роли по колонкам проекта: что переиспользовать, что создать.
+
+    Считается ТОЛЬКО когда проект уже существует — id системных колонок выводится
+    из id проекта, и до его создания их не от чего вычислять.
+    """
+    by_id = {s["id"]: s for s in existing}
+    mapping, to_create, missing_system = {}, [], []
+    for role in COLUMN_ORDER:
+        want = names[role]
+        # 1) системная колонка проекта — приоритет, даже если GET её ещё не отдал
+        sys_id = system_status_id(project_id, role)
+        sys_col = by_id.get(sys_id)
+        if sys_id and not sys_col:
+            # список мог её не отдать — спрашиваем напрямую по id
+            sys_col = request("GET", f"/kanban-status/{sys_id}", soft=True)
+        # 2) иначе колонка с нужным названием
+        hit = next((s for s in existing
+                    if s["name"].strip().lower() == want.strip().lower()), None)
+        if sys_col:
+            mapping[role] = sys_id
+            plan.append(f"ИСПОЛЬЗОВАТЬ системную колонку «{sys_col.get('name')}» (роль {role})")
+        elif hit:
+            mapping[role] = hit["id"]
+            plan.append(f"ИСПОЛЬЗОВАТЬ колонку «{hit['name']}» (роль {role})")
+        else:
+            if sys_id:
+                missing_system.append(role)
+            to_create.append((role, want))
+            plan.append(f"СОЗДАТЬ колонку «{want}» (роль {role})")
+
+    # Системные колонки (todo/wip/done) появляются не всегда сразу: в проекте,
+    # заведённом в приложении и пока пустом, их нет — а через минуту клиент их
+    # досоздаёт. Если сейчас создать свои, доска раздвоится: наблюдали на живой
+    # сессии — init в 14:17:34 создал пять колонок, приложение в 14:18:17 добавило
+    # свои три, и на доске стало две «В работе» и две «Готово» с одинаковым порядком.
+    # Удалить системные нельзя (DELETE отвечает ошибкой), создать их с нужным id
+    # тоже нельзя — значит, единственная защита в том, чтобы не начинать.
+    if missing_system and not own_columns:
+        die("Канбан проекта ещё не развёрнут: системных колонок "
+            + ", ".join(f"«{names[r]}» ({r})" for r in missing_system) + " нет.\n"
+            "  Создать свои поверх — значит получить доску-двойник: приложение "
+            "досоздаст системные позже, и они встанут рядом с одинаковыми именами.\n"
+            "  Открой проект в приложении один раз (или заведи в нём любую задачу), "
+            "дай ему синхронизироваться и повтори init.\n"
+            "  Осознанно хочешь свои колонки вместо системных — явно: --own-columns.")
+    return mapping, to_create
 
 
 def cmd_init(args):
@@ -589,35 +973,26 @@ def cmd_init(args):
     names = dict(DEFAULT_COLUMNS)
     if args.columns:
         names.update(json.loads(args.columns))
-    by_id = {s["id"]: s for s in existing}
-    mapping, to_create = {}, []
-    for role in COLUMN_ORDER:
-        want = names[role]
-        # 1) системная колонка проекта — приоритет, даже если GET её ещё не отдал
-        sys_id = system_status_id(target["id"], role) if target else None
-        sys_col = by_id.get(sys_id)
-        if sys_id and not sys_col:
-            # список мог её не отдать — спрашиваем напрямую по id
-            sys_col = request("GET", f"/kanban-status/{sys_id}", soft=True)
-        # 2) иначе колонка с нужным названием
-        hit = next((s for s in existing
-                    if s["name"].strip().lower() == want.strip().lower()), None)
-        if sys_col:
-            mapping[role] = sys_id
-            plan.append(f"ИСПОЛЬЗОВАТЬ системную колонку «{sys_col.get('name')}» (роль {role})")
-        elif hit:
-            mapping[role] = hit["id"]
-            plan.append(f"ИСПОЛЬЗОВАТЬ колонку «{hit['name']}» (роль {role})")
-        else:
-            to_create.append((role, want))
-            plan.append(f"СОЗДАТЬ колонку «{want}» (роль {role})")
+
+    if target:
+        mapping, to_create = plan_columns(target["id"], names, existing,
+                                          args.own_columns, plan)
+    else:
+        # Проекта ещё нет — системные id считать не от чего. Раскладку колонок
+        # определяем ПОСЛЕ создания: иначе создаются все пять, а сервер отдаёт
+        # свои три сразу же, и новый проект рождается с раздвоенной доской.
+        mapping, to_create = {}, []
+        plan.append("РАЗОБРАТЬ колонки после создания проекта "
+                    "(системные становятся известны только тогда)")
 
     # уже привязанный репозиторий переписываем на месте, новый получает
     # нейтральный `.agents/` — он общий для всех пяти инструментов
-    root = os.path.abspath(args.path)
-    cfg_path = find_config(root)
-    if not cfg_path or not cfg_path.startswith(root + os.sep):
-        cfg_path = os.path.join(root, CONFIG_LOCATIONS[0])
+    # ВНИМАНИЕ: не `root` — это имя занято проектом-корнем области, и его затирание
+    # ломало создание нового проекта ниже (`root["id"]` по строке пути → TypeError).
+    repo_root = os.path.abspath(args.path)
+    cfg_path = find_config(repo_root)
+    if not cfg_path or not cfg_path.startswith(repo_root + os.sep):
+        cfg_path = os.path.join(repo_root, CONFIG_LOCATIONS[0])
     plan.append(f"ЗАПИСАТЬ {cfg_path}")
 
     if not args.apply:
@@ -630,8 +1005,16 @@ def cmd_init(args):
         created = request("POST", "/project",
                           body={"title": args.project, "parent": root["id"]})
         target = created.get("project", created)
+        forget_projects()
         assert_allowed(target["id"], "созданный проект")
         print(f"создан проект {target['id']} внутри «{root['title']}»")
+        # только теперь системные колонки существуют и имеют вычислимый id
+        after = [s for s in project_statuses(target["id"]) if not s.get("removed")]
+        lines = []
+        mapping, to_create = plan_columns(target["id"], names, after,
+                                          args.own_columns, lines)
+        for line in lines:
+            print("  · " + line)
     fresh = project_statuses(target["id"])
     for role, want in to_create:
         st = request("POST", "/kanban-status",
@@ -650,6 +1033,59 @@ def cmd_init(args):
     print(f"записан {cfg_path}")
 
 
+# Потолок ширины колонки «кто держит»: одно неудачно длинное имя агента не
+# должно сдвинуть всю доску вправо. Длиннее — обрезается многоточием.
+HOLDER_COL_MAX = 16
+
+
+def board_holders(tasks):
+    """taskId -> «@имя» держателя по тегам `agent:*` (несколько — через запятую).
+
+    Один общий GET /tag на всю доску: справочник тегов в аккаунте один, теги
+    у задачи лежат массивом id, и поштучно их разворачивать незачем — цена
+    ровно та же, что у `list` (см. cmd_list).
+
+    Если ни на одной показанной задаче тегов нет — запроса не будет вовсе:
+    доска нового проекта не должна дорожать ради колонки, которая всё равно
+    окажется пустой.
+    """
+    if not any(t.get("tags") for t in tasks):
+        return {}
+    titles = {tg["id"]: (tg.get("title") or "") for tg in paged("/tag", "tags")}
+    holders = {}
+    for t in tasks:
+        who = sorted(titles[x][len(AGENT_TAG_PREFIX):] for x in (t.get("tags") or [])
+                     if titles.get(x, "").startswith(AGENT_TAG_PREFIX))
+        if who:
+            holders[t["id"]] = "@" + ",".join(who)
+    return holders
+
+
+def board_pad(holders):
+    """Форматтер левой колонки доски: фиксированная ширина, метка ПЕРЕД задачей.
+
+    Держатель печатается слева, а не в хвосте строки, именно из-за длины
+    заголовков: в хвосте метка у каждой строки вставала бы в своё место, и
+    «кто занят» пришлось бы вычитывать построчно вместо взгляда вдоль колонки.
+    Ширина считается по тому, что реально печатается (а не по всем задачам
+    проекта), и ограничена HOLDER_COL_MAX.
+
+    Тегов на доске нет — колонки нет: вывод байт в байт совпадает с прежним.
+    """
+    if not holders:
+        return lambda who: "  "
+    width = min(max(len(v) for v in holders.values()), HOLDER_COL_MAX)
+
+    def pad(who):
+        if not who:
+            return "  " + " " * width + "  "
+        if len(who) > width:
+            who = who[:width - 1] + "…"
+        return f"  {who:<{width}}  "
+
+    return pad
+
+
 def cmd_board(args):
     cfg, _ = load_config()
     statuses = {s["id"]: s["name"] for s in project_statuses(cfg["projectId"])}
@@ -657,7 +1093,11 @@ def cmd_board(args):
     by_col = {}
     for t in live_tasks(cfg["projectId"]):
         by_col.setdefault(cmap.get(t["id"]), []).append(t)
-    print(f"{cfg.get('projectTitle')} ({cfg['projectId']})")
+
+    # Раскладку считаем до печати: и теги, и ширина колонки держателя должны
+    # опираться на то, что реально попадёт на экран, а не на весь проект —
+    # иначе скрытые под --limit закрытые задачи раздвигали бы доску.
+    layout = []
     for role in COLUMN_ORDER:
         cid = (cfg.get("columns") or {}).get(role)
         items = by_col.get(cid, [])
@@ -665,16 +1105,36 @@ def cmd_board(args):
         if role == "done":  # закрытых копится много — показываем свежие
             shown = sorted(items, key=lambda t: t.get("modificatedDate") or "",
                            reverse=True)[:args.limit]
-        print(f"\n[{role}] {statuses.get(cid, '?')} — {len(items)}"
-              + (f" (показаны {len(shown)})" if len(shown) < len(items) else ""))
-        for t in sorted(shown, key=prio_of):
-            done = " ✓" if int(t.get("checked") or 0) == 1 else ""
-            print("  " + brief(t) + done)
+        layout.append((role, cid, statuses.get(cid, "?"), items,
+                       sorted(shown, key=prio_of)))
     loose = [t for t in by_col.get(None, []) if int(t.get("checked") or 0) == 0]
+    holders = board_holders([t for *_, shown in layout for t in shown] + loose)
+    pad = board_pad(holders)
+
+    print(f"{cfg.get('projectTitle')} ({cfg['projectId']})")
+
+    # Плохие новости — вперёд. Сирота без колонки и лишние колонки печатались
+    # последними и ничем не выделялись: на живой сессии агент не заметил ни того,
+    # ни другого за шесть вызовов подряд и завёл дубль задачи.
     if loose:
-        print(f"\n[вне колонок] — {len(loose)}")
+        print(f"\n⚠ ВНЕ КОЛОНОК — {len(loose)}: задача есть, на доске её не видно."
+              "\n  почини: sing.py move <id> <роль>")
         for t in loose:
-            print("  " + brief(t))
+            print(pad(holders.get(t["id"])) + brief(t))
+    known = set((cfg.get("columns") or {}).values())
+    extra = {cid: name for cid, name in statuses.items() if cid not in known}
+    if extra:
+        print(f"\n⚠ КОЛОНКИ МИМО ПРИВЯЗКИ — {len(extra)}: доска шире, чем знает скилл."
+              "\n  разобраться: sing.py doctor")
+        for cid, name in sorted(extra.items(), key=lambda x: x[1]):
+            print(f"  {cid}  «{name}»  задач={len(by_col.get(cid, []))}")
+
+    for role, cid, name, items, shown in layout:
+        print(f"\n[{role}] {name} — {len(items)}"
+              + (f" (показаны {len(shown)})" if len(shown) < len(items) else ""))
+        for t in shown:
+            done = " ✓" if int(t.get("checked") or 0) == 1 else ""
+            print(pad(holders.get(t["id"])) + brief(t) + done)
 
 
 def _pick_pool(cfg, role, include_done=False, group=None):
@@ -786,7 +1246,16 @@ def cmd_show(args):
     cfg, _ = load_config(required=False)
     t = assert_task_allowed(args.id, cfg)
     print(brief(t))
+    # Колонка и теги — не украшение: по карточке не было видно ни где задача на
+    # доске, ни держит ли её уже другой агент, а инструментов над этим трекером пять.
+    cid = task_column(args.id)
+    roles = {v: k for k, v in (cfg or {}).get("columns", {}).items()}
+    names = {s["id"]: s["name"] for s in project_statuses(t["projectId"])}
+    where = "ВНЕ КОЛОНОК ⚠" if not cid else f"{names.get(cid, cid)} [{roles.get(cid, 'мимо привязки')}]"
+    tag_titles = {x["id"]: x["title"] for x in paged("/tag", "tags")}
+    marks = " ".join("#" + tag_titles.get(x, x) for x in (t.get("tags") or []))
     print("проект:", t.get("projectId"), "| выполнена:", t.get("checked"))
+    print("колонка:", where, ("| теги: " + marks) if marks else "| тегов нет")
     note = note_to_text(t.get("note"))
     if note:
         print("\n--- заметка ---\n" + note)
@@ -799,14 +1268,15 @@ def cmd_start(args):
         die(f"{args.id}: нужен план — что собираешься сделать, в двух-трёх пунктах.\n"
             f"  sing.py start {args.id} --plan \"...\"\n"
             "Задача на одно движение и планировать нечего — явно: --no-plan.")
+    # Захват — первым действием: проигравший гонку не должен успеть подвинуть доску.
+    who = claim_task(args.id, cfg, args.agent, take_over=args.take_over)
     res = move_to_column(args.id, col_id(cfg, "wip"))
-    who = mark_agent(args.id, cfg, args.agent)
     if args.plan:
         # план пишем после захвата: если задачу перехватили, план не мусорит в чужой карточке
         fresh = request("GET", f"/task/{args.id}")
         request("PATCH", f"/task/{args.id}",
-                body={"note": note_append(fresh.get("note"),
-                                          f"ПЛАН ({AGENT_TAG_PREFIX}{who}): {args.plan}")})
+                body={"note": note_append(fresh.get("note"), args.plan,
+                                          label=f"ПЛАН ({AGENT_TAG_PREFIX}{who})")})
     print(f"{args.id}: {res} (в работе), тег {AGENT_TAG_PREFIX}{who}"
           + (", план записан" if args.plan else ", без плана"))
 
@@ -821,8 +1291,8 @@ def cmd_release(args):
     task = assert_task_allowed(args.id, cfg)
     if args.report:
         request("PATCH", f"/task/{args.id}",
-                body={"note": note_append(task.get("note"),
-                                          "ВОЗВРАТ В ОЧЕРЕДЬ: " + args.report)})
+                body={"note": note_append(task.get("note"), args.report,
+                                          label="ВОЗВРАТ В ОЧЕРЕДЬ")})
     if int(task.get("checked") or 0) == 1:
         request("POST", f"/task/{args.id}/uncomplete")
     who = agent_name(cfg, args.agent)
@@ -850,12 +1320,22 @@ def cmd_done(args):
             f"  sing.py done {args.id} --report \"...\"\n"
             "Карточка без результата бесполезна: через неделю неясно, что именно закрыли.\n"
             "Совсем нечего написать — явно: --no-report.")
+    # Обязательность плана держалась только со стороны `start`, и обойти её было
+    # штатным путём: `done` по задаче из очереди закрывал её с РЕЗУЛЬТАТОМ, но
+    # вообще без ПЛАНА. Наблюдали на живой сессии — карточка T-fcbdb208.
+    if not args.no_plan and "ПЛАН (" not in note_to_text(task.get("note")):
+        col = task_column(args.id)
+        if col != col_id(cfg, "wip"):
+            die(f"{args.id}: задача не бралась в работу — ни ПЛАНа в карточке, ни "
+                "колонки «в работе».\n"
+                f"  сначала: sing.py start {args.id} --plan \"...\"\n"
+                "Задача на одно движение и планировать нечего — явно: --no-plan.")
     if args.report:
         label = "НА ПРОВЕРКУ" if args.review else "РЕЗУЛЬТАТ"
         who = agent_name(cfg, getattr(args, "agent", None))
         request("PATCH", f"/task/{args.id}",
-                body={"note": note_append(task.get("note"),
-                                          f"{label} ({AGENT_TAG_PREFIX}{who}): {args.report}")})
+                body={"note": note_append(task.get("note"), args.report,
+                                          label=f"{label} ({AGENT_TAG_PREFIX}{who})")})
     mark_agent(args.id, cfg, getattr(args, "agent", None))
     role = "review" if args.review else "done"
     move_to_column(args.id, col_id(cfg, role))
@@ -868,14 +1348,53 @@ def cmd_block(args):
     cfg, _ = load_config()
     t = assert_task_allowed(args.id, cfg)
     request("PATCH", f"/task/{args.id}",
-            body={"note": note_append(t.get("note"), "БЛОКЕР: " + args.reason)})
+            body={"note": note_append(t.get("note"), args.reason, label="БЛОКЕР")})
     mark_agent(args.id, cfg, getattr(args, "agent", None))
     move_to_column(args.id, col_id(cfg, "blocked"))
     print(f"{args.id}: заблокирована, причина записана в заметку")
 
 
+def same_title(a, b):
+    """Сравнение заголовков «на глаз»: без HTML, регистра и лишних пробелов.
+
+    HTML тут не теория: клиент приложения оборачивает похожее на домен в <a href>,
+    и после синхронизации тот же самый заголовок перестаёт совпадать побайтно.
+    """
+    norm = lambda s: " ".join(plain(s or "").split()).strip().lower()
+    return norm(a) == norm(b)
+
+
 def cmd_add(args):
     cfg, _ = load_config()
+    # Наблюдение с живой сессии: из 11 вызовов `add` ни один не пришёл с --note,
+    # и вся очередь встала на доску голыми заголовками. Пользователь это увидел
+    # как «в карточках нет описания» — описание не потерялось, его не писали.
+    # План и результат обязательны, а постановка задачи была необязательной:
+    # именно её читает человек, решая, браться ли.
+    if not args.note and not args.no_note:
+        die(f"«{args.title}»: нужно описание — что сделать и как понять, что готово.\n"
+            f"  sing.py add \"...\" --note \"...\"\n"
+            "Заголовок на доске виден целиком, карточка нужна ради подробностей:\n"
+            "контекст, критерий приёмки, где смотреть. Заголовок исчерпывает задачу —\n"
+            "явно: --no-note.")
+    # Механизм под правило «доска — первое действие»: само правило кодом не
+    # подпирается, а вот его следствие — да. На живой сессии оборвавшийся `add`
+    # оставил задачу без колонки, агент не посмотрел доску и создал её заново —
+    # T-07bd60fd и T-3874bba6 с побайтно одинаковым заголовком.
+    if not args.dup_ok:
+        twins = [t for t in open_tasks(cfg["projectId"])
+                 if same_title(t.get("title"), args.title)]
+        if twins:
+            cmap = column_map(cfg["projectId"])
+            roles = {v: k for k, v in (cfg.get("columns") or {}).items()}
+            lines = "\n".join(
+                f"    {t['id']}  [{roles.get(cmap.get(t['id']), 'вне колонок')}]"
+                for t in twins)
+            die(f"Такая задача уже открыта — {len(twins)} шт.:\n{lines}\n"
+                "  Продолжить её, а не заводить вторую: sing.py show <id>\n"
+                "  Задача «вне колонок» — это оборвавшийся add, чинится: "
+                "sing.py move <id> todo\n"
+                "  Нужны две задачи с одним заголовком — явно: --dup-ok.")
     body = {"title": args.title, "projectId": cfg["projectId"]}
     if args.note:
         body["note"] = note_append(None, args.note)
@@ -889,8 +1408,43 @@ def cmd_add(args):
     if args.deadline:
         body["deadline"] = args.deadline
     t = request("POST", "/task", body=body)
-    move_to_column(t["id"], col_id(cfg, args.column))
-    print(f"{t['id']}: создана в колонке '{args.column}' — {args.title}")
+    tid = t["id"]
+    # Задача уже создана. Всё, что упадёт дальше, обязано назвать её id: без него
+    # сироту не найти — на доске она проваливается в «вне колонок», и агент просто
+    # создаёт задачу заново. Ровно так на живой сессии появился дубль.
+    if move_to_column(tid, col_id(cfg, args.column), fatal=False) is None:
+        die(f"{tid}: СОЗДАНА, но осталась без колонки (сеть не дала привязать).\n"
+            f"  задача существует, повторный add сделает дубль — почини её:\n"
+            f"    sing.py move {tid} {args.column}")
+    print(f"{tid}: создана в колонке '{args.column}' — {args.title}")
+
+
+def cmd_move(args):
+    """Поставить задачу в колонку, ничего больше не трогая.
+
+    Нужна для починки: задача без колонки (упал `add`) видна только в разделе
+    «вне колонок», а вернуть её было нечем — `release` заодно снимает теги и
+    отметку выполнения, то есть чинит не то.
+    """
+    cfg, _ = load_config()
+    assert_task_allowed(args.id, cfg)
+    res = move_to_column(args.id, col_id(cfg, args.column))
+    print(f"{args.id}: {res} — {args.column}")
+
+
+def cmd_rm(args):
+    """Удалить задачу. Для уборки за собой: правила требуют убирать тестовые
+    данные в тот же заход, а команды удаления в скилле не было вовсе."""
+    cfg, _ = load_config(required=False)
+    t = assert_task_allowed(args.id, cfg)
+    title = t.get("title", "")
+    if not args.yes:
+        die(f"{args.id}: «{title}»\n"
+            "  удаление необратимо — подтверди явно: sing.py rm <id> --yes")
+    request("DELETE", f"/task/{args.id}")
+    if request("GET", f"/task/{args.id}", soft=True) is not None:
+        die(f"{args.id}: сервер ответил, но задача на месте — не удалена.")
+    print(f"{args.id}: удалена — {title}")
 
 
 def cmd_checklist(args):
@@ -913,7 +1467,11 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("doctor", help="проверить токен и привязку репо").set_defaults(fn=cmd_doctor)
+    sp = sub.add_parser("doctor", help="проверить токен и привязку репо")
+    sp.add_argument("--write", action="store_true",
+                    help="проверить и права на запись: пробная задача создаётся "
+                         "в привязанном проекте и удаляется в том же заходе")
+    sp.set_defaults(fn=cmd_doctor)
 
     sp = sub.add_parser("projects", help="список проектов")
     sp.add_argument("--json", action="store_true")
@@ -923,6 +1481,9 @@ def main():
     sp.add_argument("--project", required=True, help="название проекта или P-id")
     sp.add_argument("--path", default=".", help="корень репозитория")
     sp.add_argument("--columns", help='JSON вида {"todo":"К работе",...}')
+    sp.add_argument("--own-columns", action="store_true",
+                    help="создать свои колонки, даже если системных ещё нет "
+                         "(доска раздвоится, когда приложение досоздаст свои)")
     sp.add_argument("--apply", action="store_true", help="выполнить план")
     sp.set_defaults(fn=cmd_init)
 
@@ -966,6 +1527,8 @@ def main():
     sp.add_argument("--plan", help="что собираешься сделать, в двух-трёх пунктах")
     sp.add_argument("--no-plan", action="store_true",
                     help="осознанно без плана (задача на одно движение)")
+    sp.add_argument("--take-over", action="store_true",
+                    help="забрать задачу, занятую другим агентом (снимет его метку)")
     sp.add_argument("--agent", help="имя агента (по умолчанию $SINGULARITY_AGENT)")
     sp.set_defaults(fn=cmd_start)
 
@@ -981,6 +1544,8 @@ def main():
     sp.add_argument("--no-report", action="store_true",
                     help="осознанно без результата")
     sp.add_argument("--review", action="store_true", help="в колонку review, не закрывать")
+    sp.add_argument("--no-plan", action="store_true",
+                    help="закрыть задачу, которую не брали через start")
     sp.add_argument("--agent")
     sp.set_defaults(fn=cmd_done)
 
@@ -1003,10 +1568,24 @@ def main():
     sp.add_argument("--new-group", action="store_true",
                     help="завести секцию, если её нет")
     sp.add_argument("--column", default="todo", choices=COLUMN_ORDER)
-    sp.add_argument("--note")
+    sp.add_argument("--dup-ok", action="store_true",
+                    help="завести, даже если задача с таким заголовком уже открыта")
+    sp.add_argument("--note", help="описание: что сделать, критерий готовности")
+    sp.add_argument("--no-note", action="store_true",
+                    help="осознанно без описания (заголовок исчерпывает задачу)")
     sp.add_argument("--priority", type=int, choices=[0, 1, 2])
     sp.add_argument("--deadline", help="ISO-дата")
     sp.set_defaults(fn=cmd_add)
+
+    sp = sub.add_parser("move", help="переставить задачу в колонку (починка доски)")
+    sp.add_argument("id")
+    sp.add_argument("column", choices=COLUMN_ORDER)
+    sp.set_defaults(fn=cmd_move)
+
+    sp = sub.add_parser("rm", help="удалить задачу (уборка за собой)")
+    sp.add_argument("id")
+    sp.add_argument("--yes", action="store_true", help="подтвердить удаление")
+    sp.set_defaults(fn=cmd_rm)
 
     sp = sub.add_parser("checklist", help="добавить пункты чек-листа в задачу")
     sp.add_argument("id")
