@@ -3,11 +3,18 @@
 #
 #   tools/install.sh                  — сверить и раскатать во все доступные цели
 #   tools/install.sh --check          — только сверить; код 1, если есть расхождение
+#   tools/install.sh --check --quiet  — то же без подробностей: список разошедшихся
+#                                       целей одной строкой, при совпадении — молчок
 #   tools/install.sh --list           — куда раскатывается и что установлено сейчас
 #   tools/install.sh --target codex   — только одна цель
+#   tools/install.sh --force          — раскатать из git worktree (по умолчанию отказ)
 #
 # Источник правды — этот репозиторий. Каталоги целей перезаписываются целиком:
 # правки, сделанные прямо в них, теряются. В этом и смысл сверки.
+#
+# `--check --quiet` — общий примитив сверки: им же пользуется scripts/sing.py,
+# чтобы предупредить о расхождении в момент start/done. Логика сверки должна
+# оставаться в одном месте, иначе два «одинаковых» ответа разъедутся.
 #
 # Формат SKILL.md общий для всех пяти инструментов, различаются только пути.
 # ВАЖНО, эти каталоги легко перепутать:
@@ -19,30 +26,59 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BACKUP_ROOT="${SINGULARITY_BACKUP_ROOT:-$HOME/.singularity-tasks-backup}"
 ITEMS=(SKILL.md README.md scripts references)
 # мусор компиляции не является частью скилла и не должен считаться расхождением
 DIFF_EXCL=(-x __pycache__ -x "*.pyc")
 
+# Корень, от которого считаются каталоги инструментов. Переопределяется только для
+# проверки самого установщика в песочнице: иначе единственный способ убедиться, что
+# сверка молчит при совпадении, — сначала испортить живые каталоги пяти агентов.
+# В бою переменная не задаётся, целями остаются каталоги пользователя.
+TARGET_HOME="${SINGULARITY_TARGET_HOME:-$HOME}"
+# Бэкап по умолчанию считается от того же корня, что и цели: прогон в песочнице
+# иначе затрёт настоящие бэкапы копией из песочницы — то есть сломает путь отката
+# ровно тем действием, которое затевалось, чтобы ничего не сломать.
+BACKUP_ROOT="${SINGULARITY_BACKUP_ROOT:-$TARGET_HOME/.singularity-tasks-backup}"
+
 # имя|признак установленного инструмента|куда класть скилл
 # bash 3.2 (штатный на macOS) не умеет ассоциативные массивы — держим строкой
-TARGETS="claude|$HOME/.claude|$HOME/.claude/skills/singularity-tasks
-codex|$HOME/.codex|$HOME/.codex/skills/singularity-tasks
-opencode|$HOME/.config/opencode|$HOME/.config/opencode/skills/singularity-tasks
-antigravity|$HOME/.gemini/config|$HOME/.gemini/config/skills/singularity-tasks
-qwen|$HOME/.qwen|$HOME/.qwen/skills/singularity-tasks"
+TARGETS="claude|$TARGET_HOME/.claude|$TARGET_HOME/.claude/skills/singularity-tasks
+codex|$TARGET_HOME/.codex|$TARGET_HOME/.codex/skills/singularity-tasks
+opencode|$TARGET_HOME/.config/opencode|$TARGET_HOME/.config/opencode/skills/singularity-tasks
+antigravity|$TARGET_HOME/.gemini/config|$TARGET_HOME/.gemini/config/skills/singularity-tasks
+qwen|$TARGET_HOME/.qwen|$TARGET_HOME/.qwen/skills/singularity-tasks"
 
 mode="install"
 only=""
+quiet=""
+force=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --check)  mode="check" ;;
         --list)   mode="list" ;;
+        --quiet)  quiet="quiet" ;;
+        --force)  force=1 ;;
         --target) only="${2:-}"; shift ;;
         *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
     esac
     shift
 done
+
+# Раскатка из git worktree затрёт общие каталоги пяти инструментов содержимым
+# отдельной ветки — вместе с незакоммиченной работой того, кто в этом worktree
+# сидит, и поверх работы параллельных сессий. Сверять из worktree можно и нужно,
+# раскатывать — только осознанно.
+if [[ "$mode" == "install" && $force -eq 0 && -f "$SRC/.git" ]]; then
+    cat >&2 <<EOF
+Отказ: это git worktree ($SRC), а не основной рабочий каталог репозитория.
+Раскатка отсюда зальёт в общие каталоги пяти инструментов содержимое этой ветки,
+включая незакоммиченное, и затрёт работу параллельных сессий.
+Раскатывать после слияния из основного каталога. Сверить отсюда можно:
+    tools/install.sh --check
+Если это осознанное решение — tools/install.sh --force
+EOF
+    exit 2
+fi
 
 # --------------------------------------------------------------------- вспомогательное
 
@@ -93,6 +129,7 @@ deploy() {
 
 any=0
 drift=0
+drift_names=""
 installed=0
 
 while IFS='|' read -r name probe dst; do
@@ -101,7 +138,8 @@ while IFS='|' read -r name probe dst; do
     any=1
 
     if [[ ! -d "$probe" ]]; then
-        echo "· $name — инструмент не установлен ($probe), пропуск"
+        # не установленный инструмент — не расхождение: нечему расходиться
+        [[ -n "$quiet" ]] || echo "· $name — инструмент не установлен ($probe), пропуск"
         continue
     fi
 
@@ -115,11 +153,12 @@ while IFS='|' read -r name probe dst; do
             printf "· %-12s %-8s %s\n" "$name" "$state" "$dst"
             ;;
         check)
-            if target_drift "$dst"; then
-                echo "· $name — совпадает"
+            if target_drift "$dst" "$quiet"; then
+                [[ -n "$quiet" ]] || echo "· $name — совпадает"
             else
-                echo "· $name — расхождение (см. выше)"
+                [[ -n "$quiet" ]] || echo "· $name — расхождение (см. выше)"
                 drift=1
+                drift_names="${drift_names:+$drift_names, }$name"
             fi
             ;;
         install)
@@ -142,11 +181,21 @@ fi
 case "$mode" in
     check)
         if [[ $drift -eq 1 ]]; then
+            # quiet: только список целей в stdout — его разбирает вызывающий (sing.py).
+            # Молчание при совпадении здесь принципиально: гейт, который печатает
+            # что-то на каждом запуске, перестают читать.
+            if [[ -n "$quiet" ]]; then
+                echo "$drift_names"
+                exit 1
+            fi
             echo
             echo "Расхождение эталона и установленного. Раскатать: tools/install.sh"
             echo "Если правка была сделана в цели — сначала перенести её в репозиторий,"
             echo "иначе установка её затрёт."
             exit 1
+        fi
+        if [[ -n "$quiet" ]]; then
+            exit 0
         fi
         echo
         echo "✓ все цели совпадают с эталоном"
