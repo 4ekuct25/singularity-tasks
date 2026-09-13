@@ -1207,9 +1207,74 @@ def repo_project_name(path="."):
     return os.path.basename(root.rstrip(os.sep))
 
 
+# Правило «работа идёт по доске» кладётся в правила самого репозитория: агент,
+# зашедший в него, должен узнать о доске оттуда, а не от человека в каждом промпте.
+# AGENTS.md читают Codex, OpenCode, Antigravity и Qwen; Claude Code читает CLAUDE.md,
+# поэтому рядом заводится заглушка-ссылка — но ТОЛЬКО если её ещё нет: чужие правила
+# перезаписывать нельзя.
+AGENTS_MARK = "<!-- singularity-tasks: работа по доске -->"
+
+
+def agents_rule_text(project_title, cfg_path, repo_root):
+    rel = os.path.relpath(cfg_path, repo_root)
+    return f"""{AGENTS_MARK}
+## Задачи — на доске трекера
+
+Работа в этом репозитории ведётся по доске SingularityApp, проект «{project_title}»
+(привязка — `{rel}`). Правила и команды — в скилле `singularity-tasks`, его `SKILL.md`.
+
+- До любых правок — `sing.py board`. Работа берётся из очереди: `next` → `start --plan`
+  → … → `done --report`. Задача не отражена на доске — её как будто не было.
+- Работа не из очереди (нашёл попутно, попросили в чате) — сначала `add` с описанием,
+  потом `start`. Заводить задачу задним числом поздно: в очереди могла уже лежать
+  карточка ровно про это, с готовой постановкой.
+- Не заканчивать сессию с задачей в колонке «В работе».
+"""
+
+
+def ensure_agents_rule(repo_root, project_title, cfg_path, apply=False, plan=None):
+    """Прописать правило в AGENTS.md репозитория. Идемпотентно.
+
+    Возвращает список сделанного (или запланированного). Существующий текст не
+    трогает — дописывает в конец; повторный запуск ничего не добавляет.
+    """
+    done = []
+    agents = os.path.join(repo_root, "AGENTS.md")
+    block = agents_rule_text(project_title, cfg_path, repo_root)
+    have = ""
+    if os.path.exists(agents):
+        with open(agents, encoding="utf-8") as f:
+            have = f.read()
+    if AGENTS_MARK not in have:
+        done.append(("ДОПИСАТЬ правило работы по доске в " if have else
+                     "СОЗДАТЬ ") + agents)
+        if apply:
+            with open(agents, "a", encoding="utf-8") as f:
+                f.write(("\n" if have and not have.endswith("\n") else "") +
+                        ("\n" if have else "") + block)
+            with open(agents, encoding="utf-8") as f:
+                if AGENTS_MARK not in f.read():
+                    die(f"{agents}: правило не записалось.")
+
+    claude = os.path.join(repo_root, "CLAUDE.md")
+    if not os.path.exists(claude):
+        done.append(f"СОЗДАТЬ {claude} — заглушка @AGENTS.md (Claude Code читает её)")
+        if apply:
+            with open(claude, "w", encoding="utf-8") as f:
+                f.write("@AGENTS.md\n")
+    elif "AGENTS.md" not in open(claude, encoding="utf-8").read():
+        # чужой файл не трогаем: там могут быть правила, которые не наши
+        done.append(f"⚠ {claude} существует и не ссылается на AGENTS.md — "
+                    "Claude Code правило про доску не увидит, поправьте руками")
+    if plan is not None:
+        plan.extend(d for d in done)
+    return done
+
+
 def cmd_init(args):
     """По умолчанию — сухой прогон: показывает план, ничего не меняет."""
-    if not args.project:
+    guessed = not args.project
+    if guessed:
         args.project = repo_project_name(args.path)
         print(f"Проект не указан — беру имя репозитория: «{args.project}»")
     projects = all_projects()
@@ -1280,6 +1345,20 @@ def cmd_init(args):
     if not cfg_path or not cfg_path.startswith(repo_root + os.sep):
         cfg_path = os.path.join(repo_root, CONFIG_LOCATIONS[0])
     plan.append(f"ЗАПИСАТЬ {cfg_path}")
+    ensure_agents_rule(repo_root, (target or {}).get("title") or args.project,
+                       cfg_path, apply=False, plan=plan)
+
+    # Привязка к существующему проекту — рутина; создание нового в трекере человека
+    # рутиной не является. По УГАДАННОМУ имени не создаём: иначе опечатка в имени
+    # каталога или запуск не в том месте тихо заводят лишний проект. Проверено на
+    # себе: повторный `init --apply` без --project из каталога проверки создал в
+    # трекере проект «init-proba» вместе с колонками.
+    if args.apply and not target and guessed:
+        die(f"Проекта «{args.project}» в «{root['title']}» нет, а имя я угадал по "
+            "каталогу репозитория.\n"
+            "  Создавать проект по догадке не буду — назови явно:\n"
+            f'    sing.py init --project "{args.project}" --apply\n'
+            "  Либо укажи существующий: sing.py projects")
 
     if not args.apply:
         print("\nПлан (ничего не изменено, добавь --apply):")
@@ -1317,6 +1396,9 @@ def cmd_init(args):
     }
     save_config(cfg, cfg_path)
     print(f"записан {cfg_path}")
+    for line in ensure_agents_rule(repo_root, target.get("title") or args.project,
+                                   cfg_path, apply=True):
+        print("  " + line)
 
 
 # Потолок ширины колонки «кто держит»: одно неудачно длинное имя агента не

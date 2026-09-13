@@ -670,3 +670,47 @@ class RepoProjectNameTest(unittest.TestCase):
         d = os.path.join(self.tmp, "хвост")
         os.makedirs(d)
         self.assertEqual(sing.repo_project_name(d + os.sep), "хвост")
+
+
+class AgentsRuleTest(unittest.TestCase):
+    """После привязки правило «работа по доске» обязано оказаться в правилах
+    репозитория: агент, зашедший в него, узнаёт о доске оттуда, а не из промпта."""
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.repo, True)
+        self.cfg = os.path.join(self.repo, ".agents", "singularity.json")
+
+    def _apply(self):
+        return sing.ensure_agents_rule(self.repo, "проект", self.cfg, apply=True)
+
+    def _read(self, name):
+        with open(os.path.join(self.repo, name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_creates_both_files_in_an_empty_repo(self):
+        self._apply()
+        self.assertIn(sing.AGENTS_MARK, self._read("AGENTS.md"))
+        self.assertEqual(self._read("CLAUDE.md").strip(), "@AGENTS.md",
+                         "Claude Code читает CLAUDE.md — без заглушки правило не видно")
+
+    def test_second_run_does_not_duplicate(self):
+        self._apply()
+        self.assertEqual(self._apply(), [], "повторный запуск обязан быть пустым")
+        self.assertEqual(self._read("AGENTS.md").count(sing.AGENTS_MARK), 1)
+
+    def test_existing_rules_are_kept(self):
+        with open(os.path.join(self.repo, "AGENTS.md"), "w", encoding="utf-8") as f:
+            f.write("# Свои правила\n\nНе трогать vendor/.\n")
+        self._apply()
+        text = self._read("AGENTS.md")
+        self.assertIn("Не трогать vendor/.", text, "чужие правила затёрты")
+        self.assertLess(text.index("Не трогать"), text.index(sing.AGENTS_MARK))
+
+    def test_foreign_claude_md_is_warned_about_not_overwritten(self):
+        with open(os.path.join(self.repo, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write("Чужие правила, не заглушка.\n")
+        done = self._apply()
+        self.assertEqual(self._read("CLAUDE.md"), "Чужие правила, не заглушка.\n")
+        self.assertTrue(any("не ссылается на AGENTS.md" in d for d in done),
+                        "молчаливое «не видно правила» хуже предупреждения")
