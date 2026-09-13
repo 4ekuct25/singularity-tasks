@@ -807,3 +807,27 @@ class OpenChildrenTest(unittest.TestCase):
         """Причина одна и самая сильная: отложенное не «ждёт подзадач»."""
         self.assertEqual(sing.not_ready_reason({"deferred": True}, open_children=3),
                          "отложена")
+
+
+class RecurrenceTest(unittest.TestCase):
+    """Шаблон серии — правило её порождения, а не задача: закрыть его как обычную
+    значит тронуть всю серию. Экземпляры серии — обычная работа."""
+
+    def test_series_template_is_not_offered(self):
+        t = {"recurrence": {"repeat": {"type": "EVERYDAY"}}}
+        self.assertEqual(sing.not_ready_reason(t),
+                         "повторяющаяся: это шаблон серии, а не задача")
+
+    def test_instance_of_a_series_is_ordinary_work(self):
+        self.assertIsNone(sing.not_ready_reason({"recurrenceGeneratorId": "T-серия"}))
+
+    def test_future_instance_still_waits_its_date(self):
+        self.assertEqual(
+            sing.not_ready_reason({"recurrenceGeneratorId": "T-серия",
+                                   "start": "2099-01-01T00:00:00.000Z"}),
+            "начало 2099-01-01")
+
+    def test_template_is_hidden_by_its_own_right_not_by_a_future_date(self):
+        """В базе 30 из 31 шаблона имели дату в будущем и скрывались случайно.
+        Шаблон без даты обязан скрываться сам по себе."""
+        self.assertIsNotNone(sing.not_ready_reason({"recurrence": {}, "start": ""}))
