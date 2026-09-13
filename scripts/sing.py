@@ -1678,6 +1678,70 @@ def cmd_move(args):
     print(f"{args.id}: {res} — {args.column}")
 
 
+def rename_task(task_id, new_title, task=None):
+    """Сменить заголовок и подтвердить ПЕРЕЧИТЫВАНИЕМ, вернув сохранённый.
+
+    Возвращает (старый, сохранённый). Сохранённый может отличаться от
+    отправленного: клиент приложения нормализует заголовки при синхронизации,
+    поэтому показывать надо то, что реально лежит в трекере, а не то, что мы
+    послали. Код 200 здесь ничего не доказывает (AGENTS.md §4), а одно
+    немедленное чтение не отличает «ещё не применил» от «не применил» —
+    различает только время, отсюда тот же цикл, что у set_task_tags().
+
+    Правка заголовка не должна задевать ничего другого: PATCH с лишним полем
+    легко стирает состояние задачи, поэтому checked/journalDate/tags/complete
+    сверяются до и после.
+    """
+    task = task or request("GET", f"/task/{task_id}")
+    old = task.get("title", "")
+    watched = ("checked", "journalDate", "complete", "projectId")
+
+    def snapshot(t):
+        state = {k: t.get(k) for k in watched}
+        state["tags"] = sorted(t.get("tags") or [])
+        return state
+
+    before = snapshot(task)
+    request("PATCH", f"/task/{task_id}", body={"title": new_title})
+
+    fresh = None
+    for attempt in range(1, TAG_SETTLE_TRIES + 1):
+        fresh = request("GET", f"/task/{task_id}")
+        if (fresh.get("title") or "").strip() == new_title.strip():
+            break
+        if attempt < TAG_SETTLE_TRIES:
+            time.sleep(TAG_SETTLE_PAUSE)
+    else:
+        die(f"{task_id}: заголовок не применился за {TAG_SETTLE_TRIES} "
+            f"перечитываний ({TAG_SETTLE_PAUSE * (TAG_SETTLE_TRIES - 1):.0f} с) — "
+            f"в трекере по-прежнему «{(fresh or {}).get('title', '')}».\n"
+            "  Это уже не лаг синхронизации: проверь задачу в трекере.")
+
+    after = snapshot(fresh)
+    touched = [k for k in before if before[k] != after[k]]
+    if touched:
+        die(f"{task_id}: переименование задело лишнее — {', '.join(touched)}.\n"
+            f"  было {  {k: before[k] for k in touched} }, стало { {k: after[k] for k in touched} }.\n"
+            "  Заголовок изменён, остальное состояние задачи изменяться не должно.")
+    return old, fresh.get("title", "")
+
+
+def cmd_rename(args):
+    """Переименовать карточку. Заголовок — то, по чему человек находит задачу."""
+    cfg, _ = load_config(required=False)
+    task = assert_task_allowed(args.id, cfg)
+    new = args.title.strip()
+    if not new:
+        die(f"{args.id}: пустой заголовок — переименовывать не во что.")
+    if new == (task.get("title") or "").strip():
+        print(f"{args.id}: заголовок уже такой — {task.get('title')}")
+        return
+    old, saved = rename_task(args.id, new, task)
+    print(f"{args.id}: переименована\n  было:  {old}\n  стало: {saved}"
+          + ("\n  ⚠ трекер сохранил не то, что отправлено — показан сохранённый"
+             if saved.strip() != new else ""))
+
+
 def cmd_rm(args):
     """Удалить задачу. Для уборки за собой: правила требуют убирать тестовые
     данные в тот же заход, а команды удаления в скилле не было вовсе."""
@@ -2039,6 +2103,11 @@ def main():
     sp.add_argument("id")
     sp.add_argument("column", choices=COLUMN_ORDER)
     sp.set_defaults(fn=cmd_move)
+
+    sp = sub.add_parser("rename", help="переименовать карточку с подтверждением по факту")
+    sp.add_argument("id")
+    sp.add_argument("title")
+    sp.set_defaults(fn=cmd_rename)
 
     sp = sub.add_parser("rm", help="удалить задачу (уборка за собой)")
     sp.add_argument("id")

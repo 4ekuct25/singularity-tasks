@@ -484,3 +484,64 @@ class ProjectChainTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RenameTaskTest(unittest.TestCase):
+    """AGENTS.md §4: 200 ничего не доказывает. Переименование обязано
+    подтверждаться перечитыванием и не задевать остальное состояние задачи."""
+
+    def setUp(self):
+        self.addCleanup(setattr, sing, "request", sing.request)
+        self.addCleanup(setattr, sing, "TAG_SETTLE_PAUSE", sing.TAG_SETTLE_PAUSE)
+        sing.TAG_SETTLE_PAUSE = 0          # паузы в проверке ни к чему
+        self.patched = []
+
+    def _server(self, reads):
+        """reads — что отдаёт GET после PATCH, по одному на перечитывание."""
+        it = iter(reads)
+        last = [reads[0]]
+
+        def req(method, path, **kw):
+            if method == "PATCH":
+                self.patched.append(kw.get("body"))
+                return {}
+            try:
+                last[0] = next(it)
+            except StopIteration:
+                pass
+            return last[0]
+
+        sing.request = req
+
+    def test_confirms_by_reread_not_by_status(self):
+        task = {"title": "старый", "checked": 0, "tags": ["A-1"]}
+        self._server([dict(task, title="новый")])
+        old, saved = sing.rename_task("T-1", "новый", task)
+        self.assertEqual((old, saved), ("старый", "новый"))
+        self.assertEqual(self.patched, [{"title": "новый"}],
+                         "PATCH обязан нести только title")
+
+    def test_waits_out_a_lagging_queue(self):
+        """Первое чтение отдаёт старое — это лаг очереди, а не отказ."""
+        task = {"title": "старый", "checked": 0, "tags": []}
+        self._server([task, task, dict(task, title="новый")])
+        self.assertEqual(sing.rename_task("T-1", "новый", task)[1], "новый")
+
+    def test_dies_when_title_never_applies(self):
+        task = {"title": "старый", "checked": 0, "tags": []}
+        self._server([task])
+        with self.assertRaises(SystemExit):
+            sing.rename_task("T-1", "новый", task)
+
+    def test_dies_when_rename_touches_anything_else(self):
+        """PATCH с лишним полем стирает состояние — это обязано быть замечено."""
+        task = {"title": "старый", "checked": 1, "tags": ["A-1"]}
+        self._server([{"title": "новый", "checked": 0, "tags": ["A-1"]}])
+        with self.assertRaises(SystemExit):
+            sing.rename_task("T-1", "новый", task)
+
+    def test_returns_saved_title_not_the_sent_one(self):
+        """Клиент приложения нормализует заголовок — показывать надо сохранённое."""
+        task = {"title": "старый", "checked": 0, "tags": []}
+        self._server([{"title": "новый", "checked": 0, "tags": []}])
+        self.assertEqual(sing.rename_task("T-1", "новый ", task)[1], "новый")
