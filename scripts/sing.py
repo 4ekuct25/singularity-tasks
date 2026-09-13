@@ -1275,8 +1275,22 @@ def cmd_init(args):
     """По умолчанию — сухой прогон: показывает план, ничего не меняет."""
     guessed = not args.project
     if guessed:
-        args.project = repo_project_name(args.path)
-        print(f"Проект не указан — беру имя репозитория: «{args.project}»")
+        # Уже привязанный репозиторий: проект берём из привязки, а не из имени
+        # каталога. Каталог и проект называются одинаково не всегда, и повторный
+        # init (например, чтобы дописать правило в AGENTS.md) не должен уводить
+        # репозиторий на другой проект или упираться в «проекта нет».
+        bound = find_config(os.path.abspath(args.path))
+        if bound and bound.startswith(os.path.abspath(args.path) + os.sep):
+            with open(bound, encoding="utf-8") as f:
+                known = json.load(f)
+            args.project = known.get("projectId") or known.get("projectTitle") or ""
+            guessed = not args.project
+            if args.project:
+                print(f"Репозиторий уже привязан — беру проект из {os.path.relpath(bound, args.path)}: "
+                      f"«{known.get('projectTitle') or args.project}»")
+        if not args.project:
+            args.project = repo_project_name(args.path)
+            print(f"Проект не указан — беру имя репозитория: «{args.project}»")
     projects = all_projects()
     root = resolve_root(projects)
     # искать только среди подпроектов корня — тёзка снаружи не должен даже находиться

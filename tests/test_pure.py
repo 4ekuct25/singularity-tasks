@@ -714,3 +714,33 @@ class AgentsRuleTest(unittest.TestCase):
         self.assertEqual(self._read("CLAUDE.md"), "Чужие правила, не заглушка.\n")
         self.assertTrue(any("не ссылается на AGENTS.md" in d for d in done),
                         "молчаливое «не видно правила» хуже предупреждения")
+
+
+class InitReusesExistingBindingTest(unittest.TestCase):
+    """Повторный init (например, чтобы дописать правило в AGENTS.md) обязан брать
+    проект из привязки, а не из имени каталога: они совпадают не всегда, и репозиторий
+    уехал бы на другой проект или упёрся в «проекта нет»."""
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.repo, True)
+
+    def _bind(self, where, title, pid="P-известный"):
+        d = os.path.join(self.repo, where)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "singularity.json"), "w", encoding="utf-8") as f:
+            json.dump({"projectId": pid, "projectTitle": title, "columns": {}}, f)
+
+    def test_binding_wins_over_directory_name(self):
+        self._bind(".agents", "совсем-другое-имя")
+        cfg_path = sing.find_config(self.repo)
+        self.assertTrue(cfg_path.startswith(self.repo))
+        with open(cfg_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["projectTitle"], "совсем-другое-имя")
+        self.assertNotEqual(sing.repo_project_name(self.repo), "совсем-другое-имя",
+                            "проверка бессмысленна, если имена совпали")
+
+    def test_legacy_claude_binding_is_found_too(self):
+        self._bind(".claude", "старая-привязка")
+        self.assertTrue(sing.find_config(self.repo).endswith(
+            os.path.join(".claude", "singularity.json")))
