@@ -217,12 +217,29 @@ def set_task_tags(task_id, add=(), drop=(), soft=False):
             target.append(t)
     if target == tags:
         return False
+
+    # Перечитать НЕПОСРЕДСТВЕННО перед записью и подмешать чужие метки,
+    # появившиеся после первого чтения. Список тегов правится чтением-записью,
+    # compare-and-swap этот API не умеет: между GET и PATCH другой агент успевает
+    # добавить свою метку, и запись старым списком её стирает. Так и пропали
+    # 16 меток из 23 при параллельной работе — молча, потому что проверка ниже
+    # смотрела только на СВОИ теги (`want <= actual`) и чужую потерю не видела.
+    latest = list(request("GET", f"/task/{task_id}").get("tags") or [])
+    for t in latest:
+        if t not in target and t not in drop:
+            target.append(t)
+    keep = {t for t in latest if t not in drop}
     request("PATCH", f"/task/{task_id}", body={"tags": target})
 
     want = set(add)
     for attempt in range(1, TAG_SETTLE_TRIES + 1):
         actual = set(request("GET", f"/task/{task_id}").get("tags") or [])
-        if want <= actual and not (drop & actual):
+        lost = keep - actual
+        if lost and attempt == TAG_SETTLE_TRIES:
+            die(f"{task_id}: запись тегов потеряла чужие метки {sorted(lost)}.\n"
+                "  Их добавил другой агент между чтением и записью. Это потеря следа "
+                "«кто взял задачу», а не лаг: проверь задачу в трекере.")
+        if want <= actual and not (drop & actual) and not lost:
             return True
         if attempt < TAG_SETTLE_TRIES:
             time.sleep(TAG_SETTLE_PAUSE)

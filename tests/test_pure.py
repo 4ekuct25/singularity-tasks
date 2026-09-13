@@ -545,3 +545,49 @@ class RenameTaskTest(unittest.TestCase):
         task = {"title": "старый", "checked": 0, "tags": []}
         self._server([{"title": "новый", "checked": 0, "tags": []}])
         self.assertEqual(sing.rename_task("T-1", "новый ", task)[1], "новый")
+
+
+class TagClobberTest(unittest.TestCase):
+    """Список тегов правится чтением-записью, CAS этот API не умеет. Между GET и
+    PATCH другой агент успевает добавить метку — запись старым списком её стирала,
+    а подтверждение этого не замечало, потому что смотрело только на свои теги."""
+
+    def setUp(self):
+        self.addCleanup(setattr, sing, "request", sing.request)
+        self.addCleanup(setattr, sing, "TAG_SETTLE_PAUSE", sing.TAG_SETTLE_PAUSE)
+        sing.TAG_SETTLE_PAUSE = 0
+        self.bodies = []
+
+    def _server(self, reads):
+        it = iter(reads); last = [reads[0]]
+
+        def req(method, path, **kw):
+            if method == "PATCH":
+                self.bodies.append(kw.get("body", {}).get("tags"))
+                return {}
+            try:
+                last[0] = next(it)
+            except StopIteration:
+                pass
+            return {"tags": last[0]}
+
+        sing.request = req
+
+    def test_foreign_tag_added_mid_flight_is_merged_not_wiped(self):
+        """Чужая метка появилась после первого чтения — она обязана уцелеть."""
+        self._server([[], ["A-чужой"], ["A-чужой", "A-мой"]])
+        self.assertTrue(sing.set_task_tags("T-1", add=["A-мой"]))
+        self.assertEqual(self.bodies, [["A-мой", "A-чужой"]],
+                         "запись обязана нести и чужую метку, а не только свою")
+
+    def test_losing_a_foreign_tag_is_reported_not_swallowed(self):
+        """Если чужая метка всё же пропала — это потеря следа, а не успех."""
+        self._server([[], ["A-чужой"], ["A-мой"], ["A-мой"], ["A-мой"], ["A-мой"]])
+        with self.assertRaises(SystemExit):
+            sing.set_task_tags("T-1", add=["A-мой"])
+
+    def test_own_drop_still_works(self):
+        """Снятие своей метки не должно ломаться подмешиванием."""
+        self._server([["A-мой", "A-чужой"], ["A-мой", "A-чужой"], ["A-чужой"]])
+        self.assertTrue(sing.set_task_tags("T-1", drop=["A-мой"]))
+        self.assertEqual(self.bodies, [["A-чужой"]])
