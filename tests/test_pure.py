@@ -865,8 +865,14 @@ class TaskLinkTest(unittest.TestCase):
     """Голый T-... человеку бесполезен — открыть его нечем. Формат ссылки взят из
     бандла приложения (`singularityapp://?&page=any&id=${n}`), а не придуман."""
 
-    def test_link_matches_the_format_the_app_itself_produces(self):
+    def test_web_link_is_the_default(self):
+        """Веб кликается везде и открывается с телефона; схема — только там,
+        где стоит десктоп-приложение."""
         self.assertEqual(sing.task_link("T-abc"),
+                         "https://web.singularity-app.com/#/?&id=T-abc")
+
+    def test_app_scheme_link_is_still_available(self):
+        self.assertEqual(sing.task_link_app("T-abc"),
                          "singularityapp://?&page=any&id=T-abc")
 
     def test_id_goes_into_the_link_as_is(self):

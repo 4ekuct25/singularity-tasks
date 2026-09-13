@@ -907,14 +907,23 @@ def column_map(project_id):
             if not link.get("removed") and link.get("statusId") in mine}
 
 
-# Ссылку на карточку берём в том же виде, в каком её делает само приложение:
-# `singularityapp://?&page=any&id=${n}` — строка найдена в его бандле, а не
-# угадана. Голый `T-...` человеку бесполезен: открыть его нечем.
-TASK_LINK = "singularityapp://?&page=any&id={}"
+# Голый `T-...` человеку бесполезен: открыть его нечем. Форматов два, оба
+# подтверждены — веб-адрес прислал пользователь, схему нашли в бандле приложения
+# (`singularityapp://?&page=any&id=${n}`, зарегистрирована в его Info.plist).
+#
+# Основной — веб: он кликается в любом чате и терминале и открывается с телефона.
+# Схема `singularityapp://` работает только там, где стоит десктоп-приложение, и
+# во многих интерфейсах вообще не кликабельна, поэтому её печатает только `show`.
+TASK_LINK_WEB = "https://web.singularity-app.com/#/?&id={}"
+TASK_LINK_APP = "singularityapp://?&page=any&id={}"
 
 
 def task_link(task_id):
-    return TASK_LINK.format(task_id)
+    return TASK_LINK_WEB.format(task_id)
+
+
+def task_link_app(task_id):
+    return TASK_LINK_APP.format(task_id)
 
 
 def prio_of(t):
@@ -1774,7 +1783,7 @@ def cmd_show(args):
     cfg, _ = load_config(required=False)
     t = assert_task_allowed(args.id, cfg)
     print(brief(t))
-    print(f"  {task_link(args.id)}")
+    print(f"  {task_link(args.id)}\n  {task_link_app(args.id)}")
     # Колонка и теги — не украшение: по карточке не было видно ни где задача на
     # доске, ни держит ли её уже другой агент, а инструментов над этим трекером пять.
     cid = task_column(args.id, t.get("projectId"))
