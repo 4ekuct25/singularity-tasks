@@ -17,3 +17,6 @@ credentials*
 # привязка к личному трекеру: локальная, в публичный репозиторий не уезжает
 .claude/singularity.json
 .agents/singularity.json
+
+# логи упавших прогонов
+tests/logs/

@@ -21,6 +21,9 @@
 рядом живут черновики других сессий, и подметать их — значит убить чужую работу.
 """
 
+import contextlib
+import datetime
+import io
 import os
 import subprocess
 import sys
@@ -33,12 +36,53 @@ import support  # noqa: E402
 
 GROUPS = {"fast": ["test_pure", "test_retry", "test_claim"], "live": ["test_live"]}
 SWEEP_PREFIX = "zz-selftest-"
+LOG_DIR = os.path.join(HERE, "logs")
 
 
-def run_group(names, verbosity):
+class _Tee:
+    """Пишет в оба потока: прогон видно как обычно, и он же копится для файла."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for s in self.streams:
+            s.write(text)
+        return len(text)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
+def save_failure_log(label, text):
+    """Сохранить вывод упавшего прогона.
+
+    Падение, не оставившее следа, равносильно отсутствию проверки: «прогони ещё
+    раз» становится способом не заметить дефект. Живой набор работает с трекером,
+    где есть очередь синхронизации, и краснеет не каждый раз — поймать такое
+    можно только по сохранённому логу.
+    """
+    os.makedirs(LOG_DIR, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    path = os.path.join(LOG_DIR, f"{label}-{stamp}.log")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def run_group(names, verbosity, label=None):
     loader = unittest.TestLoader()
     suite = unittest.TestSuite(loader.loadTestsFromName(n) for n in names)
-    result = unittest.TextTestRunner(verbosity=verbosity).run(suite)
+    buf = io.StringIO()
+    # unittest пишет в stderr, тесты печатают в stdout — копим оба, иначе в логе
+    # окажется половина картины
+    with contextlib.redirect_stdout(_Tee(sys.stdout, buf)):
+        result = unittest.TextTestRunner(stream=_Tee(sys.stderr, buf),
+                                         verbosity=verbosity).run(suite)
+    if not result.wasSuccessful() and label:
+        path = save_failure_log(label, buf.getvalue())
+        print(f"\nвывод упавшего прогона сохранён: {path}", file=sys.stderr)
     return result.wasSuccessful()
 
 
@@ -100,13 +144,13 @@ def main():
     ok = True
     if group in ("fast", "all"):
         print("=== fast: без сети и без токена ===")
-        ok &= run_group(GROUPS["fast"], verbosity)
+        ok &= run_group(GROUPS["fast"], verbosity, label="fast")
     if group == "slow":
         ok &= run_slow()
     if group in ("live", "all"):
         print("\n=== live: живой трекер, черновой подпроект zz- ===")
         try:
-            ok &= run_group(GROUPS["live"], verbosity)
+            ok &= run_group(GROUPS["live"], verbosity, label="live")
         finally:
             # Страховка поверх tearDownModule: если прогон убили посреди уборки,
             # черновик этого набора не должен пережить команду.
