@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import datetime
 import subprocess
 import shutil
 import sys
@@ -744,3 +745,37 @@ class InitReusesExistingBindingTest(unittest.TestCase):
         self._bind(".claude", "старая-привязка")
         self.assertTrue(sing.find_config(self.repo).endswith(
             os.path.join(".claude", "singularity.json")))
+
+
+class NotReadyReasonTest(unittest.TestCase):
+    """`next` не должен предлагать то, что человек явно отодвинул: «отложить» и
+    «начать такого-то числа» — его решения, и очередь, их игнорирующая, перестаёт
+    быть очередью."""
+
+    def setUp(self):
+        self.today = datetime.date.today().isoformat()
+
+    def test_deferred_is_not_offered(self):
+        self.assertEqual(sing.not_ready_reason({"deferred": True}), "отложена")
+
+    def test_future_start_is_not_offered(self):
+        self.assertEqual(sing.not_ready_reason({"start": "2099-01-01T00:00:00.000Z"}),
+                         "начало 2099-01-01")
+
+    def test_today_is_ready_even_late_in_the_day(self):
+        """start приходит полным ISO со временем: сравнение строк целиком
+        отложило бы задачу «на сегодня 23:59» до завтра."""
+        self.assertIsNone(sing.not_ready_reason({"start": self.today + "T23:59:00.000Z"}))
+
+    def test_past_start_and_plain_task_are_ready(self):
+        self.assertIsNone(sing.not_ready_reason({"start": "2020-01-01"}))
+        self.assertIsNone(sing.not_ready_reason({}))
+        self.assertIsNone(sing.not_ready_reason({"deferred": False, "start": ""}))
+
+    def test_pool_hides_them_only_when_asked(self):
+        """board и list обязаны показывать такие задачи: исчезнувшая карточка
+        выглядит потерянной."""
+        tasks = [{"id": "T-1", "deferred": True}, {"id": "T-2"}]
+        ready = [t for t in tasks if not sing.not_ready_reason(t)]
+        self.assertEqual([t["id"] for t in ready], ["T-2"])
+        self.assertEqual(len(tasks), 2, "из общей выборки задачи не исчезают")

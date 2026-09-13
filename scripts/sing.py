@@ -17,6 +17,7 @@
 """
 
 import argparse
+import datetime
 import email.utils
 import http.client
 import json
@@ -1559,8 +1560,32 @@ def cmd_board(args):
             print(pad(holders.get(t["id"])) + brief(t) + done)
 
 
-def _pick_pool(cfg, role, include_done=False, group=None):
-    """include_done — для просмотра; `next` обязан брать только незакрытые."""
+def not_ready_reason(task, today=None):
+    """Почему задачу нельзя брать ПРЯМО СЕЙЧАС, хотя она в очереди. None — можно.
+
+    Это решения человека, принятые в приложении: «отложить» и «начать такого-то
+    числа». Игнорировать их нельзя — очередь, выдающая отодвинутое, перестаёт быть
+    очередью. Но и прятать такие задачи с доски нельзя: исчезнувшая карточка
+    выглядит как потерянная, поэтому режем только на выдаче (`next`), а `board` и
+    `list` их показывают с пометкой.
+    """
+    if task.get("deferred"):
+        return "отложена"
+    # `start` приходит полным ISO со временем — сравниваем календарные даты,
+    # иначе «сегодня, но позже» выглядит как будущее и задача не берётся весь день
+    start = (task.get("start") or "")[:10]
+    today = today or datetime.date.today().isoformat()
+    if start and start > today:
+        return f"начало {start}"
+    return None
+
+
+def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False):
+    """include_done — для просмотра; `next` обязан брать только незакрытые.
+
+    ready_only — убрать отложенные и запланированные на будущее (см.
+    not_ready_reason). Включается только для выдачи задачи, не для показа.
+    """
     cid = col_id(cfg, role)
     cmap = column_map(cfg["projectId"])
     source = live_tasks(cfg["projectId"]) if include_done else open_tasks(cfg["projectId"])
@@ -1568,6 +1593,8 @@ def _pick_pool(cfg, role, include_done=False, group=None):
     if group:
         gid = resolve_group(cfg["projectId"], group)
         pool = [t for t in pool if t.get("group") == gid]
+    if ready_only:
+        pool = [t for t in pool if not not_ready_reason(t)]
     return sorted(pool, key=lambda t: (prio_of(t),
                                        t.get("deadline") or "9999",
                                        t.get("createdDate") or ""))
@@ -1616,9 +1643,18 @@ def cmd_notes(args):
 
 def cmd_next(args):
     cfg, _ = load_config()
-    pool = _pick_pool(cfg, args.column, group=args.group)
+    pool = _pick_pool(cfg, args.column, group=args.group, ready_only=True)
     if not pool:
-        print("Свободных задач нет.")
+        held = [(t, not_ready_reason(t))
+                for t in _pick_pool(cfg, args.column, group=args.group)]
+        held = [(t, r) for t, r in held if r]
+        if held:
+            # «очередь пуста» здесь было бы неправдой: задачи есть, их отодвинул человек
+            print(f"Свободных задач нет: все {len(held)} отодвинуты человеком.")
+            for t, r in held[:5]:
+                print(f"  {t['id']}  [{r}]  {t.get('title', '')}")
+        else:
+            print("Свободных задач нет.")
         sys.exit(2)
     t = pool[0]
     if args.json:
@@ -1644,6 +1680,9 @@ def cmd_list(args):
         extra = "  " + " ".join("#" + s for s in marks) if marks else ""
         if int(t.get("checked") or 0) == 1:
             extra += " ✓"
+        reason = not_ready_reason(t)
+        if reason and int(t.get("checked") or 0) == 0:
+            extra += f"  [{reason}]"
         print(brief(t, extra))
 
 
