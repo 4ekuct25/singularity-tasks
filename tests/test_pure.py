@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import shutil
 import sys
 import tempfile
@@ -642,3 +643,30 @@ class DetectAgentTest(unittest.TestCase):
         os.environ["SINGULARITY_AGENT"] = "свой"
         self.assertEqual(sing.agent_name(), "свой")
         self.assertEqual(sing.agent_name(override="из-флага"), "из-флага")
+
+
+class RepoProjectNameTest(unittest.TestCase):
+    """Имя проекта по умолчанию — имя репозитория. Промпт, где надо подставить
+    значение руками, подставляют неправильно или забывают вовсе."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_plain_directory_gives_its_own_name(self):
+        d = os.path.join(self.tmp, "мой-репозиторий")
+        os.makedirs(d)
+        self.assertEqual(sing.repo_project_name(d), "мой-репозиторий")
+
+    def test_subdirectory_of_a_repo_gives_the_repo_name(self):
+        """Запуск из tools/ не должен дать проект «tools»."""
+        repo = os.path.join(self.tmp, "репо")
+        sub = os.path.join(repo, "tools")
+        os.makedirs(sub)
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        self.assertEqual(sing.repo_project_name(sub), "репо")
+
+    def test_trailing_separator_does_not_eat_the_name(self):
+        d = os.path.join(self.tmp, "хвост")
+        os.makedirs(d)
+        self.assertEqual(sing.repo_project_name(d + os.sep), "хвост")

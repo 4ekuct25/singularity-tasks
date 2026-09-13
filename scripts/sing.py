@@ -1192,8 +1192,26 @@ def plan_columns(project_id, names, existing, own_columns, plan):
     return mapping, to_create
 
 
+def repo_project_name(path="."):
+    """Имя проекта по умолчанию — имя каталога репозитория.
+
+    Спрашивать его у человека незачем: в подавляющем большинстве случаев проект
+    называется как репозиторий, а промпт, где надо что-то подставить руками,
+    подставляют неправильно или забывают.
+    """
+    root = os.path.abspath(path)
+    git = subprocess.run(["git", "-C", root, "rev-parse", "--show-toplevel"],
+                         capture_output=True, text=True)
+    if git.returncode == 0 and git.stdout.strip():
+        root = git.stdout.strip()
+    return os.path.basename(root.rstrip(os.sep))
+
+
 def cmd_init(args):
     """По умолчанию — сухой прогон: показывает план, ничего не меняет."""
+    if not args.project:
+        args.project = repo_project_name(args.path)
+        print(f"Проект не указан — беру имя репозитория: «{args.project}»")
     projects = all_projects()
     root = resolve_root(projects)
     # искать только среди подпроектов корня — тёзка снаружи не должен даже находиться
@@ -2064,7 +2082,8 @@ def main():
     sp.set_defaults(fn=cmd_projects)
 
     sp = sub.add_parser("init", help="привязать репо к проекту (по умолчанию — сухой прогон)")
-    sp.add_argument("--project", required=True, help="название проекта или P-id")
+    sp.add_argument("--project",
+                    help="название проекта или P-id; по умолчанию — имя каталога репозитория")
     sp.add_argument("--path", default=".", help="корень репозитория")
     sp.add_argument("--columns", help='JSON вида {"todo":"К работе",...}')
     sp.add_argument("--own-columns", action="store_true",
