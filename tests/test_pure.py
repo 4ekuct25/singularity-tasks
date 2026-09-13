@@ -591,3 +591,54 @@ class TagClobberTest(unittest.TestCase):
         self._server([["A-мой", "A-чужой"], ["A-мой", "A-чужой"], ["A-чужой"]])
         self.assertTrue(sing.set_task_tags("T-1", drop=["A-мой"]))
         self.assertEqual(self.bodies, [["A-чужой"]])
+
+
+class DetectAgentTest(unittest.TestCase):
+    """Имя агента определяется само. Забытый export означал бы, что все
+    подписываются одинаково, а на метке «кто взял задачу» держится защита
+    от гонки — то есть тихо ломается именно то, ради чего метка нужна."""
+
+    def setUp(self):
+        self.addCleanup(setattr, sing, "__file__", sing.__file__)
+        for v in ("SINGULARITY_AGENT", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID"):
+            self.addCleanup(os.environ.pop, v, None)
+            os.environ.pop(v, None)
+
+    def _running_from(self, path):
+        sing.__file__ = path
+
+    def test_every_install_dir_is_recognised(self):
+        home = os.path.expanduser("~")
+        for marker, expected in sing.AGENT_BY_SKILL_DIR:
+            self._running_from(os.path.join(home, marker, "scripts", "sing.py"))
+            self.assertEqual(sing.detect_agent(), expected, f"не опознан {marker}")
+
+    def test_install_dirs_cover_every_deploy_target(self):
+        """TARGETS в install.sh и таблица здесь обязаны не расходиться:
+        иначе новый инструмент подпишется чужим именем."""
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(sing.__file__))),
+                              "tools", "install.sh")
+        if not os.path.exists(script):
+            self.skipTest("install.sh рядом нет (запуск из установленной копии)")
+        targets = {line.split("|")[0].strip()
+                   for line in open(script, encoding="utf-8")
+                   if line.count("|") == 2 and "$HOME" in line}
+        known = {name for _, name in sing.AGENT_BY_SKILL_DIR}
+        self.assertEqual(targets - known, set(),
+                         "цель раскатки есть, а распознавания имени для неё нет")
+
+    def test_unknown_dir_falls_back_to_session_marker(self):
+        self._running_from("/tmp/где-то/sing.py")
+        self.assertIsNone(sing.detect_agent())
+        os.environ["CLAUDECODE"] = "1"
+        self.assertEqual(sing.detect_agent(), "claude")
+
+    def test_explicit_override_wins_over_detection(self):
+        self._running_from(os.path.join(os.path.expanduser("~"), ".qwen", "skills",
+                                        "singularity-tasks", "scripts", "sing.py"))
+        self.assertEqual(sing.agent_name(), "qwen")
+        self.assertEqual(sing.agent_name(cfg={"agent": "из-конфига"}), "из-конфига",
+                         "заданное человеком не должно перебиваться догадкой по среде")
+        os.environ["SINGULARITY_AGENT"] = "свой"
+        self.assertEqual(sing.agent_name(), "свой")
+        self.assertEqual(sing.agent_name(override="из-флага"), "из-флага")

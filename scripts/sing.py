@@ -76,10 +76,53 @@ COLUMN_ORDER_HINT = {"todo": 0, "wip": 50000, "review": 75000,
 AGENT_TAG_PREFIX = "agent:"
 
 
+# Каждый инструмент запускает СВОЮ копию скилла, и каталоги у них разные —
+# по собственному пути скрипт узнаёт, под кем работает. Это надёжнее переменных
+# окружения: у большинства инструментов «свои» переменные (GEMINI_API_KEY,
+# CODEX_*) — это конфиг, который может быть выставлен где угодно и кем угодно,
+# а не метка «сейчас работаю я». Порядок каталогов совпадает с TARGETS в
+# tools/install.sh: добавляешь инструмент туда — добавь и сюда.
+AGENT_BY_SKILL_DIR = (
+    (os.path.join(".claude", "skills", "singularity-tasks"), "claude"),
+    (os.path.join(".codex", "skills", "singularity-tasks"), "codex"),
+    (os.path.join(".config", "opencode", "skills", "singularity-tasks"), "opencode"),
+    (os.path.join(".gemini", "config", "skills", "singularity-tasks"), "antigravity"),
+    (os.path.join(".qwen", "skills", "singularity-tasks"), "qwen"),
+)
+
+# Запуск не из каталога скилла (из репозитория-эталона, из worktree) путь не
+# опознаёт. Тогда — по метке хозяина сессии; надёжна только там, где инструмент
+# ставит её сам, а не просит пользователя.
+AGENT_BY_ENV = (
+    ("CLAUDECODE", "claude"),
+    ("CLAUDE_CODE_SESSION_ID", "claude"),
+)
+
+
+def detect_agent():
+    """Под каким инструментом идёт запуск. None — опознать не удалось."""
+    here = os.path.realpath(__file__)
+    for marker, name in AGENT_BY_SKILL_DIR:
+        if os.sep + marker + os.sep in here:
+            return name
+    for var, name in AGENT_BY_ENV:
+        if os.environ.get(var):
+            return name
+    return None
+
+
 def agent_name(cfg=None, override=None):
-    """Кто сейчас работает. Каждый агент выставляет свой $SINGULARITY_AGENT."""
+    """Кто сейчас работает.
+
+    Имя определяется САМО — руками задавать не нужно и не надо: забытый
+    `export` означал бы, что все агенты подписываются одинаково, а на метке
+    «кто взял задачу» держится защита от гонки. Явные способы оставлены для
+    проверок и нестандартных запусков и идут первыми: определение по каталогу
+    запуска — это догадка по среде, и перебивать ею то, что человек задал
+    руками, нельзя.
+    """
     return (override or os.environ.get("SINGULARITY_AGENT")
-            or (cfg or {}).get("agent") or "claude").strip()
+            or (cfg or {}).get("agent") or detect_agent() or "claude").strip()
 
 
 def find_tag(title):
@@ -1496,7 +1539,11 @@ def cmd_whoami(args):
     print(f"агент: {who}\nтег:   {AGENT_TAG_PREFIX}{who}")
     src = ("--agent" if args.agent else
            "$SINGULARITY_AGENT" if os.environ.get("SINGULARITY_AGENT") else
-           ".claude/singularity.json" if (cfg or {}).get("agent") else "значение по умолчанию")
+           f"определено по каталогу запуска ({os.path.realpath(__file__)})"
+           if detect_agent() and any(os.sep + m + os.sep in os.path.realpath(__file__)
+                                     for m, _ in AGENT_BY_SKILL_DIR) else
+           "определено по метке сессии инструмента" if detect_agent() else
+           "singularity.json" if (cfg or {}).get("agent") else "значение по умолчанию")
     print(f"откуда: {src}")
 
 
