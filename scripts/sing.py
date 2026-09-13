@@ -907,6 +907,16 @@ def column_map(project_id):
             if not link.get("removed") and link.get("statusId") in mine}
 
 
+# Ссылку на карточку берём в том же виде, в каком её делает само приложение:
+# `singularityapp://?&page=any&id=${n}` — строка найдена в его бандле, а не
+# угадана. Голый `T-...` человеку бесполезен: открыть его нечем.
+TASK_LINK = "singularityapp://?&page=any&id={}"
+
+
+def task_link(task_id):
+    return TASK_LINK.format(task_id)
+
+
 def prio_of(t):
     """0 = высокий, поэтому `or 1` тут нельзя — ноль ложный."""
     p = t.get("priority")
@@ -1722,7 +1732,8 @@ def cmd_next(args):
     if note:
         print("\n--- заметка ---\n" + note)
     print_checklist(checklist_items(t["id"]))
-    print(f"\nВзять в работу: sing.py start {t['id']}")
+    print(f"\n  {task_link(t['id'])}"
+          f"\nВзять в работу: sing.py start {t['id']} --plan \"...\"")
 
 
 def cmd_list(args):
@@ -1763,6 +1774,7 @@ def cmd_show(args):
     cfg, _ = load_config(required=False)
     t = assert_task_allowed(args.id, cfg)
     print(brief(t))
+    print(f"  {task_link(args.id)}")
     # Колонка и теги — не украшение: по карточке не было видно ни где задача на
     # доске, ни держит ли её уже другой агент, а инструментов над этим трекером пять.
     cid = task_column(args.id, t.get("projectId"))
@@ -1862,7 +1874,8 @@ def cmd_done(args):
     move_to_column(args.id, col_id(cfg, role), project_id=cfg["projectId"])
     if not args.review:
         request("POST", f"/task/{args.id}/complete")
-    print(f"{args.id}: {'отправлена на проверку' if args.review else 'закрыта'}")
+    print(f"{args.id}: {'отправлена на проверку' if args.review else 'закрыта'}\n"
+          f"  {task_link(args.id)}")
 
 
 def cmd_block(args):
@@ -1872,7 +1885,8 @@ def cmd_block(args):
             body={"note": note_append(t.get("note"), args.reason, label="БЛОКЕР")})
     mark_agent(args.id, cfg, getattr(args, "agent", None))
     move_to_column(args.id, col_id(cfg, "blocked"), project_id=cfg["projectId"])
-    print(f"{args.id}: заблокирована, причина записана в заметку")
+    print(f"{args.id}: заблокирована, причина записана в заметку\n"
+          f"  {task_link(args.id)}")
 
 
 def same_title(a, b):

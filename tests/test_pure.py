@@ -859,3 +859,18 @@ class EffectiveColumnTest(unittest.TestCase):
     def test_no_todo_in_binding_means_no_guess(self):
         """Привязка неполная — придумывать колонку нельзя."""
         self.assertIsNone(sing.effective_column({"id": "T-1"}, {}, {"columns": {}}))
+
+
+class TaskLinkTest(unittest.TestCase):
+    """Голый T-... человеку бесполезен — открыть его нечем. Формат ссылки взят из
+    бандла приложения (`singularityapp://?&page=any&id=${n}`), а не придуман."""
+
+    def test_link_matches_the_format_the_app_itself_produces(self):
+        self.assertEqual(sing.task_link("T-abc"),
+                         "singularityapp://?&page=any&id=T-abc")
+
+    def test_id_goes_into_the_link_as_is(self):
+        """Никакого экранирования: id — это [A-Za-z0-9-], и подмена его формы
+        сделала бы ссылку нерабочей."""
+        tid = "T-21722406-d150-4c4b-a864-9ec775df7d76-20260914"
+        self.assertTrue(sing.task_link(tid).endswith(tid))
