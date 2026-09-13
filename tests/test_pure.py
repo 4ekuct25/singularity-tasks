@@ -831,3 +831,31 @@ class RecurrenceTest(unittest.TestCase):
         """В базе 30 из 31 шаблона имели дату в будущем и скрывались случайно.
         Шаблон без даты обязан скрываться сам по себе."""
         self.assertIsNotNone(sing.not_ready_reason({"recurrence": {}, "start": ""}))
+
+
+class EffectiveColumnTest(unittest.TestCase):
+    """Задача из приложения приходит без kanban-связки, а приложение показывает её
+    в «Новые» — проверено на канбане проекта. Очередь обязана видеть то же самое,
+    иначе агент говорит «пусто» при непустом проекте."""
+
+    CFG = {"columns": {"todo": "KS-TODO", "wip": "KS-WIP", "done": "KS-DONE"}}
+
+    def test_unlinked_open_task_counts_as_todo(self):
+        self.assertEqual(
+            sing.effective_column({"id": "T-1"}, {}, self.CFG), "KS-TODO")
+
+    def test_existing_link_wins(self):
+        self.assertEqual(
+            sing.effective_column({"id": "T-1"}, {"T-1": "KS-WIP"}, self.CFG), "KS-WIP")
+
+    def test_finished_task_without_link_is_not_dragged_into_todo(self):
+        """Закрытую и унесённую в дневник приложение в «Новые» тоже не кладёт."""
+        self.assertIsNone(
+            sing.effective_column({"id": "T-1", "checked": 1}, {}, self.CFG))
+        self.assertIsNone(
+            sing.effective_column({"id": "T-2", "journalDate": "2026-09-14"}, {},
+                                  self.CFG))
+
+    def test_no_todo_in_binding_means_no_guess(self):
+        """Привязка неполная — придумывать колонку нельзя."""
+        self.assertIsNone(sing.effective_column({"id": "T-1"}, {}, {"columns": {}}))

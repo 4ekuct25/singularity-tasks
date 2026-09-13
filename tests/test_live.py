@@ -293,14 +293,21 @@ class ReturnPathTest(LiveBase):
 
 class BoardRepairTest(LiveBase):
 
-    def test_move_binds_a_task_that_has_no_column(self):
-        """Сирота после оборвавшегося `add` видна только в «вне колонок»."""
-        tid = self.make_task("zz: сирота без колонки", column=None)
-        self.assertIsNone(self.sing.task_column(tid))
+    def test_task_without_a_column_is_shown_in_todo_and_move_binds_it(self):
+        """Задача без связки — норма, а не поломка: так приходит всё, что человек
+        завёл в приложении, и приложение показывает её в «Новые». Доска обязана
+        показывать то же; `move` при этом создаёт настоящую связку."""
+        tid = self.make_task("zz: без связки с колонкой", column=None)
+        self.assertIsNone(self.sing.task_column(tid), "связки быть не должно")
         board = self.cli("board").stdout
-        self.assertIn("ВНЕ КОЛОНОК", board)
+        self.assertIn(tid, board, "задача без связки пропала с доски")
+        self.assertNotIn("ВНЕ КОЛОНОК", board,
+                         "задача из приложения — не сирота, пугать поломкой нечем")
+        self.assertIn(tid, self.cli("list").stdout,
+                      "очередь обязана видеть задачу из приложения")
         self.cli("move", tid, "todo")
         self.assertEqual(self.column_of(tid), "todo")
+        self.assertIsNotNone(self.sing.task_column(tid), "move обязан создать связку")
 
     def test_move_between_system_columns_is_verified_by_fact(self):
         """`change-column` на СИСТЕМНЫХ колонках отвечает 200, ничего не сделав.

@@ -1503,7 +1503,7 @@ def cmd_board(args):
     cmap = column_map(cfg["projectId"])
     by_col = {}
     for t in board_tasks(cfg["projectId"]):
-        by_col.setdefault(cmap.get(t["id"]), []).append(t)
+        by_col.setdefault(effective_column(t, cmap, cfg), []).append(t)
 
     # Раскладку считаем до печати: и теги, и ширина колонки держателя должны
     # опираться на то, что реально попадёт на экран, а не на весь проект —
@@ -1532,6 +1532,9 @@ def cmd_board(args):
               "привязка неполная, задачи по этим ролям доска не покажет."
               "\n  разобраться: sing.py doctor  ·  починить: sing.py init --apply")
     if loose:
+        # Сюда попадает только то, что не показывает и приложение: задача без
+        # связки и без колонки-роли `todo` в привязке. Раньше блок ловил ещё и
+        # обычные задачи из приложения — и пугал поломкой там, где её нет.
         print(f"\n⚠ ВНЕ КОЛОНОК — {len(loose)}: задача есть, на доске её не видно."
               "\n  почини: sing.py move <id> <роль>")
         for t in loose:
@@ -1605,6 +1608,26 @@ def not_ready_reason(task, today=None, open_children=0):
     return None
 
 
+def effective_column(task, cmap, cfg):
+    """Колонка задачи так, как её видит ПРИЛОЖЕНИЕ.
+
+    Задача, заведённая в приложении, приходит без `kanban-task-status` — связку
+    создаёт только наш `add`. Приложение при этом показывает её в «Новые»
+    (проверено на канбане проекта: задача без связки лежит там рядом с
+    привязанной). Значит и очередь обязана: иначе агент говорит «очередь пуста»
+    при непустом проекте, а человек видит свои задачи на доске.
+
+    Закрытые и унесённые в дневник исключение: в «Новые» их не показывает и
+    приложение.
+    """
+    linked = cmap.get(task["id"])
+    if linked:
+        return linked
+    if int(task.get("checked") or 0) == 1 or task.get("journalDate"):
+        return None
+    return (cfg.get("columns") or {}).get("todo")
+
+
 def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False,
                reasons=None):
     """include_done — для просмотра; `next` обязан брать только незакрытые.
@@ -1616,7 +1639,7 @@ def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False,
     cid = col_id(cfg, role)
     cmap = column_map(cfg["projectId"])
     source = live_tasks(cfg["projectId"]) if include_done else open_tasks(cfg["projectId"])
-    pool = [t for t in source if cmap.get(t["id"]) == cid]
+    pool = [t for t in source if effective_column(t, cmap, cfg) == cid]
     if group:
         gid = resolve_group(cfg["projectId"], group)
         pool = [t for t in pool if t.get("group") == gid]
