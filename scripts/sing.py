@@ -1560,7 +1560,18 @@ def cmd_board(args):
             print(pad(holders.get(t["id"])) + brief(t) + done)
 
 
-def not_ready_reason(task, today=None):
+def open_children_counts(tasks):
+    """Сколько НЕзакрытых подзадач у каждой задачи. Считается из уже полученной
+    выборки — отдельного запроса на это не делаем."""
+    counts = {}
+    for t in tasks:
+        parent = t.get("parent")
+        if parent and int(t.get("checked") or 0) == 0:
+            counts[parent] = counts.get(parent, 0) + 1
+    return counts
+
+
+def not_ready_reason(task, today=None, open_children=0):
     """Почему задачу нельзя брать ПРЯМО СЕЙЧАС, хотя она в очереди. None — можно.
 
     Это решения человека, принятые в приложении: «отложить» и «начать такого-то
@@ -1577,14 +1588,21 @@ def not_ready_reason(task, today=None):
     today = today or datetime.date.today().isoformat()
     if start and start > today:
         return f"начало {start}"
+    if open_children:
+        # Родитель — это его подзадачи. Взять его раньше них значит либо сделать
+        # их работу мимо доски, либо закрыть заголовок, под которым осталось
+        # незакрытое. Сами подзадачи при этом берутся как обычные задачи.
+        return f"ждёт подзадач: {open_children}"
     return None
 
 
-def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False):
+def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False,
+               reasons=None):
     """include_done — для просмотра; `next` обязан брать только незакрытые.
 
-    ready_only — убрать отложенные и запланированные на будущее (см.
-    not_ready_reason). Включается только для выдачи задачи, не для показа.
+    ready_only — убрать отложенные, запланированные на будущее и ждущие своих
+    подзадач (см. not_ready_reason). Включается только для выдачи задачи, не для
+    показа. reasons — если передан словарь, заполняется {id задачи: причина}.
     """
     cid = col_id(cfg, role)
     cmap = column_map(cfg["projectId"])
@@ -1593,8 +1611,15 @@ def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False):
     if group:
         gid = resolve_group(cfg["projectId"], group)
         pool = [t for t in pool if t.get("group") == gid]
+    kids = open_children_counts(source)
+    if reasons is not None:
+        for t in pool:
+            r = not_ready_reason(t, open_children=kids.get(t["id"], 0))
+            if r:
+                reasons[t["id"]] = r
     if ready_only:
-        pool = [t for t in pool if not not_ready_reason(t)]
+        pool = [t for t in pool
+                if not not_ready_reason(t, open_children=kids.get(t["id"], 0))]
     return sorted(pool, key=lambda t: (prio_of(t),
                                        t.get("deadline") or "9999",
                                        t.get("createdDate") or ""))
@@ -1645,12 +1670,12 @@ def cmd_next(args):
     cfg, _ = load_config()
     pool = _pick_pool(cfg, args.column, group=args.group, ready_only=True)
     if not pool:
-        held = [(t, not_ready_reason(t))
-                for t in _pick_pool(cfg, args.column, group=args.group)]
-        held = [(t, r) for t, r in held if r]
+        reasons = {}
+        everything = _pick_pool(cfg, args.column, group=args.group, reasons=reasons)
+        held = [(t, reasons[t["id"]]) for t in everything if t["id"] in reasons]
         if held:
             # «очередь пуста» здесь было бы неправдой: задачи есть, их отодвинул человек
-            print(f"Свободных задач нет: все {len(held)} отодвинуты человеком.")
+            print(f"Свободных задач нет: все {len(held)} пока брать нельзя.")
             for t, r in held[:5]:
                 print(f"  {t['id']}  [{r}]  {t.get('title', '')}")
         else:
@@ -1670,7 +1695,9 @@ def cmd_next(args):
 
 def cmd_list(args):
     cfg, _ = load_config()
-    pool = _pick_pool(cfg, args.column, include_done=True, group=args.group)
+    reasons = {}
+    pool = _pick_pool(cfg, args.column, include_done=True, group=args.group,
+                      reasons=reasons)
     if args.mine:
         tag_id = find_tag(AGENT_TAG_PREFIX + agent_name(cfg, args.agent))
         pool = [t for t in pool if tag_id and tag_id in (t.get("tags") or [])]
@@ -1680,7 +1707,7 @@ def cmd_list(args):
         extra = "  " + " ".join("#" + s for s in marks) if marks else ""
         if int(t.get("checked") or 0) == 1:
             extra += " ✓"
-        reason = not_ready_reason(t)
+        reason = reasons.get(t["id"])
         if reason and int(t.get("checked") or 0) == 0:
             extra += f"  [{reason}]"
         print(brief(t, extra))

@@ -779,3 +779,31 @@ class NotReadyReasonTest(unittest.TestCase):
         ready = [t for t in tasks if not sing.not_ready_reason(t)]
         self.assertEqual([t["id"] for t in ready], ["T-2"])
         self.assertEqual(len(tasks), 2, "из общей выборки задачи не исчезают")
+
+
+class OpenChildrenTest(unittest.TestCase):
+    """Родитель — это его подзадачи. Взять его раньше них значит либо сделать их
+    работу мимо доски, либо закрыть заголовок, под которым осталось незакрытое."""
+
+    def test_counts_only_unfinished_children(self):
+        tasks = [{"id": "P"},
+                 {"id": "A", "parent": "P", "checked": 0},
+                 {"id": "B", "parent": "P", "checked": 1},
+                 {"id": "C", "checked": 0}]
+        self.assertEqual(sing.open_children_counts(tasks), {"P": 1})
+
+    def test_parent_waits_for_children(self):
+        self.assertEqual(sing.not_ready_reason({"id": "P"}, open_children=2),
+                         "ждёт подзадач: 2")
+
+    def test_parent_is_ready_once_children_are_closed(self):
+        self.assertIsNone(sing.not_ready_reason({"id": "P"}, open_children=0))
+
+    def test_subtask_itself_is_offered(self):
+        """Подзадача — обычная работа, её брать можно и нужно."""
+        self.assertIsNone(sing.not_ready_reason({"id": "A", "parent": "P"}))
+
+    def test_deferred_beats_children_in_the_message(self):
+        """Причина одна и самая сильная: отложенное не «ждёт подзадач»."""
+        self.assertEqual(sing.not_ready_reason({"deferred": True}, open_children=3),
+                         "отложена")
