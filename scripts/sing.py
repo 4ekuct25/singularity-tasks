@@ -1212,18 +1212,71 @@ def plan_columns(project_id, names, existing, own_columns, plan):
     return mapping, to_create
 
 
+def _git_out(root, *args):
+    """Вывод git-команды строкой или None, если git не ответил."""
+    try:
+        r = subprocess.run(["git", "-C", root, *args],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    return out or None
+
+
+def git_main_worktree(path="."):
+    """Корень ОСНОВНОГО рабочего дерева репозитория и признак worktree.
+
+    Возвращает `(root, is_linked_worktree)`; `(None, False)` — если это не git.
+
+    В подключённом worktree `--show-toplevel` отдаёт каталог самого worktree, а он
+    называется по ВЕТКЕ (`.claude/worktrees/se-aeza-timeout-963b4c`), а не по
+    репозиторию. Поймано на живой сессии: `init` в worktree репозитория multihop
+    напечатал план «СОЗДАТЬ проект se-aeza-timeout-963b4c», хотя проект multihop
+    существовал и привязаться надо было к нему.
+
+    Основное дерево считается от ОБЩЕГО служебного каталога (`--git-common-dir`):
+    у подключённого worktree он указывает на `<основное дерево>/.git`, тогда как
+    `--git-dir` — на `<общий>/worktrees/<имя>`. Совпали — мы в основном дереве.
+    """
+    root = os.path.abspath(path)
+    top = _git_out(root, "rev-parse", "--show-toplevel")
+    if not top:
+        return None, False
+    common = _git_out(root, "rev-parse", "--git-common-dir")
+    git_dir = _git_out(root, "rev-parse", "--git-dir")
+    if not common or not git_dir:
+        return top, False
+    # git печатает пути относительно своего cwd, а это `root` из-за `-C`
+    common_abs = os.path.realpath(os.path.join(root, common))
+    git_abs = os.path.realpath(os.path.join(root, git_dir))
+    if common_abs == git_abs:
+        return top, False
+    # `<основное дерево>/.git` -> основное дерево; голый `repo.git` -> `repo`
+    base = os.path.basename(common_abs)
+    if base == ".git":
+        return os.path.dirname(common_abs), True
+    if base.endswith(".git"):
+        return common_abs[: -len(".git")].rstrip(os.sep), True
+    return common_abs, True
+
+
 def repo_project_name(path="."):
     """Имя проекта по умолчанию — имя каталога репозитория.
 
     Спрашивать его у человека незачем: в подавляющем большинстве случаев проект
     называется как репозиторий, а промпт, где надо что-то подставить руками,
     подставляют неправильно или забывают.
+
+    В git worktree берётся имя ОСНОВНОГО рабочего дерева: имя каталога worktree —
+    это имя ветки, и проект по нему получился бы одноразовым (см.
+    `git_main_worktree`).
     """
     root = os.path.abspath(path)
-    git = subprocess.run(["git", "-C", root, "rev-parse", "--show-toplevel"],
-                         capture_output=True, text=True)
-    if git.returncode == 0 and git.stdout.strip():
-        root = git.stdout.strip()
+    main, _ = git_main_worktree(root)
+    if main:
+        root = main
     return os.path.basename(root.rstrip(os.sep))
 
 
@@ -1372,6 +1425,19 @@ def ensure_agents_rule(repo_root, project_title, cfg_path, apply=False, plan=Non
     return done
 
 
+def refuse_guessed_project(title, root_title):
+    """Единственный текст отказа «проект по угаданному имени не создаю».
+
+    Один текст на оба режима намеренно: сухой прогон и `--apply` обязаны говорить
+    одно и то же. Разошлись они ровно потому, что жили в разных местах.
+    """
+    return (f"Проекта «{title}» в «{root_title}» нет, а имя я угадал по "
+            "каталогу репозитория.\n"
+            "  Создавать проект по догадке не буду — назови явно:\n"
+            f'    sing.py init --project "{title}" --apply\n'
+            "  Либо укажи существующий: sing.py projects")
+
+
 def cmd_init(args):
     """По умолчанию — сухой прогон: показывает план, ничего не меняет."""
     guessed = not args.project
@@ -1391,7 +1457,13 @@ def cmd_init(args):
                       f"«{known.get('projectTitle') or args.project}»")
         if not args.project:
             args.project = repo_project_name(args.path)
-            print(f"Проект не указан — беру имя репозитория: «{args.project}»")
+            _, in_worktree = git_main_worktree(os.path.abspath(args.path))
+            if in_worktree:
+                print(f"Проект не указан, и это git worktree — имя беру по основному "
+                      f"рабочему дереву: «{args.project}» "
+                      f"(каталог worktree назван по ветке, проект по нему был бы лишним)")
+            else:
+                print(f"Проект не указан — беру имя репозитория: «{args.project}»")
     projects = all_projects()
     root = resolve_root(projects)
     # искать только среди подпроектов корня — тёзка снаружи не должен даже находиться
@@ -1425,6 +1497,28 @@ def cmd_init(args):
                    if p.get("title", "").strip().lower() == args.project.strip().lower()]
         if outside:
             assert_allowed(outside[0]["id"], "проект")
+
+    # Привязка к существующему проекту — рутина; создание нового в трекере человека
+    # рутиной не является. По УГАДАННОМУ имени не создаём: иначе опечатка в имени
+    # каталога или запуск не в том месте тихо заводят лишний проект. Проверено на
+    # себе: повторный `init --apply` без --project из каталога проверки создал в
+    # трекере проект «init-proba» вместе с колонками.
+    #
+    # Отказ считается ДО плана и печатается в обоих режимах из одного текста: раньше
+    # сухой прогон обещал «СОЗДАТЬ проект», а `--apply` по тому же вводу отказывал, —
+    # план, расходящийся с поведением, читают как разрешение (поймано в worktree
+    # репозитория multihop). Заодно это экономит запросы: колонки и задачи
+    # несуществующего проекта спрашивать не у кого.
+    if not target and guessed:
+        if not args.apply:
+            print("\nПлан (ничего не изменено, добавь --apply):")
+            print(f"  · ОТКАЗАТЬСЯ создавать проект «{args.project}»: "
+                  "имя угадано по каталогу, --apply его не создаст")
+            print("  Дальше не произойдёт ничего: без проекта нет ни колонок, "
+                  "ни привязки, ни обязательных задач.")
+            print(refuse_guessed_project(args.project, root["title"]), file=sys.stderr)
+            return
+        die(refuse_guessed_project(args.project, root["title"]))
 
     plan = []
     if not target:
@@ -1469,18 +1563,6 @@ def cmd_init(args):
     tasks_plan, tasks_to_create = plan_default_tasks(
         existing_tasks, is_git, has_logs=has_logs, no_tasks=getattr(args, "no_tasks", False))
     plan.extend(tasks_plan)
-
-    # Привязка к существующему проекту — рутина; создание нового в трекере человека
-    # рутиной не является. По УГАДАННОМУ имени не создаём: иначе опечатка в имени
-    # каталога или запуск не в том месте тихо заводят лишний проект. Проверено на
-    # себе: повторный `init --apply` без --project из каталога проверки создал в
-    # трекере проект «init-proba» вместе с колонками.
-    if args.apply and not target and guessed:
-        die(f"Проекта «{args.project}» в «{root['title']}» нет, а имя я угадал по "
-            "каталогу репозитория.\n"
-            "  Создавать проект по догадке не буду — назови явно:\n"
-            f'    sing.py init --project "{args.project}" --apply\n'
-            "  Либо укажи существующий: sing.py projects")
 
     if not args.apply:
         print("\nПлан (ничего не изменено, добавь --apply):")
