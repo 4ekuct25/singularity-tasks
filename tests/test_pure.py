@@ -674,6 +674,173 @@ class RepoProjectNameTest(unittest.TestCase):
         self.assertEqual(sing.repo_project_name(d + os.sep), "хвост")
 
 
+class InitInWorktreeTest(unittest.TestCase):
+    """git worktree: каталог рабочего дерева назван по ВЕТКЕ, а не по репозиторию.
+
+    Поймано на живой сессии: `init` в worktree репозитория multihop предложил завести
+    проект «se-aeza-timeout-963b4c» — имя ветки. Проект multihop при этом существовал.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(self._drop)
+        self.repo = os.path.join(self.tmp, "основной-репозиторий")
+        os.makedirs(self.repo)
+        self._git("init", "-q", "-b", "main", ".")
+        self._git("commit", "-q", "--allow-empty", "-m", "старт")
+        # worktree лежит ВНУТРИ репозитория (как .claude/worktrees/*) — так же,
+        # как в бою: подниматься к основному дереву по файловой системе нельзя,
+        # надо спрашивать git.
+        self.wt = os.path.join(self.repo, ".worktrees", "vetka-963b4c")
+        self._git("worktree", "add", "-q", self.wt, "-b", "vetka-963b4c")
+
+    def _drop(self):
+        # worktree заперт своим служебным каталогом — сносим весь временный корень
+        shutil.rmtree(self.tmp, True)
+
+    def _git(self, *args):
+        r = subprocess.run(["git", "-C", self.repo, *args],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest(f"git не отработал ({' '.join(args)}): {r.stderr.strip()}")
+        return r
+
+    def test_name_comes_from_main_worktree_not_from_branch_directory(self):
+        self.assertEqual(sing.repo_project_name(self.wt), "основной-репозиторий",
+                         "имя каталога worktree — это имя ветки, проект по нему одноразовый")
+
+    def test_subdirectory_of_a_worktree_gives_the_same_name(self):
+        sub = os.path.join(self.wt, "tools")
+        os.makedirs(sub, exist_ok=True)
+        self.assertEqual(sing.repo_project_name(sub), "основной-репозиторий")
+
+    def test_worktree_is_recognised_as_such(self):
+        root, linked = sing.git_main_worktree(self.wt)
+        self.assertTrue(linked, "не опознан worktree — сообщение соврёт про имя")
+        self.assertEqual(os.path.realpath(root), os.path.realpath(self.repo))
+
+    def test_main_worktree_is_not_mistaken_for_a_linked_one(self):
+        root, linked = sing.git_main_worktree(self.repo)
+        self.assertFalse(linked, "обычный репозиторий объявлен worktree")
+        self.assertEqual(os.path.realpath(root), os.path.realpath(self.repo))
+        self.assertEqual(sing.repo_project_name(self.repo), "основной-репозиторий")
+
+    def test_not_a_repository_at_all(self):
+        plain = os.path.join(self.tmp, "не-репозиторий")
+        os.makedirs(plain)
+        self.assertEqual(sing.git_main_worktree(plain), (None, False))
+        self.assertEqual(sing.repo_project_name(plain), "не-репозиторий")
+
+
+class KanbanNotDeployedTest(unittest.TestCase):
+    """Проект без системных колонок: `init` отказывается, и отказ обязан быть
+    полезным. Автоматически развернуть канбан нельзя — замерено
+    (`tools/check-kanban-lazy.py`): свой id колонке API не даёт (400), ссылку на
+    несуществующую колонку отвергает (400), системную колонку не удаляет (403).
+    Поэтому ценность отказа вся в том, что он называет ДЕЙСТВУЮЩИЙ выход."""
+
+    def setUp(self):
+        # сети нет: GET колонки по id — единственный запрос на этом пути
+        self.addCleanup(setattr, sing, "request", sing.request)
+        sing.request = lambda *a, **kw: None
+
+    def _die_text(self, own_columns=False):
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.plan_columns("P-свежий", dict(sing.DEFAULT_COLUMNS), [],
+                              own_columns, [])
+        return err.getvalue()
+
+    def test_refusal_names_both_ways_out(self):
+        text = self._die_text()
+        self.assertIn("--project", text,
+                      "короткий путь (пусть проект заведёт сам init) не назван")
+        self.assertIn("в приложении", text, "второй выход не назван")
+        self.assertIn("--own-columns", text, "осознанный обход не назван")
+
+    def test_refusal_says_why_it_cannot_be_done_automatically(self):
+        """Без причины отказ читается как «скилл поленился», и его обходят."""
+        text = self._die_text()
+        for fact in ("400", "403"):
+            self.assertIn(fact, text, "в отказе нет замера, только запрет")
+
+    def test_own_columns_is_a_way_through_not_a_wall(self):
+        mapping, to_create = sing.plan_columns(
+            "P-свежий", dict(sing.DEFAULT_COLUMNS), [], True, [])
+        self.assertEqual(mapping, {}, "переиспользовать нечего — колонок нет")
+        self.assertEqual([r for r, _ in to_create], sing.COLUMN_ORDER)
+
+    def test_system_columns_present_are_reused_not_created(self):
+        """Главный инвариант: свои «Новые»/«В работе»/«Готово» не создаются никогда."""
+        existing = [{"id": f"KS-P-свежий{suf}", "name": name, "kanbanOrder": i}
+                    for i, (suf, name) in enumerate(
+                        [("-TODO", "Новые"), ("-IN-PROGRESS", "В работе"),
+                         ("-DONE", "Готово")])]
+        plan = []
+        mapping, to_create = sing.plan_columns(
+            "P-свежий", dict(sing.DEFAULT_COLUMNS), existing, False, plan)
+        self.assertEqual(mapping["todo"], "KS-P-свежий-TODO")
+        self.assertEqual([r for r, _ in to_create], ["review", "blocked"])
+        self.assertFalse([l for l in plan if l.startswith("СОЗДАТЬ колонку «Новые»")])
+
+
+class InitDryRunMatchesApplyTest(unittest.TestCase):
+    """План сухого прогона обязан показывать то, что реально произойдёт.
+
+    Было: план обещал «СОЗДАТЬ проект», а `--apply` по тому же вводу отказывал —
+    план, расходящийся с поведением, читают как разрешение.
+
+    Сети здесь нет: список проектов подставляется в памятку `_PROJECTS_CACHE`, и
+    на этом пути (имя угадано, проекта нет) запросов не делается вовсе.
+    """
+
+    ROOT = {"id": "P-root", "title": sing.ROOT_PROJECT_TITLE, "parent": None}
+
+    def setUp(self):
+        self.repo = os.path.join(tempfile.mkdtemp(), "zz-takogo-proekta-net")
+        os.makedirs(self.repo)
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.repo), True)
+        sing.forget_projects()
+        sing._PROJECTS_CACHE.extend([self.ROOT])
+        self.addCleanup(sing.forget_projects)
+
+    def _args(self, apply):
+        return argparse.Namespace(project=None, path=self.repo, apply=apply,
+                                  columns=None, own_columns=False, no_tasks=False)
+
+    def _dry_run(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), quiet() as err:
+            sing.cmd_init(self._args(apply=False))
+        return out.getvalue(), err.getvalue()
+
+    def test_plan_promises_refusal_not_creation(self):
+        out, err = self._dry_run()
+        self.assertNotIn("СОЗДАТЬ проект", out,
+                         "план обещает создание, которого --apply не сделает")
+        self.assertIn("ОТКАЗАТЬСЯ создавать проект", out)
+        self.assertIn("--project", out + err, "нет способа продолжить — отказ бесполезен")
+
+    def test_plan_does_not_promise_anything_after_the_refusal(self):
+        out, _ = self._dry_run()
+        for promised in ("ЗАПИСАТЬ", "СОЗДАТЬ задачу", "СОЗДАТЬ колонку", "РАЗОБРАТЬ"):
+            self.assertNotIn(promised, out,
+                             f"после отказа ничего не произойдёт, а план обещает «{promised}»")
+
+    def test_dry_run_touches_nothing_on_disk(self):
+        self._dry_run()
+        self.assertEqual(os.listdir(self.repo), [],
+                         "сухой прогон обязан быть сухим")
+
+    def test_apply_refuses_with_the_same_text(self):
+        _, plan_err = self._dry_run()
+        with contextlib.redirect_stdout(io.StringIO()), quiet() as err, \
+                self.assertRaises(SystemExit) as exc:
+            sing.cmd_init(self._args(apply=True))
+        self.assertEqual(exc.exception.code, 1)
+        self.assertEqual(err.getvalue(), plan_err,
+                         "сухой прогон и --apply обязаны говорить одно и то же")
+
+
 class AgentsRuleTest(unittest.TestCase):
     """После привязки правило «работа по доске» обязано оказаться в правилах
     репозитория: агент, зашедший в него, узнаёт о доске оттуда, а не из промпта."""

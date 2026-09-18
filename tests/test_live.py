@@ -529,6 +529,69 @@ class NotesTest(LiveBase):
         p = self.cli("notes", "--edit", tid, "--text", "текст", expect=1)
         self.assertIn("не заметка", p.stderr)
         self.assertEqual(self.note_of(tid), "", "отказ всё-таки что-то записал")
+class FreshProjectKanbanTest(LiveBase):
+    """СВЕЖИЙ проект, в приложении не открытый и в канбан руками не переключённый:
+    `init --apply` обязан разложить роли по СИСТЕМНЫМ колонкам и не завести ни одной
+    своей «Новые»/«В работе»/«Готово».
+
+    Замер, из-за которого проверка выглядит именно так (tools/check-kanban-lazy.py):
+    у проекта, созданного через API, все три системные колонки есть сразу же — ручное
+    переключение режима для этого пути не нужно вовсе. Развернуть канбан за приложение
+    скилл всё равно не может (свой id колонке API не даёт, 400), поэтому проверяется
+    то, что достижимо: раздвоения доски нет.
+
+    Свой черновик, а не общий: общий заводится `--with-columns`, то есть уже с
+    доской, — на нём этот путь не проверишь (проверка, которая не может покраснеть,
+    не проверка).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.title = draft_title() + "-fresh"
+        cls.fresh, _ = LIVE["zz"].create_draft(cls.sing, cls.title)
+        cls.addClassCleanup(cls._drop)
+        cls.dir = tempfile.mkdtemp(prefix="zz-selftest-fresh-")
+        cls.addClassCleanup(shutil.rmtree, cls.dir, True)
+
+    @classmethod
+    def _drop(cls):
+        LIVE["zz"].delete_draft(cls.sing, cls.fresh["id"])
+
+    def _init(self):
+        env = support.clean_env(SINGULARITY_AGENT=AGENT)
+        p = subprocess.run(
+            [sys.executable, support.SING, "init", "--project", self.title,
+             "--apply", "--no-tasks"],
+            cwd=self.dir, env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0,
+                         f"init на свежем проекте отказал\n{p.stdout}\n{p.stderr}")
+        return p
+
+    def test_init_on_a_fresh_project_uses_system_columns_and_makes_no_twins(self):
+        self._init()
+        with open(os.path.join(self.dir, ".agents", "singularity.json")) as f:
+            cfg = json.load(f)
+        pid = self.fresh["id"]
+        for role, suffix in self.sing.SYSTEM_SUFFIX.items():
+            self.assertEqual(cfg["columns"][role], f"KS-{pid}{suffix}",
+                             f"роль {role} привязана не к системной колонке")
+        self.assertIn("review", cfg["columns"])
+        self.assertIn("blocked", cfg["columns"])
+
+        board = [s for s in self.sing.project_statuses(pid) if not s.get("removed")]
+        names = [s["name"] for s in board]
+        twins = sorted({n for n in names if names.count(n) > 1})
+        self.assertEqual(twins, [], f"доска раздвоилась: {names}")
+        self.assertEqual(len(board), 5, f"колонок {len(board)}, а ролей пять: {names}")
+
+    def test_second_init_changes_nothing(self):
+        """Повторный `init --apply` не должен добирать доску второй раз."""
+        self._init()
+        before = {s["id"] for s in self.sing.project_statuses(self.fresh["id"])}
+        self._init()
+        after = {s["id"] for s in self.sing.project_statuses(self.fresh["id"])}
+        self.assertEqual(before, after, "повторный init изменил состав колонок")
 
 
 class ScopeGuardTest(LiveBase):
