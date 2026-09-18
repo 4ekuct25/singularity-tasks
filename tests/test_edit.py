@@ -21,6 +21,7 @@
 Запуск: tests/run.py fast
 """
 
+import datetime
 import json
 import os
 import shutil
@@ -158,6 +159,13 @@ class TrackerStub(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         path = urllib.parse.urlsplit(self.path).path
+        if path.startswith("/kanban-task-status/"):
+            # Связка доски: id детерминирован (`KTS-<taskId>`, api.md), поэтому
+            # заглушке хватает вытащить taskId из него.
+            tid = path[len("/kanban-task-status/KTS-"):]
+            STATE["links"][tid] = self._body()["statusId"]
+            return self._send({"id": f"KTS-{tid}", "taskId": tid,
+                               "statusId": STATE["links"][tid]})
         if not path.startswith("/task/"):
             return self._send({"error": "нет такого пути"}, 404)
         tid = path[len("/task/"):]
@@ -202,6 +210,11 @@ class TrackerStub(BaseHTTPRequestHandler):
                 task["note"] = None
             STATE["tasks"][tid] = task
             return self._send(task)
+        if path == "/kanban-task-status":
+            # Живой сервер апсертит связку по taskId (api.md): повторный POST не
+            # заводит вторую, а переставляет существующую.
+            STATE["links"][body["taskId"]] = body["statusId"]
+            return self._send({"id": f"KTS-{body['taskId']}", **body})
         self._send({"error": "нет такого пути"}, 404)
 
     def do_DELETE(self):
@@ -516,6 +529,119 @@ class NotesTest(EditBase):
         out = json.loads(r.stdout)
         self.assertIn("новый текст", out["note"])
         self.assertIn("переписана", r.stderr, "человеку не осталось ни строки")
+
+
+class StartDateTest(EditBase):
+    """Дата старта: ЗАПИСЬ и ЧТЕНИЕ обязаны сходиться.
+
+    Читать `start` скилл умел с самого начала — по нему `not_ready_reason`
+    решает, что задачу рано брать, — а записать его из CLI было нечем вовсе
+    (T-bae724fd). Поэтому проверяется не «поле ушло в запрос», а связка целиком:
+    записали дату в будущем -> `next` такую задачу не выдаёт, `board`/`list`
+    показывают её с пометкой, `--json` отдаёт `start` и `notReady`. Половина
+    этой связки без другой бессмысленна: запись без чтения кладёт поле, которого
+    никто не увидит, чтение без записи — то, чем и была команда до правки.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.future = (datetime.date.today()
+                       + datetime.timedelta(days=30)).isoformat()
+        self.past = (datetime.date.today()
+                     - datetime.timedelta(days=5)).isoformat()
+
+    def start_of(self, tid):
+        return STATE["tasks"][tid].get("start")
+
+    def test_add_writes_the_start_date_as_noon_utc(self):
+        out = self.cli("add", "задача на потом", "--note", "постановка",
+                       "--start", self.future).stdout
+        tid = out.split(":")[0]
+        self.assertEqual(self.start_of(tid), self.future + "T12:00:00.000Z",
+                         "дата старта не записалась, а команда отчиталась успехом")
+        self.assertIn(f"начало {self.future}", out,
+                      "человеку не сказали, что задача не выдастся до этого дня")
+
+    def test_a_future_start_keeps_the_task_out_of_next(self):
+        """Секция здесь — способ оставить в очереди ОДНУ задачу: иначе `next`
+        выдаст соседнюю, и «не выдал именно эту» доказано не будет."""
+        tid = self.cli("add", "задача на потом", "--note", "постановка",
+                       "--group", "Раздел B", "--start",
+                       self.future).stdout.split(":")[0]
+        p = self.cli("next", "--group", "Раздел B", code=2)
+        self.assertIn("брать нельзя", p.stdout)
+        self.assertIn(f"начало {self.future}", p.stdout)
+        self.assertIn(tid, p.stdout)
+        # Контроль: та же задача без даты старта очередью выдаётся — значит
+        # пустая выдача выше про дату, а не про секцию.
+        self.cli("set", tid, "--start", "")
+        self.assertIn(tid, self.cli("next", "--group", "Раздел B").stdout)
+
+    def test_but_it_stays_visible_on_the_board_and_in_the_list(self):
+        """Спрятанная карточка выглядит потерянной — режем только на выдаче."""
+        tid = self.cli("add", "задача на потом", "--note", "постановка",
+                       "--start", self.future).stdout.split(":")[0]
+        for argv in (("board",), ("list",)):
+            out = self.cli(*argv).stdout
+            self.assertIn(tid, out, f"{argv[0]} потерял задачу с датой старта")
+            self.assertIn(f"[начало {self.future}]", out,
+                          f"{argv[0]} показал её без пометки, как обычную")
+
+    def test_json_carries_the_start_field_and_the_reason(self):
+        tid = self.cli("add", "задача на потом", "--note", "постановка",
+                       "--start", self.future).stdout.split(":")[0]
+        hit = next(t for t in json.loads(self.cli("list", "--json").stdout)
+                   if t["id"] == tid)
+        self.assertEqual(hit["start"], self.future)
+        self.assertEqual(hit["notReady"], f"начало {self.future}")
+
+    def test_set_writes_the_start_date_of_an_existing_task(self):
+        self.cli("set", "T-loose", "--start", self.future)
+        self.assertEqual(self.start_of("T-loose"), self.future + "T12:00:00.000Z")
+        self.assertEqual(STATE["patches"], [{"start": self.future + "T12:00:00.000Z"}],
+                         "PATCH обязан нести только названное поле")
+
+    def test_empty_start_clears_it_and_differs_from_not_touching(self):
+        self.cli("set", "T-loose", "--start", self.future)
+        STATE["patches"].clear()
+        out = self.cli("set", "T-loose", "--start", "").stdout
+        self.assertEqual(STATE["patches"], [{"start": None}],
+                         "пустая строка обязана писать null, а не пропускаться")
+        self.assertIsNone(self.start_of("T-loose"))
+        self.assertIn("не в будущем", out)
+
+    def test_a_past_start_is_written_but_changes_nothing_for_the_queue(self):
+        out = self.cli("set", "T-loose", "--start", self.past).stdout
+        self.assertEqual(self.start_of("T-loose"), self.past + "T12:00:00.000Z")
+        self.assertIn("не в будущем", out)
+        self.cli("next")          # задача по-прежнему выдаётся, код 0
+
+    def test_silent_200_on_the_start_date_is_caught(self):
+        """AGENTS.md §4: этот API умеет ответить 200, ничего не сделав."""
+        STATE["ignore_write"] = True
+        p = self.cli("set", "T-loose", "--start", self.future, code=1)
+        self.assertIn("не применилась", p.stderr)
+        self.assertIn("дата старта", p.stderr, "не названо поле, которое не записалось")
+
+    def test_broken_start_never_reaches_the_request(self):
+        p = self.cli("set", "T-loose", "--start", "2026-02-30", code=1)
+        self.assertIn("--start", p.stderr)
+        self.assertEqual(STATE["patches"], [], "мусор всё-таки ушёл в трекер")
+
+    def test_start_after_deadline_warns_but_writes(self):
+        """Отказ уронил бы законное `set --deadline` из-за старой даты старта —
+        поэтому предупреждение, а не отказ; и оно обязано быть заметным."""
+        out = self.cli("set", "T-loose", "--start", self.future,
+                       "--deadline", self.past).stdout
+        self.assertEqual(self.start_of("T-loose"), self.future + "T12:00:00.000Z",
+                         "предупреждение не должно отменять запись")
+        self.assertIn("позже дедлайна", out)
+        self.assertIn(f"--start {self.past}", out, "не подсказано, как поменять местами")
+
+    def test_a_sane_pair_says_nothing_extra(self):
+        out = self.cli("set", "T-loose", "--start", self.past,
+                       "--deadline", self.future).stdout
+        self.assertNotIn("позже дедлайна", out)
 
 
 if __name__ == "__main__":

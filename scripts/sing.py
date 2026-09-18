@@ -1167,13 +1167,21 @@ _ISO_DT_RE = re.compile(
     r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(\.\d+)?"
     r"(Z|[+-]\d{2}:?\d{2})$", re.I)
 
-DEADLINE_HELP = (
+DATE_HELP = (
     "дата 2026-10-15 (станет полднем UTC того же дня) либо полный ISO-8601 "
     "с явной таймзоной: 2026-10-15T18:00:00.000Z, 2026-10-15T18:00:00+03:00")
 
+START_HELP = ("дата старта: раньше неё задача не выдаётся в next, но с доски не "
+              "пропадает — " + DATE_HELP)
 
-def parse_deadline(raw, field="--deadline"):
+
+def parse_date(raw, field="--deadline"):
     """Привести дату к тому виду, который API принимает, ЛИБО объяснить отказ.
+
+    Разбор один на все датные поля задачи: `deadline` и `start` сервер принимает
+    в одном и том же виде (api.md), и второй парсер означал бы два набора правил
+    дополнения и два текста отказа, расходящихся с первой же правкой. Имя поля
+    приходит параметром — только ради текста отказа.
 
     Голую дату `2026-10-15` сервер отвечает `400` — и это была не косметика: `add`
     падал сырым дампом ответа API, задача не создавалась (T-daa1e87c). Справка при
@@ -1193,7 +1201,7 @@ def parse_deadline(raw, field="--deadline"):
         return None
 
     def bad(why):
-        die(f"{field}: {why}\n  ожидается: {DEADLINE_HELP}\n  получено: {raw}")
+        die(f"{field}: {why}\n  ожидается: {DATE_HELP}\n  получено: {raw}")
 
     if _DATE_ONLY_RE.match(raw):
         y, m, d = (int(x) for x in raw.split("-"))
@@ -1223,8 +1231,9 @@ def parse_deadline(raw, field="--deadline"):
     return raw
 
 
-def deadline_instant(raw):
-    """Дедлайн как МОМЕНТ времени; `None` — пусто или не разбирается.
+def date_instant(raw):
+    """Датное поле задачи (`deadline`, `start`) как МОМЕНТ времени;
+    `None` — пусто или не разбирается.
 
     Сверять сохранённое строкой нельзя: одно и то же время записывается
     по-разному (замер, api.md: в базе живут формы с 6, 3 и 0 знаками дробной
@@ -1256,13 +1265,13 @@ def field_applied(name, task, want):
     """Поле задачи в трекере уже равно тому, что мы хотим записать?
 
     Сверка по СМЫСЛУ поля, а не по «== из словаря»: у приоритета отсутствие
-    значения означает «обычный» (`prio_of`), у дедлайна сравниваются моменты
+    значения означает «обычный» (`prio_of`), у датных полей сравниваются моменты
     времени, а не строки.
     """
     if name == "priority":
         return prio_of(task) == int(want)
-    if name == "deadline":
-        return deadline_instant(task.get("deadline")) == deadline_instant(want)
+    if name in ("deadline", "start"):
+        return date_instant(task.get(name)) == date_instant(want)
     if name == "note":
         # Сверять дельту строкой нельзя: одна и та же заметка записывается
         # разными операциями (а сервер вправе их нормализовать). Значение имеет
@@ -1283,7 +1292,41 @@ def field_show(name, value):
 
 # Имена полей в выводе — человеческие, в теле запроса — те, что понимает API.
 FIELD_TITLES = {"priority": "приоритет", "deadline": "дедлайн", "group": "секция",
-                "note": "заметка"}
+                "note": "заметка", "start": "дата старта"}
+
+
+def start_after_deadline(task):
+    """Старт позже дедлайна? Возвращает пару дат для сообщения, иначе `None`.
+
+    Сочетание осмысленного смысла не имеет: до даты старта очередь задачу не
+    выдаёт (`not_ready_reason`), а к этому дню дедлайн уже прошёл — то есть
+    карточка просрочена раньше, чем её вообще можно взять. Обычно это описка
+    (перепутанные флаги).
+
+    И всё же это ПРЕДУПРЕЖДЕНИЕ, а не отказ. `set` меняет одно поле, второе
+    лежит в трекере: отказ уронил бы законное `set --deadline` из-за старой даты
+    старта — человек двигает дедлайн ближе именно потому, что срочно, и чинить
+    ему в этот момент предлагалось бы не то. Данные при этом не портятся:
+    очередь ведёт себя предсказуемо (не выдаёт до старта), просрочка видна на
+    доске. Поэтому — заметная строка и ни одного заблокированного сценария.
+    """
+    s, d = date_instant(task.get("start")), date_instant(task.get("deadline"))
+    if s and d and s > d:
+        return (task.get("start") or "")[:10], (task.get("deadline") or "")[:10]
+    return None
+
+
+def warn_start_after_deadline(task, out=None):
+    """Печатает предупреждение по ФАКТУ записанного — из перечитанной задачи,
+    а не из того, что мы отправляли (AGENTS.md §4)."""
+    hit = start_after_deadline(task)
+    if hit:
+        print(f"  ⚠ старт {hit[0]} позже дедлайна {hit[1]}: до {hit[0]} очередь "
+              f"задачу не выдаст (next пропустит её как «начало {hit[0]}»), "
+              "а дедлайн к этому дню уже пройдёт.\n"
+              "    Если флаги перепутаны — поменяй местами: "
+              f"sing.py set {task.get('id')} --start {hit[1]} --deadline {hit[0]}",
+              file=out or sys.stdout)
 
 # Что сверяется до и после ЛЮБОЙ правки полей (`set_task_fields`): PATCH с лишним
 # полем стирает состояние задачи, и ловится это только снимком. Команды со своим
@@ -2237,8 +2280,11 @@ def cmd_board(args):
     extra = {cid: name for cid, name in statuses.items() if cid not in known}
     titles = tag_titles([t for *_, shown in layout for t in shown] + loose)
 
+    # Счёт подзадач нужен обоим выводам: человеческий помечает «пока брать
+    # нельзя» ровно тем же текстом, что машинный кладёт в notReady.
+    kids = open_children_counts(tasks)
+
     if args.json:
-        kids = open_children_counts(tasks)
         gnames = group_titles(cfg["projectId"])
 
         def one(t, role, column_name):
@@ -2322,11 +2368,20 @@ def cmd_board(args):
         print(f"\n[{role}] {name} — {len(items)}"
               + (f" (показаны {len(shown)})" if len(shown) < len(items) else ""))
         for t in shown:
-            done = " ✓" if int(t.get("checked") or 0) == 1 else ""
+            closed = int(t.get("checked") or 0) == 1
+            done = " ✓" if closed else ""
             # в дневнике = приложение унесло закрытую задачу из активного списка;
             # на доске она остаётся, но в самом приложении её там уже не видно
             done += " (в дневнике)" if t.get("journalDate") else ""
-            print(pad(holders.get(t["id"])) + brief(t) + done)
+            # Пометка «пока брать нельзя» — та же, что у `list` и в notReady.
+            # Без неё доска молчала о том, чего `next` не выдаст: задача с датой
+            # старта в будущем выглядела обычной, и агент видел «очередь пуста»
+            # при непустой колонке, не понимая, почему (у закрытых причина
+            # бессмысленна — там её нет, как и в `list`).
+            reason = None if closed else not_ready_reason(
+                t, open_children=kids.get(t["id"], 0))
+            print(pad(holders.get(t["id"])) + brief(t) + done
+                  + (f"  [{reason}]" if reason else ""))
 
 
 def open_children_counts(tasks):
@@ -2338,6 +2393,22 @@ def open_children_counts(tasks):
         if parent and int(t.get("checked") or 0) == 0:
             counts[parent] = counts.get(parent, 0) + 1
     return counts
+
+
+def starts_later(task, today=None):
+    """Дата старта задачи ещё не наступила -> сама дата (ГГГГ-ММ-ДД), иначе None.
+
+    Одна точка сравнения на весь скилл: её читает и очередь (`not_ready_reason`),
+    и команды записи (`add`/`set`), объясняя человеку, почему только что
+    заведённая задача не выдаётся. Своё сравнение в каждом месте разъехалось бы с
+    очередью — и сообщение противоречило бы поведению.
+
+    `start` приходит полным ISO со временем — сравниваем календарные даты, иначе
+    «сегодня, но позже» выглядит как будущее и задача не берётся весь день.
+    """
+    start = (task.get("start") or "")[:10]
+    today = today or datetime.date.today().isoformat()
+    return start if start and start > today else None
 
 
 def not_ready_reason(task, today=None, open_children=0):
@@ -2360,11 +2431,8 @@ def not_ready_reason(task, today=None, open_children=0):
         return "повторяющаяся: это шаблон серии, а не задача"
     if task.get("deferred"):
         return "отложена"
-    # `start` приходит полным ISO со временем — сравниваем календарные даты,
-    # иначе «сегодня, но позже» выглядит как будущее и задача не берётся весь день
-    start = (task.get("start") or "")[:10]
-    today = today or datetime.date.today().isoformat()
-    if start and start > today:
+    start = starts_later(task, today)
+    if start:
         return f"начало {start}"
     if open_children:
         # Родитель — это его подзадачи. Взять его раньше них значит либо сделать
@@ -2907,7 +2975,9 @@ def cmd_add(args):
     if args.priority is not None:
         body["priority"] = args.priority
     if args.deadline:
-        body["deadline"] = parse_deadline(args.deadline)
+        body["deadline"] = parse_date(args.deadline)
+    if args.start:
+        body["start"] = parse_date(args.start, "--start")
     t = request("POST", "/task", body=body)
     tid = t["id"]
     # Задача уже создана. Всё, что упадёт дальше, обязано назвать её id: без него
@@ -2923,13 +2993,20 @@ def cmd_add(args):
     # `priority`/`deadline` выглядел бы как успех: задача создана, поле пустое.
     # Не `die`: задача уже существует, ронять команду здесь значит толкать на
     # повторный add и дубль. Поэтому — предупреждение и готовая починка.
-    dropped = [k for k in ("priority", "deadline")
+    dropped = [k for k in ("priority", "deadline", "start")
                if k in body and not field_applied(k, t, body[k])]
     if dropped:
         fix = " ".join(f"--{k} '{body[k]}'" for k in dropped)
         print(f"  ⚠ трекер не взял {', '.join(FIELD_TITLES[k] for k in dropped)} — "
               f"дописать: sing.py set {tid} {fix}")
     print(f"{tid}: создана в колонке '{args.column}' — {args.title}")
+    later = starts_later(t) if body.get("start") else None
+    if later:
+        # Задача создана «на будущее» — сказать это сразу. Иначе агент, заведя
+        # карточку, не найдёт её в `next` и решит, что `add` не сработал.
+        print(f"  начало {later}: до этого дня очередь её не выдаст, "
+              "на доске она видна с пометкой")
+    warn_start_after_deadline(t)
     if cfg.get("adhoc"):
         # Задача уехала в соседний проект: из этого репозитория её больше ничем
         # не открыть (show/report сверяют проект задачи с привязкой), поэтому
@@ -3070,7 +3147,7 @@ def set_task_fields(task_id, fields, task=None, watched=SET_WATCHED):
 
 
 def cmd_set(args):
-    """Сменить приоритет и/или дедлайн у СУЩЕСТВУЮЩЕЙ задачи.
+    """Сменить приоритет, дедлайн и/или дату старта у СУЩЕСТВУЮЩЕЙ задачи.
 
     До этой команды `--priority`/`--deadline` были только у `add`, то есть поля
     задавались один раз при создании и больше не менялись. На живой сессии
@@ -3088,12 +3165,15 @@ def cmd_set(args):
     # обязаны различаться. `--deadline ''` пишет null, отсутствие флага не
     # отправляет поле вовсе.
     if args.deadline is not None:
-        fields["deadline"] = parse_deadline(args.deadline)
+        fields["deadline"] = parse_date(args.deadline)
+    if args.start is not None:
+        fields["start"] = parse_date(args.start, "--start")
     if not fields:
-        die(f"{args.id}: нечего менять — нужен --priority и/или --deadline.\n"
+        die(f"{args.id}: нечего менять — нужен --priority, --deadline и/или --start.\n"
             "  sing.py set <id> --priority 0            # 0=высокий, 1=обычный, 2=низкий\n"
             "  sing.py set <id> --deadline 2026-10-15\n"
-            "  sing.py set <id> --deadline ''           # снять дедлайн")
+            "  sing.py set <id> --start 2026-10-01      # раньше неё next не выдаст\n"
+            "  sing.py set <id> --deadline ''           # снять дедлайн (то же у --start)")
 
     def value_of(t, k):
         """Приоритета может не быть в задаче вовсе, и это «обычный», а не пусто."""
@@ -3107,6 +3187,7 @@ def cmd_set(args):
         print(f"{args.id}: {FIELD_TITLES[k]} уже {field_show(k, value_of(task, k))}"
               " — не трогаю")
     if not todo:
+        warn_start_after_deadline(task)
         print(f"  {task_link(args.id)}")
         return
 
@@ -3114,6 +3195,15 @@ def cmd_set(args):
     for k in todo:
         print(f"{args.id}: {FIELD_TITLES[k]} {field_show(k, value_of(task, k))}"
               f" -> {field_show(k, value_of(fresh, k))}")
+    # Что означает новая дата старта для очереди — словами, тем же текстом, что
+    # печатает `next`: иначе «поле записано» не отвечает на вопрос «а почему
+    # задача пропала из выдачи».
+    if "start" in todo:
+        later = starts_later(fresh)
+        print(f"  начало {later}: до этого дня очередь задачу не выдаст, "
+              "на доске она видна с пометкой" if later
+              else "  дата старта не в будущем — для очереди задача обычная")
+    warn_start_after_deadline(fresh)
     print(f"  {task_link(args.id)}")
 
 
@@ -3609,7 +3699,8 @@ def build_parser():
                     help="осознанно без описания (заголовок исчерпывает задачу)")
     sp.add_argument("--priority", type=int, choices=[0, 1, 2],
                     help="0=высокий, 1=обычный, 2=низкий")
-    sp.add_argument("--deadline", help=DEADLINE_HELP)
+    sp.add_argument("--deadline", help=DATE_HELP)
+    sp.add_argument("--start", help=START_HELP)
     sp.add_argument("--project", metavar="ПРОЕКТ", help=PROJECT_REF)
     sp.set_defaults(fn=cmd_add)
 
@@ -3623,12 +3714,15 @@ def build_parser():
     sp.add_argument("title")
     sp.set_defaults(fn=cmd_rename)
 
-    sp = sub.add_parser("set", help="сменить приоритет и/или дедлайн у существующей задачи")
+    sp = sub.add_parser("set",
+                        help="сменить приоритет, дедлайн и/или дату старта задачи")
     sp.add_argument("id")
     sp.add_argument("--priority", type=int, choices=[0, 1, 2],
                     help="0=высокий, 1=обычный, 2=низкий")
     sp.add_argument("--deadline",
-                    help=DEADLINE_HELP + "; пустая строка '' — снять дедлайн")
+                    help=DATE_HELP + "; пустая строка '' — снять дедлайн")
+    sp.add_argument("--start",
+                    help=START_HELP + "; пустая строка '' — снять дату старта")
     sp.set_defaults(fn=cmd_set)
 
     sp = sub.add_parser("regroup", help="перенести задачу в секцию проекта или снять секцию")

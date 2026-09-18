@@ -16,6 +16,7 @@
 Запуск: tests/run.py live   (нужен токен и доступ к трекеру)
 """
 
+import datetime
 import json
 import os
 import shutil
@@ -195,16 +196,22 @@ class AddTest(LiveBase):
 
         Прогонять надо именно живьём: разбор даты можно проверить на заглушке, а
         вот что сервер берёт получившуюся форму — только здесь.
+
+        Дата старта проверяется здесь же, одной задачей: поле у сервера другое,
+        а форма даты та же, и лишний `add` на живом прогоне стоит запросов.
         """
         out = self.cli("add", "zz: дедлайн короткой датой",
                        "--note", "критерий: задача создалась",
-                       "--deadline", "2026-10-15").stdout
+                       "--deadline", "2026-10-15", "--start", "2026-10-01").stdout
         tid = out.split(":")[0].strip()
         self.assertTrue(tid.startswith("T-"), out)
-        saved = self.sing.request("GET", f"/task/{tid}").get("deadline")
-        self.assertTrue(saved, "дедлайн не сохранился, а команда не упала")
-        self.assertEqual(saved[:10], "2026-10-15",
-                         f"календарный день съехал: {saved}")
+        saved = self.sing.request("GET", f"/task/{tid}")
+        self.assertTrue(saved.get("deadline"), "дедлайн не сохранился, а команда не упала")
+        self.assertEqual(saved["deadline"][:10], "2026-10-15",
+                         f"календарный день съехал: {saved['deadline']}")
+        self.assertTrue(saved.get("start"), "дата старта не сохранилась")
+        self.assertEqual(saved["start"][:10], "2026-10-01",
+                         f"календарный день съехал: {saved['start']}")
         # доска печатает первые 10 символов — человек должен видеть ту же дату
         self.assertIn("дедлайн=2026-10-15", self.cli("list").stdout)
 
@@ -273,6 +280,44 @@ class SetFieldsTest(LiveBase):
                          "дедлайн не снялся, а команда отчиталась успехом")
         self.assertEqual(self.field(tid, "priority"), 0,
                          "снятие дедлайна задело приоритет")
+
+    def test_start_date_is_written_and_the_queue_obeys_it(self):
+        """Живьём проверяется ровно то, чего не видно на заглушке: что СЕРВЕР
+        берёт получившуюся форму даты в поле `start` и отдаёт её обратно, а
+        карточка при этом остаётся в своей колонке (PATCH `start` связку с доской
+        не трогает, api.md). Поведение очереди на этих же данных — рядом, одной
+        задачей: живой прогон и так упирается в rate limit.
+
+        A/B/A на одной карточке: дата в будущем -> дата в прошлом -> снятие. Без
+        возврата «стало снова видно» пустая выдача ничего не доказывала бы — она
+        бывает и от соседней причины.
+        """
+        future = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
+        past = (datetime.date.today() - datetime.timedelta(days=5)).isoformat()
+        tid = self.make_task("zz: дата старта и очередь")
+        group = "zz-старт"
+        self.cli("groups", "--create", group)
+        self.cli("regroup", tid, group)      # своя секция: в очереди одна задача
+
+        out = self.cli("set", tid, "--start", future).stdout
+        self.assertEqual((self.field(tid, "start") or "")[:10], future,
+                         "сервер не взял дату старта, а команда отчиталась успехом")
+        self.assertIn(f"начало {future}", out, "не сказано, что значит эта дата")
+        self.assertEqual(self.column_of(tid), "todo",
+                         "запись даты старта утащила карточку с доски")
+
+        p = self.cli("next", "--group", group, expect=2)
+        self.assertIn(f"начало {future}", p.stdout)
+        line = next(s for s in self.cli("board").stdout.splitlines() if tid in s)
+        self.assertIn(f"[начало {future}]", line, "доска показала её без пометки")
+
+        self.cli("set", tid, "--start", past)
+        self.assertIn(tid, self.cli("next", "--group", group).stdout,
+                      "с прошедшей датой старта задача обязана выдаваться")
+
+        self.cli("set", tid, "--start", "")
+        self.assertFalse(self.field(tid, "start"),
+                         "дата старта не снялась, а команда отчиталась успехом")
 
     def test_set_keeps_the_task_intact(self):
         """PATCH с лишним полем стирает состояние. Взятая в работу задача обязана

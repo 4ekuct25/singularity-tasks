@@ -1108,10 +1108,10 @@ class DefaultProjectTasksTest(unittest.TestCase):
             self.assertTrue(sing.has_logs_or_journal(td))
 
 
-# ------------------------------------------------------------------- дедлайн
+# --------------------------------------------------------- дедлайн и старт
 
 
-class ParseDeadlineTest(unittest.TestCase):
+class ParseDateTest(unittest.TestCase):
     """`--deadline` обещал «ISO-дату», а API берёт только полный ISO-8601 с явной
     таймзоной: голая `2026-10-15` — `400`, задача не создаётся (T-daa1e87c).
     Разбор обязан быть ЛОКАЛЬНЫМ: формат ловится до запроса, с примером в тексте."""
@@ -1119,13 +1119,13 @@ class ParseDeadlineTest(unittest.TestCase):
     def test_short_date_becomes_noon_utc(self):
         """Полдень, а не полночь: полночь в зоне со сдвигом уезжает в соседние
         сутки по UTC, и доска (`brief()` режет deadline[:10]) показала бы 14-е."""
-        self.assertEqual(sing.parse_deadline("2026-10-15"),
+        self.assertEqual(sing.parse_date("2026-10-15"),
                          "2026-10-15T12:00:00.000Z")
-        self.assertEqual(sing.parse_deadline("  2026-10-15  "),
+        self.assertEqual(sing.parse_date("  2026-10-15  "),
                          "2026-10-15T12:00:00.000Z")
         # Календарный день держится при сдвиге −11:59…+11:59. Шире не бывает:
         # зоны занимают 26 часов, одной точки, верной для всех, не существует.
-        stamp = sing.parse_deadline("2026-10-15")
+        stamp = sing.parse_date("2026-10-15")
         self.assertTrue(stamp.startswith("2026-10-15"))
         moment = datetime.datetime(2026, 10, 15, 12, tzinfo=datetime.timezone.utc)
         for minutes in (-719, -540, -330, 0, 180, 345, 719):
@@ -1143,18 +1143,18 @@ class ParseDeadlineTest(unittest.TestCase):
                     "2026-10-15T18:00:00+03:00",
                     "2026-10-15T18:00:00-08:00",
                     "2026-10-15T18:00:00+0300"):
-            self.assertEqual(sing.parse_deadline(raw), raw, raw)
+            self.assertEqual(sing.parse_date(raw), raw, raw)
 
     def test_empty_means_nothing_to_send(self):
         """Пустой ввод — это «снять дедлайн»; отличать его от «не трогать»
         обязан вызывающий, по `is None` самого аргумента."""
-        self.assertIsNone(sing.parse_deadline(""))
-        self.assertIsNone(sing.parse_deadline("   "))
-        self.assertIsNone(sing.parse_deadline(None))
+        self.assertIsNone(sing.parse_date(""))
+        self.assertIsNone(sing.parse_date("   "))
+        self.assertIsNone(sing.parse_date(None))
 
     def test_datetime_without_timezone_is_refused_with_a_hint(self):
         with quiet() as err, self.assertRaises(SystemExit):
-            sing.parse_deadline("2026-10-15T18:00:00")
+            sing.parse_date("2026-10-15T18:00:00")
         text = err.getvalue()
         self.assertIn("таймзон", text)
         self.assertIn("2026-10-15T18:00:00.000Z", text, "нет примера формата")
@@ -1164,14 +1164,14 @@ class ParseDeadlineTest(unittest.TestCase):
         for raw in ("2026-02-30", "2026-13-01", "2026-04-31",
                     "2026-02-30T12:00:00Z", "2026-10-15T25:00:00Z"):
             with quiet() as err, self.assertRaises(SystemExit):
-                sing.parse_deadline(raw)
+                sing.parse_date(raw)
             self.assertIn("календар", err.getvalue(), raw)
 
     def test_garbage_is_refused_with_an_example(self):
         for raw in ("завтра", "15.10.2026", "2026/10/15", "2026-10",
                     "15-10-2026", "2026-10-15T18:00:00+25:00"):
             with quiet() as err, self.assertRaises(SystemExit):
-                sing.parse_deadline(raw)
+                sing.parse_date(raw)
             text = err.getvalue()
             self.assertIn("--deadline", text, raw)
             self.assertIn("2026-10-15", text, f"нет примера формата для {raw}")
@@ -1180,11 +1180,21 @@ class ParseDeadlineTest(unittest.TestCase):
         """Одно и то же сообщение обслуживает и `add`, и правку существующей
         карточки — имя поля должно быть тем, которое человек набрал."""
         with quiet() as err, self.assertRaises(SystemExit):
-            sing.parse_deadline("завтра", field="--deadline у set")
+            sing.parse_date("завтра", field="--deadline у set")
         self.assertIn("--deadline у set", err.getvalue())
 
+    def test_the_same_parser_serves_the_start_date(self):
+        """Второй разбор дат означал бы два набора правил дополнения и два
+        текста отказа: сервер берёт `start` и `deadline` в одном виде (api.md)."""
+        self.assertEqual(sing.parse_date("2026-10-15", "--start"),
+                         "2026-10-15T12:00:00.000Z")
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.parse_date("2026-02-30", "--start")
+        self.assertIn("--start", err.getvalue())
+        self.assertIn("календар", err.getvalue())
 
-class DeadlineInstantTest(unittest.TestCase):
+
+class DateInstantTest(unittest.TestCase):
     """Сохранённое сравнивается как МОМЕНТ, а не строкой: одно и то же время
     записывается по-разному (в базе три формы дробной части), а зону сервер
     вправе нормализовать. Строковая сверка тогда сказала бы «поле не
@@ -1194,16 +1204,16 @@ class DeadlineInstantTest(unittest.TestCase):
         same = ["2026-10-15T15:00:00.000Z", "2026-10-15T15:00:00Z",
                 "2026-10-15T15:00:00.000000Z", "2026-10-15T18:00:00+03:00",
                 "2026-10-15T07:00:00-08:00", "2026-10-15 15:00:00Z"]
-        moments = {sing.deadline_instant(s) for s in same}
+        moments = {sing.date_instant(s) for s in same}
         self.assertEqual(len(moments), 1, f"одно время разошлось: {moments}")
 
     def test_different_moments_stay_different(self):
-        self.assertNotEqual(sing.deadline_instant("2026-10-15T12:00:00Z"),
-                            sing.deadline_instant("2026-10-15T12:00:00+03:00"))
+        self.assertNotEqual(sing.date_instant("2026-10-15T12:00:00Z"),
+                            sing.date_instant("2026-10-15T12:00:00+03:00"))
 
     def test_empty_and_garbage_are_none(self):
         for raw in (None, "", "   ", "завтра", "2026-10-15", "2026-10-15T12:00:00"):
-            self.assertIsNone(sing.deadline_instant(raw), raw)
+            self.assertIsNone(sing.date_instant(raw), raw)
 
 
 class FieldAppliedTest(unittest.TestCase):
@@ -1227,6 +1237,73 @@ class FieldAppliedTest(unittest.TestCase):
         self.assertTrue(sing.field_applied("deadline", {}, None))
         self.assertFalse(sing.field_applied("deadline",
                                             {"deadline": "2026-10-15T12:00:00Z"}, None))
+
+    def test_start_is_compared_the_same_way_as_a_deadline(self):
+        """Подтверждение записи сравнивает моменты: сервер вправе вернуть тот же
+        момент в другой записи, и строковая сверка уронила бы успешную правку."""
+        task = {"start": "2026-10-15T15:00:00.000Z"}
+        self.assertTrue(sing.field_applied("start", task,
+                                           "2026-10-15T18:00:00+03:00"))
+        self.assertFalse(sing.field_applied("start", task,
+                                            "2026-10-16T15:00:00.000Z"))
+        self.assertTrue(sing.field_applied("start", {}, None))
+        self.assertFalse(sing.field_applied("start", task, None))
+
+
+class StartsLaterTest(unittest.TestCase):
+    """Одна точка сравнения «старт ещё не наступил» на весь скилл: её читает и
+    очередь, и `add`/`set`, объясняя, почему задача не выдаётся. Своё сравнение
+    в каждом месте разъехалось бы с очередью — сообщение противоречило бы делу."""
+
+    def setUp(self):
+        self.today = datetime.date.today().isoformat()
+
+    def test_future_yes_today_and_past_no(self):
+        self.assertEqual(sing.starts_later({"start": "2099-01-01T00:00:00.000Z"}),
+                         "2099-01-01")
+        self.assertIsNone(sing.starts_later({"start": self.today + "T23:59:00.000Z"}))
+        self.assertIsNone(sing.starts_later({"start": "2020-01-01"}))
+
+    def test_nothing_set_is_not_a_future_date(self):
+        for task in ({}, {"start": ""}, {"start": None}):
+            self.assertIsNone(sing.starts_later(task), task)
+
+    def test_the_queue_says_exactly_the_same_thing(self):
+        task = {"start": "2099-01-01T00:00:00.000Z"}
+        self.assertEqual(sing.not_ready_reason(task),
+                         f"начало {sing.starts_later(task)}")
+
+
+class StartAfterDeadlineTest(unittest.TestCase):
+    """Старт позже дедлайна — почти всегда описка, но это ПРЕДУПРЕЖДЕНИЕ.
+
+    Отказ уронил бы законное `set --deadline`: второе поле лежит в трекере, и
+    человек, двигающий дедлайн ближе из-за срочности, получил бы отказ вместо
+    правки. Данные при этом не портятся — очередь ведёт себя предсказуемо."""
+
+    def test_pair_is_reported_as_dates(self):
+        self.assertEqual(
+            sing.start_after_deadline({"start": "2026-11-01T12:00:00.000Z",
+                                       "deadline": "2026-10-15T12:00:00.000Z"}),
+            ("2026-11-01", "2026-10-15"))
+
+    def test_sane_or_incomplete_pairs_stay_silent(self):
+        for task in ({"start": "2026-10-01T12:00:00.000Z",
+                      "deadline": "2026-10-15T12:00:00.000Z"},
+                     {"start": "2026-10-15T12:00:00.000Z",
+                      "deadline": "2026-10-15T12:00:00.000Z"},
+                     {"start": "2026-11-01T12:00:00.000Z"},
+                     {"deadline": "2026-10-15T12:00:00.000Z"},
+                     {}):
+            self.assertIsNone(sing.start_after_deadline(task), task)
+
+    def test_it_never_raises(self):
+        """Ровно то, что отличает предупреждение от отказа."""
+        out = io.StringIO()
+        sing.warn_start_after_deadline({"id": "T-1",
+                                        "start": "2026-11-01T12:00:00.000Z",
+                                        "deadline": "2026-10-15T12:00:00.000Z"}, out)
+        self.assertIn("позже дедлайна", out.getvalue())
 
 
 class SetTaskFieldsTest(unittest.TestCase):
@@ -1331,7 +1408,8 @@ class SetCommandTest(unittest.TestCase):
         sing.set_task_fields = fake
 
     def _run(self, **kw):
-        args = argparse.Namespace(id="T-1", priority=None, deadline=None)
+        args = argparse.Namespace(id="T-1", priority=None, deadline=None,
+                                  start=None)
         for k, v in kw.items():
             setattr(args, k, v)
         out = io.StringIO()
@@ -1357,9 +1435,19 @@ class SetCommandTest(unittest.TestCase):
     def test_nothing_to_change_is_refused_with_examples(self):
         with quiet() as err, self.assertRaises(SystemExit):
             self._run()
-        self.assertIn("нечего менять", err.getvalue())
-        self.assertIn("--deadline ''", err.getvalue())
+        text = err.getvalue()
+        self.assertIn("нечего менять", text)
+        self.assertIn("--deadline ''", text)
+        self.assertIn("--start", text, "флаг есть у команды, но не назван в подсказке")
         self.assertEqual(self.sent, [])
+
+    def test_all_three_fields_go_in_one_patch(self):
+        """Один PATCH, а не три: каждый лишний — ещё один шанс задеть соседнее
+        поле и ещё одно перечитывание на подтверждение."""
+        self._run(priority=0, deadline="2026-11-20", start="2026-11-01")
+        self.assertEqual(self.sent, [{"priority": 0,
+                                      "deadline": "2026-11-20T12:00:00.000Z",
+                                      "start": "2026-11-01T12:00:00.000Z"}])
 
     def test_same_value_is_not_written_at_all(self):
         """Запись «того же самого» не подтверждает ничего: поле равно ожидаемому
