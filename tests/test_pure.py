@@ -732,6 +732,57 @@ class InitInWorktreeTest(unittest.TestCase):
         self.assertEqual(sing.repo_project_name(plain), "не-репозиторий")
 
 
+class KanbanNotDeployedTest(unittest.TestCase):
+    """Проект без системных колонок: `init` отказывается, и отказ обязан быть
+    полезным. Автоматически развернуть канбан нельзя — замерено
+    (`tools/check-kanban-lazy.py`): свой id колонке API не даёт (400), ссылку на
+    несуществующую колонку отвергает (400), системную колонку не удаляет (403).
+    Поэтому ценность отказа вся в том, что он называет ДЕЙСТВУЮЩИЙ выход."""
+
+    def setUp(self):
+        # сети нет: GET колонки по id — единственный запрос на этом пути
+        self.addCleanup(setattr, sing, "request", sing.request)
+        sing.request = lambda *a, **kw: None
+
+    def _die_text(self, own_columns=False):
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.plan_columns("P-свежий", dict(sing.DEFAULT_COLUMNS), [],
+                              own_columns, [])
+        return err.getvalue()
+
+    def test_refusal_names_both_ways_out(self):
+        text = self._die_text()
+        self.assertIn("--project", text,
+                      "короткий путь (пусть проект заведёт сам init) не назван")
+        self.assertIn("в приложении", text, "второй выход не назван")
+        self.assertIn("--own-columns", text, "осознанный обход не назван")
+
+    def test_refusal_says_why_it_cannot_be_done_automatically(self):
+        """Без причины отказ читается как «скилл поленился», и его обходят."""
+        text = self._die_text()
+        for fact in ("400", "403"):
+            self.assertIn(fact, text, "в отказе нет замера, только запрет")
+
+    def test_own_columns_is_a_way_through_not_a_wall(self):
+        mapping, to_create = sing.plan_columns(
+            "P-свежий", dict(sing.DEFAULT_COLUMNS), [], True, [])
+        self.assertEqual(mapping, {}, "переиспользовать нечего — колонок нет")
+        self.assertEqual([r for r, _ in to_create], sing.COLUMN_ORDER)
+
+    def test_system_columns_present_are_reused_not_created(self):
+        """Главный инвариант: свои «Новые»/«В работе»/«Готово» не создаются никогда."""
+        existing = [{"id": f"KS-P-свежий{suf}", "name": name, "kanbanOrder": i}
+                    for i, (suf, name) in enumerate(
+                        [("-TODO", "Новые"), ("-IN-PROGRESS", "В работе"),
+                         ("-DONE", "Готово")])]
+        plan = []
+        mapping, to_create = sing.plan_columns(
+            "P-свежий", dict(sing.DEFAULT_COLUMNS), existing, False, plan)
+        self.assertEqual(mapping["todo"], "KS-P-свежий-TODO")
+        self.assertEqual([r for r, _ in to_create], ["review", "blocked"])
+        self.assertFalse([l for l in plan if l.startswith("СОЗДАТЬ колонку «Новые»")])
+
+
 class InitDryRunMatchesApplyTest(unittest.TestCase):
     """План сухого прогона обязан показывать то, что реально произойдёт.
 
