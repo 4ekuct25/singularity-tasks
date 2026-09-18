@@ -19,6 +19,10 @@
 
 `--sweep` намеренно трогает только `zz-selftest-*`, а не всю маску `zz-*`:
 рядом живут черновики других сессий, и подметать их — значит убить чужую работу.
+
+Вывод упавшего прогона ложится в `tests/logs/` (каталог гитигнорен) и подрезается
+там же, при сохранении следующего лога той же метки — пороги и их причина в
+`RETENTION`.
 """
 
 import contextlib
@@ -27,6 +31,7 @@ import io
 import os
 import subprocess
 import sys
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,9 +39,26 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import support  # noqa: E402
 
-GROUPS = {"fast": ["test_pure", "test_retry", "test_claim"], "live": ["test_live"]}
+GROUPS = {"fast": ["test_pure", "test_retry", "test_claim", "test_logs"],
+          "live": ["test_live"]}
 SWEEP_PREFIX = "zz-selftest-"
 LOG_DIR = os.path.join(HERE, "logs")
+
+# Сколько логов упавших прогонов держать — отдельно по каждой метке, потому что
+# цена повтора у них разная:
+#   fast — ~4 с, без сети и без токена: воспроизводится по требованию, лог почти
+#          всегда можно получить заново, поэтому окно короткое;
+#   live — ~4 мин и живой трекер, краснеет редко и невоспроизводимо (очередь
+#          синхронизации), поэтому окно длинное: именно ради такого лога файлы и
+#          пишутся, и подрезка не имеет права его съесть.
+# Пара — (сколько последних держать при любом возрасте, предельный возраст в днях).
+# `keep_last` — это ПОЛ, а не потолок: он защищает редкое свидетельство, когда
+# прогонов давно не было. Метки без политики (ручные файлы, будущие группы) не
+# подрезаются вовсе.
+RETENTION = {
+    "fast": (5, 7),
+    "live": (20, 90),
+}
 
 
 class _Tee:
@@ -55,20 +77,65 @@ class _Tee:
             s.flush()
 
 
+def prune_logs(label, now=None):
+    """Подрезать старые логи МЕТКИ `label`. Возвращает список удалённых путей.
+
+    Файл удаляется, только если выполнено И то, И другое: он старше предельного
+    возраста И не входит в `keep_last` последних. Условие «и», а не «или», —
+    осознанно: «или» по количеству убило бы свежую историю на серии падений в
+    один день, а «или» по возрасту — тот самый редкий лог живого прогона, если
+    набор давно не гоняли.
+
+    Трогаем только файлы своей метки: падение `fast` не имеет права уносить
+    логи `live`, у них разная цена и разная политика.
+    """
+    if label not in RETENTION:
+        return []
+    keep_last, max_age_days = RETENTION[label]
+    cutoff = (time.time() if now is None else now) - max_age_days * 86400
+    prefix = f"{label}-"
+    try:
+        names = [n for n in os.listdir(LOG_DIR)
+                 if n.startswith(prefix) and n.endswith(".log")]
+    except FileNotFoundError:
+        return []
+    dated = []
+    for n in names:
+        path = os.path.join(LOG_DIR, n)
+        try:
+            dated.append((os.path.getmtime(path), n, path))
+        except OSError:                              # файл унесли параллельно — не наша забота
+            continue
+    removed = []
+    # новые первыми; имя как второй ключ — метка времени секундная, совпадения бывают
+    for mtime, _name, path in sorted(dated, reverse=True)[keep_last:]:
+        if mtime >= cutoff:
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        removed.append(path)
+    return removed
+
+
 def save_failure_log(label, text):
-    """Сохранить вывод упавшего прогона.
+    """Сохранить вывод упавшего прогона и подрезать старые логи этой метки.
 
     Падение, не оставившее следа, равносильно отсутствию проверки: «прогони ещё
     раз» становится способом не заметить дефект. Живой набор работает с трекером,
     где есть очередь синхронизации, и краснеет не каждый раз — поймать такое
     можно только по сохранённому логу.
+
+    Каталог гитигнорен, поэтому его рост в диффе не виден — подрезка живёт прямо
+    здесь, в единственном месте, где логи появляются.
     """
     os.makedirs(LOG_DIR, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     path = os.path.join(LOG_DIR, f"{label}-{stamp}.log")
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
-    return path
+    return path, prune_logs(label)
 
 
 def run_group(names, verbosity, label=None):
@@ -81,8 +148,14 @@ def run_group(names, verbosity, label=None):
         result = unittest.TextTestRunner(stream=_Tee(sys.stderr, buf),
                                          verbosity=verbosity).run(suite)
     if not result.wasSuccessful() and label:
-        path = save_failure_log(label, buf.getvalue())
+        path, pruned = save_failure_log(label, buf.getvalue())
         print(f"\nвывод упавшего прогона сохранён: {path}", file=sys.stderr)
+        if pruned:
+            # молчаливый удалятель пугает — говорим, сколько и по какому порогу
+            keep_last, days = RETENTION[label]
+            print(f"подрезано старых логов «{label}»: {len(pruned)} "
+                  f"(держим последние {keep_last} и всё моложе {days} дней)",
+                  file=sys.stderr)
     return result.wasSuccessful()
 
 
