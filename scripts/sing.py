@@ -585,6 +585,38 @@ def assert_allowed(project_id, what="проект"):
     return chain[0]
 
 
+def projects_in_scope(projects=None):
+    """Подпроекты корня области. Сам корень в список не входит — в нём не работают.
+
+    Единственное место, где считается «что вообще разрешено»: и `init`, и разовая
+    адресация `--project` ищут проект ТОЛЬКО здесь, поэтому тёзка снаружи области
+    не должен даже находиться по имени.
+    """
+    projects = projects if projects is not None else all_projects()
+    root = resolve_root(projects)
+    return [p for p in projects
+            if p["id"] != root["id"]
+            and any(x["id"] == root["id"] for x in project_chain(p["id"], projects))]
+
+
+def match_projects(ref, allowed):
+    """Проекты под ссылку «название | часть названия | P-id». Список, а не один:
+    неоднозначность обязана дойти до человека, а не решаться за него.
+
+    Точное совпадение названия важнее подстроки — иначе «tasks» выбирало бы сразу
+    и «tasks», и «singularity-tasks», то есть однозначный запрос выглядел бы
+    неоднозначным.
+    """
+    ref = (ref or "").strip()
+    if ref.startswith("P-"):
+        return [p for p in allowed if p["id"] == ref]
+    exact = [p for p in allowed
+             if p.get("title", "").strip().lower() == ref.lower()]
+    if exact:
+        return exact
+    return [p for p in allowed if ref.lower() in p.get("title", "").lower()]
+
+
 # Скилл раскатывается в Claude Code, Codex, OpenCode, Antigravity и Qwen Code,
 # привязка репозитория не должна жить в каталоге одного из них. Новые репозитории
 # получают нейтральный `.agents/`, старый `.claude/` продолжает читаться.
@@ -622,6 +654,82 @@ def load_config(required=True, check_scope=True):
     if check_scope:
         assert_allowed(cfg["projectId"], "привязанный проект")
     return cfg, p
+
+
+def project_columns(project_id, statuses=None):
+    """Роли -> колонки по ФАКТИЧЕСКОЙ доске проекта, ничего в нём не создавая.
+
+    Нужна для разовой адресации `--project`: у соседнего проекта файла привязки
+    здесь нет, и раскладку колонок приходится узнавать по его доске. Порядок тот
+    же, что у `init`: сначала системная колонка проекта (её id детерминирован,
+    см. SYSTEM_SUFFIX), затем колонка с названием по умолчанию.
+
+    Роль, которой на доске не нашлось, в ответ НЕ ПОПАДАЕТ — придумать колонку
+    значило бы молча положить задачу не туда. Отказ выдаст col_id, и он назовёт
+    проект: `--project` читает чужую доску, а не чинит её.
+    """
+    statuses = project_statuses(project_id) if statuses is None else statuses
+    live = [s for s in statuses if not s.get("removed")]
+    ids = {s["id"] for s in live}
+    by_name = {}
+    for s in live:
+        by_name.setdefault((s.get("name") or "").strip().lower(), s["id"])
+    mapping = {}
+    for role in COLUMN_ORDER:
+        sys_id = system_status_id(project_id, role)
+        if sys_id and sys_id in ids:
+            mapping[role] = sys_id
+            continue
+        hit = by_name.get(DEFAULT_COLUMNS[role].strip().lower())
+        if hit:
+            mapping[role] = hit
+    return mapping
+
+
+def config_for_project(ref):
+    """Привязка НА ОДНУ КОМАНДУ по `--project <название|P-id>`. Диск не трогается.
+
+    Это адресация, а не переключение репозитория: файл привязки не читается и не
+    переписывается, следующая команда снова работает со своим проектом.
+
+    Ограничение области от этого не слабеет, а проверяется дважды: искать можно
+    только среди подпроектов ROOT_PROJECT_TITLE (projects_in_scope), и найденное
+    ещё раз проходит assert_allowed — область считается по адресуемому проекту,
+    а не по тому, в каком каталоге запущена команда.
+    """
+    projects = all_projects()
+    hits = match_projects(ref, projects_in_scope(projects))
+    if len(hits) > 1:
+        die(f"--project «{ref}»: подходит несколько проектов:\n  " +
+            "\n  ".join(f"{p['id']}  {p['title']}" for p in hits))
+    if not hits:
+        # Отказ обязан отличать «вне области» от «нет такого»: иначе запрет
+        # выглядит как опечатка, и его повторяют, подбирая написание.
+        needle = (ref or "").strip().lower()
+        outside = [p for p in projects
+                   if p["id"] == (ref or "").strip()
+                   or p.get("title", "").strip().lower() == needle]
+        if outside:
+            assert_allowed(outside[0]["id"], "проект --project")  # назовёт путь
+        die(f"--project «{ref}»: среди подпроектов «{ROOT_PROJECT_TITLE}» такого нет.\n"
+            "  что есть: sing.py projects")
+    target = hits[0]
+    assert_allowed(target["id"], "проект --project")
+    return {"projectId": target["id"], "projectTitle": target.get("title"),
+            "columns": project_columns(target["id"]), "adhoc": ref}
+
+
+def command_config(args):
+    """Откуда команда берёт проект: привязка репозитория или разовый `--project`.
+
+    Одна точка на все команды, умеющие адресовать соседний проект, — чтобы
+    правило «`--project` ничего не пишет на диск» не приходилось повторять
+    (и однажды забыть) в каждой из них.
+    """
+    ref = getattr(args, "project", None)
+    if ref:
+        return config_for_project(ref), None
+    return load_config()
 
 
 def save_config(cfg, path):
@@ -839,6 +947,14 @@ def col_id(cfg, role):
     """
     cid = (cfg.get("columns") or {}).get(role)
     if not cid:
+        if cfg.get("adhoc"):
+            # Совет «init --apply» здесь был бы вредным: он привязал бы ТЕКУЩИЙ
+            # репозиторий к чужому проекту, то есть сделал не то, о чём просили.
+            die(f"В проекте «{cfg.get('projectTitle')}» нет колонки под роль '{role}'.\n"
+                f"  искали системную колонку проекта и колонку «{DEFAULT_COLUMNS[role]}».\n"
+                "  --project читает чужую доску как есть и ничего в ней не создаёт;\n"
+                "  разложить колонки по ролям может только init — из того репозитория,\n"
+                "  которому этот проект принадлежит.")
         die(f"В привязке ({find_config() or CONFIG_NAME}) нет колонки '{role}'.\n"
             "  посмотреть целиком: sing.py doctor  ·  починить: sing.py init --apply")
     return cid
@@ -1395,24 +1511,14 @@ def cmd_init(args):
     projects = all_projects()
     root = resolve_root(projects)
     # искать только среди подпроектов корня — тёзка снаружи не должен даже находиться
-    allowed = [p for p in projects
-               if p["id"] != root["id"]
-               and any(x["id"] == root["id"] for x in project_chain(p["id"], projects))]
-    target = None
-    if args.project.startswith("P-"):
-        target = next((p for p in allowed if p["id"] == args.project), None)
-        if not target:
-            assert_allowed(args.project, "проект")  # выдаст внятный отказ
-    else:
-        matches = [p for p in allowed
-                   if p.get("title", "").strip().lower() == args.project.strip().lower()]
-        if not matches:
-            matches = [p for p in allowed
-                       if args.project.strip().lower() in p.get("title", "").lower()]
-        if len(matches) > 1:
-            die("Под запрос подходит несколько проектов:\n  " +
-                "\n  ".join(f"{p['id']}  {p['title']}" for p in matches))
-        target = matches[0] if matches else None
+    allowed = projects_in_scope(projects)
+    matches = match_projects(args.project, allowed)
+    if len(matches) > 1:
+        die("Под запрос подходит несколько проектов:\n  " +
+            "\n  ".join(f"{p['id']}  {p['title']}" for p in matches))
+    target = matches[0] if matches else None
+    if not target and args.project.startswith("P-"):
+        assert_allowed(args.project, "проект")  # выдаст внятный отказ
 
     if not target:
         # тёзка корня сломал бы resolve_root — второй проект с тем же названием
@@ -1623,7 +1729,7 @@ def board_layout(cfg, by_col, statuses, limit):
 
 
 def cmd_board(args):
-    cfg, _ = load_config()
+    cfg, _ = command_config(args)
     statuses = {s["id"]: s["name"] for s in project_statuses(cfg["projectId"])}
     cmap = column_map(cfg["projectId"])
     by_col = {}
@@ -1641,7 +1747,13 @@ def cmd_board(args):
     holders = board_holders([t for *_, shown in layout for t in shown] + loose)
     pad = board_pad(holders)
 
-    print(f"{cfg.get('projectTitle')} ({cfg['projectId']})")
+    # Чужую доску обязательно называть чужой: без пометки агент принимает её за
+    # доску своего репозитория и берёт задачу «из очереди», которая не его.
+    print(f"{cfg.get('projectTitle')} ({cfg['projectId']})"
+          + (f"\n⚠ ЧУЖОЙ ПРОЕКТ — показан по --project «{cfg['adhoc']}»; "
+             "привязка репозитория не менялась.\n"
+             "  брать отсюда задачу в работу нельзя: start/next работают только "
+             "с привязанным проектом." if cfg.get("adhoc") else ""))
 
     # Плохие новости — вперёд. Сирота без колонки и лишние колонки печатались
     # последними и ничем не выделялись: на живой сессии агент не заметил ни того,
@@ -1852,7 +1964,10 @@ def cmd_next(args):
 
 
 def cmd_list(args):
-    cfg, _ = load_config()
+    cfg, _ = command_config(args)
+    if cfg.get("adhoc"):
+        print(f"# {cfg.get('projectTitle')} ({cfg['projectId']}) — чужой проект "
+              f"по --project, только чтение")
     reasons = {}
     pool = _pick_pool(cfg, args.column, include_done=True, group=args.group,
                       reasons=reasons)
@@ -2015,7 +2130,7 @@ def same_title(a, b):
 
 
 def cmd_add(args):
-    cfg, _ = load_config()
+    cfg, _ = command_config(args)
     # Наблюдение с живой сессии: из 11 вызовов `add` ни один не пришёл с --note,
     # и вся очередь встала на доску голыми заголовками. Пользователь это увидел
     # как «в карточках нет описания» — описание не потерялось, его не писали.
@@ -2068,6 +2183,13 @@ def cmd_add(args):
             f"  задача существует, повторный add сделает дубль — почини её:\n"
             f"    sing.py move {tid} {args.column}")
     print(f"{tid}: создана в колонке '{args.column}' — {args.title}")
+    if cfg.get("adhoc"):
+        # Задача уехала в соседний проект: из этого репозитория её больше ничем
+        # не открыть (show/report сверяют проект задачи с привязкой), поэтому
+        # ссылка обязана быть в выводе — иначе карточку не найти.
+        print(f"  проект «{cfg.get('projectTitle')}» ({cfg['projectId']}) — "
+              "по --project, привязка репозитория не менялась\n"
+              f"  {task_link(tid)}")
 
 
 def cmd_move(args):
@@ -2417,9 +2539,16 @@ def main():
     sp.add_argument("--apply", action="store_true", help="выполнить план")
     sp.set_defaults(fn=cmd_init)
 
+    # Разовая адресация соседнего проекта. Текст один на три команды: расхождение
+    # в справке читается как разница в поведении, которой нет.
+    PROJECT_REF = ("другой подпроект «" + ROOT_PROJECT_TITLE + "» "
+                   "(название или P-id) — на одну эту команду; "
+                   "привязку репозитория не меняет")
+
     sp = sub.add_parser("board", help="доска проекта по колонкам")
     sp.add_argument("--limit", type=int, default=10,
                     help="сколько закрытых показывать в колонке done")
+    sp.add_argument("--project", metavar="ПРОЕКТ", help=PROJECT_REF)
     sp.set_defaults(fn=cmd_board)
 
     sp = sub.add_parser("next", help="следующая задача из очереди")
@@ -2442,6 +2571,7 @@ def main():
     sp.add_argument("--group", help="только из секции (название или Q-id)")
     sp.add_argument("--mine", action="store_true", help="только со своим agent-тегом")
     sp.add_argument("--agent", help="имя агента (по умолчанию $SINGULARITY_AGENT)")
+    sp.add_argument("--project", metavar="ПРОЕКТ", help=PROJECT_REF)
     sp.set_defaults(fn=cmd_list)
 
     sp = sub.add_parser("whoami", help="под каким тегом работает этот агент")
@@ -2505,6 +2635,7 @@ def main():
                     help="осознанно без описания (заголовок исчерпывает задачу)")
     sp.add_argument("--priority", type=int, choices=[0, 1, 2])
     sp.add_argument("--deadline", help="ISO-дата")
+    sp.add_argument("--project", metavar="ПРОЕКТ", help=PROJECT_REF)
     sp.set_defaults(fn=cmd_add)
 
     sp = sub.add_parser("move", help="переставить задачу в колонку (починка доски)")

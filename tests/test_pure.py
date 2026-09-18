@@ -938,3 +938,200 @@ class DefaultProjectTasksTest(unittest.TestCase):
             with open(os.path.join(td, "JOURNAL.md"), "w") as f:
                 f.write("# Journal\n")
             self.assertTrue(sing.has_logs_or_journal(td))
+
+
+# ------------------------------------------------- адресация соседнего проекта
+
+
+class _Args:
+    """Заменитель argparse.Namespace: command_config читает только --project."""
+
+    def __init__(self, project=None):
+        self.project = project
+
+
+class AdHocProjectTest(unittest.TestCase):
+    """`--project` — адресация ОДНОЙ команды (T-11e50aee).
+
+    Проверяется главное, что может сломаться молча: ограничение области держится
+    по АДРЕСУЕМОМУ проекту, колонки берутся с его доски, а привязка репозитория
+    на диске остаётся нетронутой — флаг адресует, а не переключает.
+    """
+
+    ROOT = {"id": "P-root", "title": sing.ROOT_PROJECT_TITLE}
+    MINE = {"id": "P-mine", "title": "мой-репозиторий", "parent": "P-root"}
+    NEIGHBOUR = {"id": "P-neigh", "title": "соседний", "parent": "P-root"}
+    TWIN = {"id": "P-twin", "title": "соседний-двойник", "parent": "P-root"}
+    NESTED = {"id": "P-nest", "title": "вложенный", "parent": "P-neigh"}
+    OUTSIDE = {"id": "P-out", "title": "личное", "parent": None}
+    # тёзка снаружи области: он не должен даже попадать в поиск, иначе отказ
+    # приходит от последней проверки, а до неё чужой проект успевает найтись
+    OUTSIDE_TWIN = {"id": "P-out2", "title": "соседний-чужой", "parent": None}
+    ALL = [ROOT, MINE, NEIGHBOUR, TWIN, NESTED, OUTSIDE, OUTSIDE_TWIN]
+
+    def setUp(self):
+        self.addCleanup(setattr, sing, "all_projects", sing.all_projects)
+        self.addCleanup(setattr, sing, "project_statuses", sing.project_statuses)
+        sing.all_projects = lambda: [dict(p) for p in self.ALL]
+        self.statuses = self._full_board
+        sing.project_statuses = lambda pid: self.statuses(pid)
+
+    @staticmethod
+    def _full_board(pid):
+        cols = [{"id": sing.system_status_id(pid, r), "name": sing.DEFAULT_COLUMNS[r]}
+                for r in ("todo", "wip", "done")]
+        cols += [{"id": f"KS-{pid}-REVIEW", "name": sing.DEFAULT_COLUMNS["review"]},
+                 {"id": f"KS-{pid}-BLOCK", "name": sing.DEFAULT_COLUMNS["blocked"]}]
+        return cols
+
+    # ---------------------------------------------------------- область работы
+
+    def test_project_outside_the_root_is_refused(self):
+        """Главное свойство флага: он адресует, но не расширяет область."""
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.config_for_project("личное")
+        self.assertIn("ЗАПРЕЩЕНО", err.getvalue())
+        self.assertIn(sing.ROOT_PROJECT_TITLE, err.getvalue())
+
+    def test_project_outside_the_root_is_refused_by_id_too(self):
+        """P-id мимо названия — та же дверь, а не обход."""
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.config_for_project("P-out")
+        self.assertIn("ЗАПРЕЩЕНО", err.getvalue())
+
+    def test_root_project_itself_is_refused(self):
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.config_for_project(sing.ROOT_PROJECT_TITLE)
+        self.assertIn("корневой", err.getvalue())
+
+    def test_unknown_project_is_a_refusal_not_a_fallback(self):
+        """Промах по имени обязан быть отказом: молчаливый откат на привязку
+        завёл бы карточку не в тот проект и выглядел бы как успех."""
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.config_for_project("такого-нет")
+        self.assertIn(sing.ROOT_PROJECT_TITLE, err.getvalue())
+
+    def test_ambiguous_reference_is_refused_with_the_list(self):
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.config_for_project("сосед")
+        self.assertIn("P-neigh", err.getvalue())
+        self.assertIn("P-twin", err.getvalue())
+        self.assertNotIn("P-out2", err.getvalue(),
+                         "проект вне области не должен даже попадать в поиск")
+
+    def test_exact_title_wins_over_substring(self):
+        """Иначе однозначный запрос «соседний» выглядел бы неоднозначным."""
+        cfg = sing.config_for_project("соседний")
+        self.assertEqual(cfg["projectId"], "P-neigh")
+
+    def test_nested_subproject_is_addressable(self):
+        """Область — всё дерево под корнем, а не только его прямые дети."""
+        self.assertEqual(sing.config_for_project("вложенный")["projectId"], "P-nest")
+
+    def test_scope_list_excludes_the_root_itself(self):
+        ids = {p["id"] for p in sing.projects_in_scope()}
+        self.assertEqual(ids, {"P-mine", "P-neigh", "P-twin", "P-nest"},
+                         "в области — только дерево под корнем, без самого корня")
+
+    # ---------------------------------------------------------------- колонки
+
+    def test_columns_are_read_from_the_addressed_board(self):
+        cfg = sing.config_for_project("P-neigh")
+        self.assertEqual(cfg["columns"]["todo"],
+                         sing.system_status_id("P-neigh", "todo"))
+        self.assertEqual(cfg["columns"]["review"], "KS-P-neigh-REVIEW")
+        self.assertEqual(cfg["projectTitle"], "соседний")
+        self.assertEqual(cfg["adhoc"], "P-neigh")
+
+    def test_system_column_wins_over_a_namesake(self):
+        """Системная колонка приоритетна, как и в init: своя колонка с тем же
+        названием не должна подменять доску приложения."""
+        self.statuses = lambda pid: (
+            [{"id": "KS-самодельная", "name": sing.DEFAULT_COLUMNS["todo"]}]
+            + self._full_board(pid))
+        self.assertEqual(sing.config_for_project("P-neigh")["columns"]["todo"],
+                         sing.system_status_id("P-neigh", "todo"))
+
+    def test_removed_column_is_not_used(self):
+        self.statuses = lambda pid: [
+            {"id": "KS-мертвая", "name": sing.DEFAULT_COLUMNS["todo"], "removed": True}]
+        self.assertEqual(sing.config_for_project("P-neigh")["columns"], {})
+
+    def test_missing_role_is_not_guessed(self):
+        """Колонки под роль нет — значит нет. Придуманная колонка положила бы
+        задачу не туда и отчиталась бы об успехе."""
+        self.statuses = lambda pid: [
+            {"id": sing.system_status_id(pid, "todo"),
+             "name": sing.DEFAULT_COLUMNS["todo"]}]
+        cfg = sing.config_for_project("P-neigh")
+        self.assertEqual(list(cfg["columns"]), ["todo"])
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.col_id(cfg, "review")
+        text = err.getvalue()
+        self.assertIn("соседний", text)
+        self.assertNotIn("init --apply", text,
+                         "совет привязать ТЕКУЩИЙ репозиторий к чужому проекту вреден")
+
+    # ------------------------------------------------- привязка на диске цела
+
+    def test_project_flag_does_not_touch_the_binding_on_disk(self):
+        """`--project` — адресация, а не переключение репозитория."""
+        repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo, True)
+        cfg_path = os.path.join(repo, ".agents", "singularity.json")
+        os.makedirs(os.path.dirname(cfg_path))
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump({"projectId": "P-mine", "projectTitle": "мой-репозиторий",
+                       "columns": {"todo": "KS-P-mine-TODO"}}, f, ensure_ascii=False)
+        with open(cfg_path, encoding="utf-8") as f:
+            before = f.read()
+
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(repo)
+
+        picked, _ = sing.command_config(_Args(project="соседний"))
+        self.assertEqual(picked["projectId"], "P-neigh")
+        with open(cfg_path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before,
+                             "--project переписал привязку репозитория")
+        # следующая команда снова работает со своим проектом
+        own, path = sing.command_config(_Args())
+        self.assertEqual(own["projectId"], "P-mine")
+        self.assertEqual(os.path.realpath(path), os.path.realpath(cfg_path))
+        self.assertNotIn("adhoc", own)
+
+
+class ProjectFlagSurfaceTest(unittest.TestCase):
+    """Кто умеет адресовать чужой проект, а кто намеренно нет.
+
+    Решение: читать чужую доску и завести в ней карточку безопасно, а БРАТЬ
+    оттуда задачу в работу — нет. `start`/`next` держат задачу agent-тегом и
+    колонкой «В работе», а делать её пришлось бы в чужом репозитории; сессии,
+    работающие в нём, этого захвата не ждут. Проверяется argparse — то, обо что
+    упирается агент.
+    """
+
+    def _help(self, cmd):
+        p = subprocess.run([sys.executable, support.SING, cmd, "--help"],
+                           env=support.clean_env(SINGULARITY_API="http://127.0.0.1:1"),
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p.stdout
+
+    def test_add_list_board_take_project(self):
+        for cmd in ("add", "list", "board"):
+            self.assertIn("--project", self._help(cmd), f"{cmd} без --project")
+
+    def test_next_and_start_do_not_take_project(self):
+        for cmd in ("next", "start", "move", "done"):
+            self.assertNotIn("--project", self._help(cmd),
+                             f"{cmd} не должен адресовать чужой проект")
+
+    def test_next_with_project_fails_before_any_request(self):
+        """Отказ argparse, а не тихое игнорирование флага: молча забытый флаг —
+        это выдача задачи из СВОЕГО проекта под видом чужого."""
+        p = subprocess.run([sys.executable, support.SING, "next", "--project", "любой"],
+                           env=support.clean_env(SINGULARITY_API="http://127.0.0.1:1"),
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("unrecognized arguments", p.stderr)
