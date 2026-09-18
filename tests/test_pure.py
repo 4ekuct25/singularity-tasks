@@ -885,34 +885,56 @@ class TaskLinkTest(unittest.TestCase):
 class DefaultProjectTasksTest(unittest.TestCase):
     """Обязательные задачи проекта при init."""
 
-    def test_plan_creates_task_when_git_repo_and_not_exists(self):
-        plan, to_create = sing.plan_default_tasks([], is_git=True)
-        self.assertEqual(len(to_create), 1)
-        self.assertEqual(to_create[0]["column"], "todo")
-        self.assertTrue(any("СОЗДАТЬ" in line for line in plan))
+    def test_plan_creates_tasks_when_git_repo_and_not_exists(self):
+        plan, to_create = sing.plan_default_tasks([], is_git=True, has_logs=True)
+        self.assertEqual(len(to_create), 2)
+        titles = [t["title"] for t in to_create]
+        self.assertIn("Удалить влитые и устаревшие ветки в локальном и удалённом репозитории", titles)
+        self.assertIn("Выполнить ротацию логов проекта", titles)
+        self.assertEqual(len([line for line in plan if "СОЗДАТЬ" in line]), 2)
 
     def test_plan_skips_when_already_exists(self):
-        existing = [{"title": "Удалить влитые и устаревшие ветки в локальном и удалённом репозитории"}]
-        plan, to_create = sing.plan_default_tasks(existing, is_git=True)
+        existing = [
+            {"title": "Удалить влитые и устаревшие ветки в локальном и удалённом репозитории"},
+            {"title": "Выполнить ротацию логов проекта"},
+        ]
+        plan, to_create = sing.plan_default_tasks(existing, is_git=True, has_logs=True)
         self.assertEqual(len(to_create), 0)
-        self.assertTrue(any("ПРОПУСТИТЬ" in line for line in plan))
+        self.assertEqual(len([line for line in plan if "ПРОПУСТИТЬ" in line]), 2)
 
     def test_plan_case_and_whitespace_insensitive(self):
-        existing = [{"title": "   удалить влитые и устаревшие ВЕТКИ в локальном и удалённом репозитории \n"}]
-        plan, to_create = sing.plan_default_tasks(existing, is_git=True)
+        existing = [
+            {"title": "   удалить влитые и устаревшие ВЕТКИ в локальном и удалённом репозитории \n"},
+            {"title": "  выполнить РОТАЦИЮ логов проекта  "},
+        ]
+        plan, to_create = sing.plan_default_tasks(existing, is_git=True, has_logs=True)
         self.assertEqual(len(to_create), 0)
-        self.assertTrue(any("ПРОПУСТИТЬ" in line for line in plan))
+        self.assertEqual(len([line for line in plan if "ПРОПУСТИТЬ" in line]), 2)
 
-    def test_plan_skips_git_only_when_not_git(self):
-        plan, to_create = sing.plan_default_tasks([], is_git=False)
+    def test_plan_non_git_with_logs_gets_log_rotation_only(self):
+        plan, to_create = sing.plan_default_tasks([], is_git=False, has_logs=True)
+        self.assertEqual(len(to_create), 1)
+        self.assertEqual(to_create[0]["title"], "Выполнить ротацию логов проекта")
+
+    def test_plan_non_git_without_logs_skips_all(self):
+        plan, to_create = sing.plan_default_tasks([], is_git=False, has_logs=False)
         self.assertEqual(len(to_create), 0)
         self.assertEqual(plan, [])
 
     def test_plan_no_tasks_flag(self):
-        plan, to_create = sing.plan_default_tasks([], is_git=True, no_tasks=True)
+        plan, to_create = sing.plan_default_tasks([], is_git=True, has_logs=True, no_tasks=True)
         self.assertEqual(len(to_create), 0)
         self.assertEqual(plan, [])
 
     def test_is_git_repo(self):
         self.assertTrue(sing.is_git_repo(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
         self.assertFalse(sing.is_git_repo(tempfile.gettempdir()))
+
+    def test_has_logs_or_journal(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.assertTrue(sing.has_logs_or_journal(repo_root))
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(sing.has_logs_or_journal(td))
+            with open(os.path.join(td, "JOURNAL.md"), "w") as f:
+                f.write("# Journal\n")
+            self.assertTrue(sing.has_logs_or_journal(td))

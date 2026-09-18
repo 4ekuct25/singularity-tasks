@@ -1235,6 +1235,20 @@ def is_git_repo(path="."):
     return res.returncode == 0 and res.stdout.strip() == "true"
 
 
+def has_logs_or_journal(path="."):
+    """Проверить, есть ли в каталоге журнал решений (JOURNAL.md) или файлы логов."""
+    root = os.path.abspath(path)
+    if os.path.exists(os.path.join(root, "JOURNAL.md")) or os.path.exists(os.path.join(root, "logs")):
+        return True
+    try:
+        for item in os.listdir(root):
+            if item.endswith(".log") or item.endswith("_LOG.md"):
+                return True
+    except OSError:
+        pass
+    return False
+
+
 DEFAULT_PROJECT_TASKS = [
     {
         "title": "Удалить влитые и устаревшие ветки в локальном и удалённом репозитории",
@@ -1250,15 +1264,30 @@ DEFAULT_PROJECT_TASKS = [
             "git branch -a содержит только ветку main (и актуальные рабочие ветки при их наличии)."
         ),
     },
+    {
+        "title": "Выполнить ротацию логов проекта",
+        "column": "todo",
+        "logs_or_git": True,
+        "note": (
+            "Что сделать:\n"
+            "1. Проверить размер и дату записей в логах и журнале проекта (JOURNAL.md, каталоги logs/ и runtime-логи).\n"
+            "2. Для разросшихся текстовых логов/журнала перенести устаревшие записи (старше 7-14 дней) в архивные файлы (например, по неделям/месяцам в archive/).\n"
+            "3. Для файлов, в которые пишет работающий процесс, применять copy-truncate (не mv), чтобы не сломать запись в дескриптор открытого файла.\n"
+            "4. Убедиться, что основной файл содержит только актуальный контекст, а архивные записи сохранены без потерь.\n\n"
+            "Критерий готовности:\n"
+            "Размер основного лога/журнала уменьшен до актуального окна, старые записи сохранены в архиве, активные процессы продолжают писать без сбоев."
+        ),
+    },
 ]
 
 
-def plan_default_tasks(existing_tasks, is_git, no_tasks=False):
+def plan_default_tasks(existing_tasks, is_git, has_logs=True, no_tasks=False):
     """Определить список обязательных задач для проекта.
 
     Идемпотентно: если задача с таким заголовком уже есть в проекте (открыта,
     закрыта или оформлена шаблоном повторяющейся серии), она не дублируется.
     Задачи с git_only=True создаются только в git-репозиториях.
+    Задачи с logs_or_git=True создаются, если есть git или логи/журнал.
     """
     if no_tasks:
         return [], []
@@ -1267,6 +1296,8 @@ def plan_default_tasks(existing_tasks, is_git, no_tasks=False):
     for tdef in DEFAULT_PROJECT_TASKS:
         title = tdef["title"]
         if tdef.get("git_only") and not is_git:
+            continue
+        if tdef.get("logs_or_git") and not (is_git or has_logs):
             continue
         already = any(same_title(t.get("title"), title) for t in existing_tasks)
         if already:
@@ -1433,9 +1464,10 @@ def cmd_init(args):
                        cfg_path, apply=False, plan=plan)
 
     is_git = is_git_repo(repo_root)
+    has_logs = has_logs_or_journal(repo_root)
     existing_tasks = board_tasks(target["id"]) if target else []
     tasks_plan, tasks_to_create = plan_default_tasks(
-        existing_tasks, is_git, no_tasks=getattr(args, "no_tasks", False))
+        existing_tasks, is_git, has_logs=has_logs, no_tasks=getattr(args, "no_tasks", False))
     plan.extend(tasks_plan)
 
     # Привязка к существующему проекту — рутина; создание нового в трекере человека
