@@ -19,6 +19,13 @@
 
 `--sweep` намеренно трогает только `zz-selftest-*`, а не всю маску `zz-*`:
 рядом живут черновики других сессий, и подметать их — значит убить чужую работу.
+
+⚠️ `live` НЕЛЬЗЯ гонять подряд. Один прогон — это ~300 запросов за ~100 с, и
+трекер отвечает на серию троттлингом: замер 18.09 (T-b2575163) — 10 прогонов
+встык дали 2 зелёных, потом `500` на любую запись минимум на 6 минут; 5 прогонов
+с паузой 90 с — 1 зелёный, дальше 429 вплоть до 14 ошибок из 18. Красный после
+второго прогона подряд — это отказ трекера, а не регрессия; при падении набор
+сам называет такие отказы строкой «в выводе N× отказ трекера».
 """
 
 import contextlib
@@ -37,6 +44,20 @@ import support  # noqa: E402
 GROUPS = {"fast": ["test_pure", "test_retry", "test_claim"], "live": ["test_live"]}
 SWEEP_PREFIX = "zz-selftest-"
 LOG_DIR = os.path.join(HERE, "logs")
+
+# Отказы САМОГО трекера: живой набор краснеет от них, хотя поведение скилла не
+# менялось. Замер 18.09 (T-b2575163): 15 прогонов подряд — 1-2 зелёных в начале,
+# дальше сплошь 429, вплоть до 14 ошибок из 18 на прогон. Красный от отказа
+# трекера и красный от регрессии — разные новости, и путать их дорого в обе
+# стороны: «опять трекер» прикрывает настоящий дефект, а «сломали скилл»
+# отправляет чинить исправное.
+ENV_REFUSALS = (
+    ("HTTP 429", "трекер троттлит аккаунт (429 ThrottlerException) — прогоны "
+                 "подряд он не держит, разнеси их по времени"),
+    ("Default task group not found", "трекер не нашёл дефолтную группу проекта "
+                                     "(400 на POST /task) — его временное состояние"),
+    ("Sync error", "очередь синхронизации переполнена (500 на запись)"),
+)
 
 
 class _Tee:
@@ -71,18 +92,37 @@ def save_failure_log(label, text):
     return path
 
 
+def env_refusals(text):
+    """Назвать отказы трекера в выводе прогона: [(что это, сколько раз), …].
+
+    Вердикт НЕ смягчается: красный остаётся красным, код возврата не меняется.
+    Функция только называет причину — и молчит, когда таких строк нет, чтобы на
+    неё нельзя было списать обычное расхождение поведения.
+    """
+    return [(why, text.count(mark)) for mark, why in ENV_REFUSALS if mark in text]
+
+
 def run_group(names, verbosity, label=None):
     loader = unittest.TestLoader()
     suite = unittest.TestSuite(loader.loadTestsFromName(n) for n in names)
     buf = io.StringIO()
-    # unittest пишет в stderr, тесты печатают в stdout — копим оба, иначе в логе
-    # окажется половина картины
-    with contextlib.redirect_stdout(_Tee(sys.stdout, buf)):
-        result = unittest.TextTestRunner(stream=_Tee(sys.stderr, buf),
+    # Копим ОБА потока, и именно подменой sys.stdout/sys.stderr, а не только
+    # stream'ом раннера: причину падения печатает не unittest, а сам код —
+    # `sing.die()` пишет `POST /task -> HTTP 500: <детали сервера>` в sys.stderr
+    # и выходит. Раньше подменялся только stdout, и в логе оставался traceback
+    # со словами «причина выше», которой в файле не было.
+    out_tee, err_tee = _Tee(sys.stdout, buf), _Tee(sys.stderr, buf)
+    with contextlib.redirect_stdout(out_tee), contextlib.redirect_stderr(err_tee):
+        # раннеру отдаём тот же tee напрямую: через подменённый sys.stderr он
+        # писал бы в buf дважды
+        result = unittest.TextTestRunner(stream=err_tee,
                                          verbosity=verbosity).run(suite)
     if not result.wasSuccessful() and label:
-        path = save_failure_log(label, buf.getvalue())
+        text = buf.getvalue()
+        path = save_failure_log(label, text)
         print(f"\nвывод упавшего прогона сохранён: {path}", file=sys.stderr)
+        for why, n in env_refusals(text):
+            print(f"  в выводе {n}× отказ трекера: {why}", file=sys.stderr)
     return result.wasSuccessful()
 
 
