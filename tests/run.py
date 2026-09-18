@@ -41,7 +41,8 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import support  # noqa: E402
 
-GROUPS = {"fast": ["test_pure", "test_retry", "test_claim"], "live": ["test_live"]}
+GROUPS = {"fast": ["test_pure", "test_retry", "test_claim", "test_json"],
+          "live": ["test_live"]}
 SWEEP_PREFIX = "zz-selftest-"
 LOG_DIR = os.path.join(HERE, "logs")
 

@@ -1116,6 +1116,110 @@ def brief(t, extra=""):
             f"{plain(t.get('title', ''))}{extra}")
 
 
+# --------------------------------------------------------------------------- машинный вывод
+
+# `--json` — один формат на все команды, которые что-то показывают.
+#
+# Чем обошлось его отсутствие (T-16593b9c, перенос backlog): сверить 30 созданных
+# карточек с доской было нечем, и сверку писали регексом по человекочитаемому
+# выводу — по префиксу `T-` и метке `[обычный]`. Такой парсер ломается от любой
+# косметической правки формата, причём молча: выдаёт «не найдено 0» вместо отказа.
+#
+# Отсюда три правила, которые держат этот вывод пригодным для машины:
+#   * объект задачи одинаков ВЕЗДЕ (task_json) — разный набор ключей у `list` и
+#     `show` означал бы, что парсер всё равно пишется под конкретную команду;
+#   * ключи присутствуют всегда, даже пустые — «то есть, то нет» заставляет
+#     проверять каждое обращение;
+#   * в stdout только JSON. Все предупреждения и подсказки уходят в stderr:
+#     одна человеческая строка сверху — и `json.loads` падает на всём выводе.
+
+
+def json_out(payload):
+    """Единственная точка печати машинного вывода — чтобы форма была одна."""
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def tag_titles(tasks):
+    """id тега -> заголовок, одним запросом на всю показываемую выборку.
+
+    Справочник тегов в аккаунте один, у задачи лежат только их id. Если тегов нет
+    ни на одной задаче — запроса не будет вовсе: доска нового проекта не должна
+    дорожать ради колонки, которая всё равно окажется пустой.
+    """
+    if not any(t.get("tags") for t in tasks):
+        return {}
+    return {tg["id"]: (tg.get("title") or "") for tg in paged("/tag", "tags")}
+
+
+def task_tags(task, titles):
+    """Теги задачи ЗАГОЛОВКАМИ, по алфавиту. Неизвестный id остаётся id-ом:
+    молча потерять чужой тег дороже, чем показать его сырым."""
+    return sorted(titles.get(x, x) for x in (task.get("tags") or []))
+
+
+def group_titles(project_id):
+    """id секции -> название. Запрос делается только ради `--json`."""
+    return {g["id"]: g["title"] for g in project_groups(project_id)}
+
+
+def checklist_json(items):
+    """Чек-лист машинно: номер тот же, что в выводе `show`/`next` (см. checklist_items)."""
+    return [{"n": n, "id": c.get("id"), "title": plain(c.get("title", "")),
+             "done": item_done(c)} for n, c in enumerate(items, 1)]
+
+
+def task_json(task, role=None, column_name=None, tags=(), group_title=None,
+              open_children=0, not_ready=None, **extra):
+    """Задача одним и тем же объектом во всех командах с `--json`.
+
+    Каждая пометка, которую человек видит текстом, здесь — отдельное поле, иначе
+    машинный вывод беднее человеческого и парсить всё равно приходится строки:
+
+        ✓                    -> done            (в дневнике)      -> journal
+        [отложена]           -> deferred        [начало ГГГГ-ММ-ДД] -> start
+        [ждёт подзадач: N]   -> openChildren    ⚠ ВНЕ КОЛОНОК     -> column: null
+        повторяющаяся        -> recurring
+
+    `notReady` — та же причина словами, ровно как её печатает `next`; поля рядом
+    позволяют не разбирать её текст.
+
+    `column` — РОЛЬ скилла (todo/doing/…), а не название колонки в трекере:
+    название человек меняет в приложении, роль — контракт скилла. Название лежит
+    рядом, в `columnName`.
+    """
+    prio = prio_of(task)
+    # «Ничего нет» в машинном выводе выглядит одинаково — `null`. API отдаёт
+    # отсутствующего родителя пустой строкой (замер на живой задаче: parent=""),
+    # и отличать `""` от `null` пришлось бы каждому, кто это читает.
+    empty = lambda v: v or None          # noqa: E731 — короче именованной функции
+    d = {
+        "id": task.get("id"),
+        "title": plain(task.get("title", "")),
+        "column": role,
+        "columnName": column_name,
+        "project": task.get("projectId"),
+        # id группы отдаётся как есть; groupTitle=None при непустом group значит
+        # безымянную fake-группу проекта, то есть «вне секций» (см. project_groups)
+        "group": empty(task.get("group")),
+        "groupTitle": group_title,
+        "tags": list(tags),
+        "priority": prio,
+        "priorityName": PRIORITY_NAMES.get(prio, "?"),
+        "deadline": empty(task.get("deadline")),
+        "done": int(task.get("checked") or 0) == 1,
+        "journal": bool(task.get("journalDate")),
+        "deferred": bool(task.get("deferred")),
+        "start": (task.get("start") or "")[:10] or None,
+        "openChildren": open_children,
+        "recurring": task.get("recurrence") is not None,
+        "notReady": not_ready,
+        "parent": empty(task.get("parent")),
+        "url": task_link(task.get("id")),
+    }
+    d.update(extra)
+    return d
+
+
 # --------------------------------------------------------------------------- команды
 
 
@@ -1285,7 +1389,15 @@ def cmd_projects(args):
              if p["id"] != root["id"]
              and any(x["id"] == root["id"] for x in project_chain(p["id"], projects))]
     if args.json:
-        print(json.dumps(items, ensure_ascii=False, indent=2))
+        # Раньше здесь печатался сырой ответ API — полсотни служебных полей, из
+        # которых осмысленны четыре, и ни одного вычисленного (глубина, архив).
+        # Машинный вывод обязан быть контрактом скилла, а не транзитом чужой схемы:
+        # поля API меняются на их стороне и молча ломают того, кто их читал.
+        json_out([{"id": p["id"], "title": p.get("title", ""),
+                   "parent": p.get("parent"),
+                   "depth": max(len(project_chain(p["id"], projects)) - 2, 0),
+                   "archived": bool(p.get("journalDate"))}
+                  for p in sorted(items, key=lambda x: x.get("title", ""))])
         return
     print(f"Доступные проекты — только внутри «{root['title']}» ({root['id']}):")
     for p in sorted(items, key=lambda x: x.get("title", "")):
@@ -1680,20 +1792,14 @@ def cmd_init(args):
 HOLDER_COL_MAX = 16
 
 
-def board_holders(tasks):
+def board_holders(tasks, titles=None):
     """taskId -> «@имя» держателя по тегам `agent:*` (несколько — через запятую).
 
-    Один общий GET /tag на всю доску: справочник тегов в аккаунте один, теги
-    у задачи лежат массивом id, и поштучно их разворачивать незачем — цена
-    ровно та же, что у `list` (см. cmd_list).
-
-    Если ни на одной показанной задаче тегов нет — запроса не будет вовсе:
-    доска нового проекта не должна дорожать ради колонки, которая всё равно
-    окажется пустой.
+    Справочник тегов берётся одним запросом (tag_titles) и может быть передан
+    готовым: `board --json` разворачивает те же теги полностью, и ходить за ними
+    второй раз незачем.
     """
-    if not any(t.get("tags") for t in tasks):
-        return {}
-    titles = {tg["id"]: (tg.get("title") or "") for tg in paged("/tag", "tags")}
+    titles = tag_titles(tasks) if titles is None else titles
     holders = {}
     for t in tasks:
         who = sorted(titles[x][len(AGENT_TAG_PREFIX):] for x in (t.get("tags") or [])
@@ -1760,8 +1866,9 @@ def cmd_board(args):
     cfg, _ = load_config()
     statuses = {s["id"]: s["name"] for s in project_statuses(cfg["projectId"])}
     cmap = column_map(cfg["projectId"])
+    tasks = board_tasks(cfg["projectId"])
     by_col = {}
-    for t in board_tasks(cfg["projectId"]):
+    for t in tasks:
         by_col.setdefault(effective_column(t, cmap, cfg), []).append(t)
 
     # Раскладку считаем до печати: и теги, и ширина колонки держателя должны
@@ -1772,7 +1879,45 @@ def cmd_board(args):
     # приложением, а не потеряна — сирота, которую надо чинить, выглядит иначе
     loose = [t for t in by_col.get(None, [])
              if int(t.get("checked") or 0) == 0 and not t.get("journalDate")]
-    holders = board_holders([t for *_, shown in layout for t in shown] + loose)
+    known = set((cfg.get("columns") or {}).values())
+    extra = {cid: name for cid, name in statuses.items() if cid not in known}
+    titles = tag_titles([t for *_, shown in layout for t in shown] + loose)
+
+    if args.json:
+        kids = open_children_counts(tasks)
+        gnames = group_titles(cfg["projectId"])
+
+        def one(t, role, column_name):
+            n = kids.get(t["id"], 0)
+            return task_json(t, role=role, column_name=column_name,
+                             tags=task_tags(t, titles),
+                             group_title=gnames.get(t.get("group")),
+                             open_children=n,
+                             not_ready=not_ready_reason(t, open_children=n))
+
+        json_out({
+            "project": {"id": cfg["projectId"], "title": cfg.get("projectTitle")},
+            # Роль без колонки: count=null, а не 0. «0» читалось бы как «в колонке
+            # пусто», а про непривязанную роль доска не знает ничего — ровно то
+            # различие, ради которого в человеческом выводе там нет счётчика.
+            # name берётся из statuses, а не из раскладки: там у пропавшей в
+            # трекере колонки стоит человеческое «?», а машине нужен null
+            "columns": [{"role": role, "id": cid, "name": statuses.get(cid),
+                         "bound": bool(cid),
+                         "count": len(items) if cid else None,
+                         "tasks": [one(t, role, statuses.get(cid)) for t in shown]}
+                        for role, cid, name, items, shown in layout],
+            "looseTasks": [one(t, None, None) for t in loose],
+            "unboundRoles": [role for role, cid, *_ in layout if not cid],
+            "unknownColumns": [{"id": cid, "name": name,
+                                "count": len(by_col.get(cid, []))}
+                               for cid, name in sorted(extra.items(),
+                                                       key=lambda x: x[1])],
+        })
+        return
+
+    holders = board_holders([t for *_, shown in layout for t in shown] + loose,
+                            titles)
     pad = board_pad(holders)
 
     print(f"{cfg.get('projectTitle')} ({cfg['projectId']})")
@@ -1798,8 +1943,6 @@ def cmd_board(args):
               "\n  почини: sing.py move <id> <роль>")
         for t in loose:
             print(pad(holders.get(t["id"])) + brief(t))
-    known = set((cfg.get("columns") or {}).values())
-    extra = {cid: name for cid, name in statuses.items() if cid not in known}
     if extra:
         print(f"\n⚠ КОЛОНКИ МИМО ПРИВЯЗКИ — {len(extra)}: доска шире, чем знает скилл."
               "\n  разобраться: sing.py doctor")
@@ -1888,12 +2031,14 @@ def effective_column(task, cmap, cfg):
 
 
 def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False,
-               reasons=None):
+               reasons=None, children=None):
     """include_done — для просмотра; `next` обязан брать только незакрытые.
 
     ready_only — убрать отложенные, запланированные на будущее и ждущие своих
     подзадач (см. not_ready_reason). Включается только для выдачи задачи, не для
-    показа. reasons — если передан словарь, заполняется {id задачи: причина}.
+    показа. reasons — если передан словарь, заполняется {id задачи: причина};
+    children — тем же способом {id задачи: сколько незакрытых подзадач}. Оба
+    словаря заполняются из УЖЕ полученной выборки, лишних запросов не будет.
     """
     cid = col_id(cfg, role)
     cmap = column_map(cfg["projectId"])
@@ -1903,6 +2048,8 @@ def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False,
         gid = resolve_group(cfg["projectId"], group)
         pool = [t for t in pool if t.get("group") == gid]
     kids = open_children_counts(source)
+    if children is not None:
+        children.update({t["id"]: kids.get(t["id"], 0) for t in pool})
     if reasons is not None:
         for t in pool:
             r = not_ready_reason(t, open_children=kids.get(t["id"], 0))
@@ -1920,15 +2067,33 @@ def cmd_groups(args):
     cfg, _ = load_config()
     if args.create:
         gid = resolve_group(cfg["projectId"], args.create, create=True)
-        print(f"секция «{args.create}» -> {gid}")
-        return
+        if not args.json:
+            print(f"секция «{args.create}» -> {gid}")
+            return
+        # С --json создание не отчитывается строкой, а ПЕРЕЧИТЫВАЕТ список: и
+        # stdout остаётся чистым JSON, и созданная секция подтверждается фактом,
+        # а не кодом ответа (AGENTS.md §4).
+        print(f"секция «{args.create}» -> {gid}", file=sys.stderr)
     groups = project_groups(cfg["projectId"])
-    if not groups:
+    if not groups and not args.json:
         print("Секций нет — задачи лежат в проекте без разбиения.")
         return
     counts = {}
     for t in open_tasks(cfg["projectId"]):
         counts[t.get("group")] = counts.get(t.get("group"), 0) + 1
+    if args.json:
+        # «Секций нет» машине не сообщение, а пустой список: отдельная ветка с
+        # человеческой фразой на месте JSON — ровно тот случай, когда парсер
+        # падает на редком состоянии проекта.
+        json_out({
+            "groups": [{"id": g["id"], "title": g["title"],
+                        "openTasks": counts.get(g["id"], 0)}
+                       for g in sorted(groups, key=lambda x: x.get("parentOrder") or 0)],
+            "outsideGroups": counts.get(None, 0)
+            + sum(v for k, v in counts.items()
+                  if k and k not in {g["id"] for g in groups}),
+        })
+        return
     for g in sorted(groups, key=lambda x: x.get("parentOrder") or 0):
         print(f"{g['id']}  открытых={counts.get(g['id'], 0):<3} «{g['title']}»")
     loose = counts.get(None, 0) + sum(v for k, v in counts.items()
@@ -1959,22 +2124,43 @@ def cmd_notes(args):
 
 def cmd_next(args):
     cfg, _ = load_config()
-    pool = _pick_pool(cfg, args.column, group=args.group, ready_only=True)
+    kids = {}
+    pool = _pick_pool(cfg, args.column, group=args.group, ready_only=True,
+                      children=kids)
     if not pool:
+        # Пустая очередь под --json — это `null` в stdout и объяснение в stderr:
+        # код возврата 2 остаётся, но вывод не перестаёт быть JSON. Пустой stdout
+        # заставил бы вызывающего отличать «нечего брать» от сбоя парсера.
+        out = sys.stderr if args.json else sys.stdout
         reasons = {}
         everything = _pick_pool(cfg, args.column, group=args.group, reasons=reasons)
         held = [(t, reasons[t["id"]]) for t in everything if t["id"] in reasons]
         if held:
             # «очередь пуста» здесь было бы неправдой: задачи есть, их отодвинул человек
-            print(f"Свободных задач нет: все {len(held)} пока брать нельзя.")
+            print(f"Свободных задач нет: все {len(held)} пока брать нельзя.", file=out)
             for t, r in held[:5]:
-                print(f"  {t['id']}  [{r}]  {t.get('title', '')}")
+                print(f"  {t['id']}  [{r}]  {t.get('title', '')}", file=out)
         else:
-            print("Свободных задач нет.")
+            print("Свободных задач нет.", file=out)
+        if args.json:
+            json_out(None)
         sys.exit(2)
     t = pool[0]
     if args.json:
-        print(json.dumps(t, ensure_ascii=False, indent=2))
+        # Раньше здесь печатался сырой объект API: ни колонки, ни названий тегов
+        # (только их id), зато полсотни служебных полей. Теперь — тот же объект,
+        # что у show/list/board, плюс заметка и чек-лист: `next --json` для того и
+        # зовут, чтобы решить по задаче, не ходя за ней вторым запросом.
+        titles = tag_titles([t])
+        statuses = {s["id"]: s["name"] for s in project_statuses(cfg["projectId"])}
+        json_out(task_json(
+            t, role=args.column, column_name=statuses.get(col_id(cfg, args.column)),
+            tags=task_tags(t, titles),
+            group_title=group_titles(cfg["projectId"]).get(t.get("group")),
+            open_children=kids.get(t["id"], 0),
+            note=note_to_text(t.get("note")),
+            checklist=checklist_json(checklist_items(t["id"])),
+            appUrl=task_link_app(t["id"])))
         return
     print(brief(t))
     note = note_to_text(t.get("note"))
@@ -1987,15 +2173,29 @@ def cmd_next(args):
 
 def cmd_list(args):
     cfg, _ = load_config()
-    reasons = {}
+    reasons, kids = {}, {}
     pool = _pick_pool(cfg, args.column, include_done=True, group=args.group,
-                      reasons=reasons)
+                      reasons=reasons, children=kids)
     if args.mine:
         tag_id = find_tag(AGENT_TAG_PREFIX + agent_name(cfg, args.agent))
         pool = [t for t in pool if tag_id and tag_id in (t.get("tags") or [])]
-    tag_titles = {t["id"]: t["title"] for t in paged("/tag", "tags")}
+    titles = tag_titles(pool)
+    if args.json:
+        statuses = {s["id"]: s["name"] for s in project_statuses(cfg["projectId"])}
+        cname = statuses.get(col_id(cfg, args.column))
+        gnames = group_titles(cfg["projectId"])
+        json_out([task_json(
+            t, role=args.column, column_name=cname, tags=task_tags(t, titles),
+            group_title=gnames.get(t.get("group")),
+            open_children=kids.get(t["id"], 0),
+            # причина «пока брать нельзя» у закрытой задачи бессмысленна — то же
+            # правило, что и в человеческом выводе строкой ниже
+            not_ready=(reasons.get(t["id"])
+                       if int(t.get("checked") or 0) == 0 else None))
+            for t in pool])
+        return
     for t in pool:
-        marks = [tag_titles.get(x, x) for x in (t.get("tags") or [])]
+        marks = task_tags(t, titles)
         extra = "  " + " ".join("#" + s for s in marks) if marks else ""
         if int(t.get("checked") or 0) == 1:
             extra += " ✓"
@@ -2022,16 +2222,34 @@ def cmd_whoami(args):
 def cmd_show(args):
     cfg, _ = load_config(required=False)
     t = assert_task_allowed(args.id, cfg)
-    print(brief(t))
-    print(f"  {task_link(args.id)}\n  {task_link_app(args.id)}")
     # Колонка и теги — не украшение: по карточке не было видно ни где задача на
     # доске, ни держит ли её уже другой агент, а инструментов над этим трекером пять.
     cid = task_column(args.id, t.get("projectId"))
     roles = {v: k for k, v in (cfg or {}).get("columns", {}).items()}
     names = {s["id"]: s["name"] for s in project_statuses(t["projectId"])}
     where = "ВНЕ КОЛОНОК ⚠" if not cid else f"{names.get(cid, cid)} [{roles.get(cid, 'мимо привязки')}]"
-    tag_titles = {x["id"]: x["title"] for x in paged("/tag", "tags")}
-    marks = " ".join("#" + tag_titles.get(x, x) for x in (t.get("tags") or []))
+    titles = tag_titles([t])
+    marks = " ".join("#" + s for s in task_tags(t, titles))
+
+    if args.json:
+        # Подзадачи считаются по выборке проекта — тем же счётом, что у board и
+        # list. Лишний запрос здесь только под --json: `show` без него за всем
+        # проектом не ходит, а поле openChildren, которое иногда 0 «потому что не
+        # считали», хуже отсутствующего.
+        kids = open_children_counts(live_tasks(t["projectId"])).get(args.id, 0)
+        json_out(task_json(
+            t, role=roles.get(cid), column_name=names.get(cid) if cid else None,
+            tags=task_tags(t, titles),
+            group_title=group_titles(t["projectId"]).get(t.get("group")),
+            open_children=kids,
+            not_ready=not_ready_reason(t, open_children=kids),
+            note=note_to_text(t.get("note")),
+            checklist=checklist_json(checklist_items(args.id)),
+            appUrl=task_link_app(args.id)))
+        return
+
+    print(brief(t))
+    print(f"  {task_link(args.id)}\n  {task_link_app(args.id)}")
     print("проект:", t.get("projectId"), "| выполнена:", t.get("checked"))
     print("колонка:", where, ("| теги: " + marks) if marks else "| тегов нет")
     note = note_to_text(t.get("note"))
@@ -2634,7 +2852,23 @@ def warn_if_skill_drifted(command):
 # --------------------------------------------------------------------------- CLI
 
 
-def main():
+# Команды, которые ПОКАЗЫВАЮТ состояние, — у всех до одной есть `--json`.
+# Список нужен не для красоты: на нём стоит проверка в tests/test_pure.py, и
+# новая показывающая команда без флага уронит её, а не обнаружится через месяц
+# ответом argparse «unrecognized arguments: --json» посреди чужой сверки.
+JSON_COMMANDS = ("projects", "board", "next", "groups", "list", "show")
+
+JSON_HELP = ("машинный вывод: в stdout только JSON, предупреждения и подсказки — "
+             "в stderr; формат объекта задачи одинаков во всех командах")
+
+
+def json_flag(sp):
+    sp.add_argument("--json", action="store_true", help=JSON_HELP)
+
+
+def build_parser():
+    """Разбор аргументов отдельно от запуска: набор проверяет состав флагов, не
+    выполняя команд."""
     p = argparse.ArgumentParser(prog="sing.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2646,7 +2880,7 @@ def main():
     sp.set_defaults(fn=cmd_doctor)
 
     sp = sub.add_parser("projects", help="список проектов")
-    sp.add_argument("--json", action="store_true")
+    json_flag(sp)
     sp.set_defaults(fn=cmd_projects)
 
     sp = sub.add_parser("init", help="привязать репо к проекту (по умолчанию — сухой прогон)")
@@ -2665,16 +2899,18 @@ def main():
     sp = sub.add_parser("board", help="доска проекта по колонкам")
     sp.add_argument("--limit", type=int, default=10,
                     help="сколько закрытых показывать в колонке done")
+    json_flag(sp)
     sp.set_defaults(fn=cmd_board)
 
     sp = sub.add_parser("next", help="следующая задача из очереди")
     sp.add_argument("--column", default="todo", choices=COLUMN_ORDER)
     sp.add_argument("--group", help="брать только из секции (название или Q-id)")
-    sp.add_argument("--json", action="store_true")
+    json_flag(sp)
     sp.set_defaults(fn=cmd_next)
 
     sp = sub.add_parser("groups", help="секции проекта")
     sp.add_argument("--create", metavar="НАЗВАНИЕ", help="завести секцию")
+    json_flag(sp)
     sp.set_defaults(fn=cmd_groups)
 
     sp = sub.add_parser("notes", help="заметки проекта (контекст для агента)")
@@ -2687,6 +2923,7 @@ def main():
     sp.add_argument("--group", help="только из секции (название или Q-id)")
     sp.add_argument("--mine", action="store_true", help="только со своим agent-тегом")
     sp.add_argument("--agent", help="имя агента (по умолчанию $SINGULARITY_AGENT)")
+    json_flag(sp)
     sp.set_defaults(fn=cmd_list)
 
     sp = sub.add_parser("whoami", help="под каким тегом работает этот агент")
@@ -2695,6 +2932,7 @@ def main():
 
     sp = sub.add_parser("show", help="карточка задачи")
     sp.add_argument("id")
+    json_flag(sp)
     sp.set_defaults(fn=cmd_show)
 
     sp = sub.add_parser("start", help="взять задачу в работу: план, колонка, agent-тег")
@@ -2795,7 +3033,11 @@ def main():
     sp.add_argument("items", nargs="+", metavar="ПУНКТ", help=ITEM_REF)
     sp.set_defaults(fn=cmd_uncheck)
 
-    args = p.parse_args()
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
     args.fn(args)
     warn_if_skill_drifted(args.cmd)
 

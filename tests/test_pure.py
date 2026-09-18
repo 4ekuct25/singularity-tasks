@@ -1211,6 +1211,101 @@ class SetCommandTest(unittest.TestCase):
         with quiet(), self.assertRaises(SystemExit):
             self._run(deadline="2026-02-30")
         self.assertEqual(self.sent, [])
+
+
+# ------------------------------------------------------------- машинный вывод
+
+
+class JsonFlagCoverageTest(unittest.TestCase):
+    """`--json` обязан быть у КАЖДОЙ показывающей команды, без исключений.
+
+    Дефект, из-за которого это проверяется (T-16593b9c): флаг был у `next` и
+    `projects`, а у `list`, `show`, `board` и `groups` argparse отвечал
+    `unrecognized arguments: --json`. Обнаружилось это не при правке, а через
+    месяц — посреди сверки тридцати карточек, которую пришлось дописывать
+    регексом по человекочитаемому выводу.
+
+    Проверяются обе стороны списка: команда из JSON_COMMANDS без флага и флаг у
+    команды, которой нет в списке, — одинаково красные. Иначе список превратится
+    в комментарий, расходящийся с кодом.
+    """
+
+    def subparsers(self):
+        p = sing.build_parser()
+        hit = next(a for a in p._actions
+                   if isinstance(a, argparse._SubParsersAction))
+        return hit.choices
+
+    def with_json(self):
+        return {name for name, sp in self.subparsers().items()
+                if any("--json" in a.option_strings for a in sp._actions)}
+
+    def test_every_showing_command_takes_json(self):
+        missing = set(sing.JSON_COMMANDS) - self.with_json()
+        self.assertEqual(missing, set(),
+                         f"argparse ответит «unrecognized arguments: --json»: {missing}")
+
+    def test_no_command_carries_json_past_the_list(self):
+        self.assertEqual(self.with_json(), set(sing.JSON_COMMANDS))
+
+    def test_the_flag_actually_parses(self):
+        """Состав флагов — ещё не разбор: проверяем, что команда с ним доходит
+        до своей функции, а не падает на parse_args."""
+        for name in sing.JSON_COMMANDS:
+            argv = [name, "T-1"] if name == "show" else [name]
+            args = sing.build_parser().parse_args([*argv, "--json"])
+            self.assertTrue(args.json, name)
+
+
+class TaskJsonTest(unittest.TestCase):
+    """Объект задачи для машины: полный набор ключей и никаких украшений."""
+
+    def test_keys_are_always_there_even_when_empty(self):
+        a = sing.task_json({"id": "T-1", "title": "пусто"})
+        b = sing.task_json({"id": "T-2", "title": "полно", "priority": 0,
+                            "checked": 1, "deferred": True, "group": "Q-9",
+                            "deadline": "2026-10-15T12:00:00.000Z"},
+                           role="done", column_name="Готово", tags=["agent:x"],
+                           group_title="Раздел", open_children=2,
+                           not_ready="отложена")
+        self.assertEqual(set(a), set(b), "набор ключей зависит от содержимого")
+        self.assertEqual([a["column"], a["columnName"], a["groupTitle"],
+                          a["deadline"], a["notReady"], a["parent"]], [None] * 6)
+        self.assertEqual(a["tags"], [])
+
+    def test_priority_zero_is_high_not_default(self):
+        """Та же ловушка, что и в prio_of: ноль ложный, и `or 1` здесь нельзя."""
+        d = sing.task_json({"id": "T-1", "title": "x", "priority": 0})
+        self.assertEqual((d["priority"], d["priorityName"]), (0, "высокий"))
+        self.assertEqual(sing.task_json({"id": "T-2", "title": "x"})["priority"], 1)
+
+    def test_no_human_decorations(self):
+        d = sing.task_json({"id": "T-1", "priority": 0,
+                            "title": '<a href="http://x.md">имя</a>'})
+        self.assertEqual(d["title"], "имя")
+        self.assertNotIn("!", d["priorityName"])
+
+    def test_start_is_a_calendar_date_not_a_timestamp(self):
+        d = sing.task_json({"id": "T-1", "title": "x",
+                            "start": "2999-01-01T09:00:00.000Z"})
+        self.assertEqual(d["start"], "2999-01-01")
+        self.assertIsNone(sing.task_json({"id": "T-2", "title": "x"})["start"])
+
+    def test_empty_strings_from_the_api_become_null(self):
+        """Замер на живой задаче: отсутствующий родитель приходит как `""`.
+        Для машины «ничего нет» обязано выглядеть одинаково, иначе каждый
+        читающий пишет `if v not in (None, "")`."""
+        d = sing.task_json({"id": "T-1", "title": "x", "parent": "",
+                            "group": "", "deadline": ""})
+        self.assertEqual([d["parent"], d["group"], d["deadline"]], [None] * 3)
+
+    def test_unknown_tag_id_survives_as_an_id(self):
+        """Молча потерять чужой тег дороже, чем показать его сырым."""
+        t = {"id": "T-1", "title": "x", "tags": ["TG-known", "TG-strange"]}
+        self.assertEqual(sing.task_tags(t, {"TG-known": "agent:a"}),
+                         ["TG-strange", "agent:a"])
+
+
 # ------------------------------------------------------------ вердикт по прогону
 
 
