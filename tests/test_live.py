@@ -300,6 +300,54 @@ class SetFieldsTest(LiveBase):
                          "отказ всё-таки что-то записал")
 
 
+class RegroupTest(LiveBase):
+    """Перенос между секциями. Живьём проверяется ровно то, чего заглушка знать не
+    может: что сервер БЕРЁТ посланное значение и что «вне секций» у него устроено
+    так, как мы думаем, — это id безымянной служебной группы, а не пусто."""
+
+    def group_of(self, task_id):
+        return self.sing.request("GET", f"/task/{task_id}").get("group")
+
+    def test_task_moves_into_a_section_and_back_outside(self):
+        out = self.cli("groups", "--create", "zz-секция").stdout
+        gid = out.rsplit("->", 1)[1].strip()
+        self.assertTrue(gid.startswith("Q-"), out)
+        tid = self.make_task("zz: перенос между секциями")
+        loose = self.group_of(tid)
+        # у только что созданной задачи group УЖЕ не пуст — это служебная группа
+        self.assertTrue(loose, "«вне секций» оказалось пустым — замер устарел")
+        self.assertEqual(loose, self.sing.fake_group(self.proj["id"]))
+
+        self.cli("regroup", tid, "zz-секция")
+        self.assertEqual(self.group_of(tid), gid,
+                         "секция не записалась, а команда отчиталась успехом")
+        self.assertIn("уже", self.cli("regroup", tid, "zz-секция").stdout)
+
+        self.cli("regroup", tid, "--clear")
+        self.assertEqual(self.group_of(tid), loose,
+                         "снятие секции не вернуло задачу в служебную группу")
+
+    def test_regroup_keeps_the_card_intact(self):
+        """PATCH с лишним полем стирает состояние: взятая в работу задача обязана
+        остаться взятой, с колонкой, тегом держателя и планом в заметке."""
+        out = self.cli("groups", "--create", "zz-секция сохранности").stdout
+        tid = self.make_task("zz: перенос не ломает карточку")
+        self.cli("start", tid, "--plan", "проверяю перенос в секцию")
+        self.cli("regroup", tid, "zz-секция сохранности")
+        self.assertEqual(self.group_of(tid), out.rsplit("->", 1)[1].strip())
+        self.assertEqual(self.column_of(tid), "wip", "карточка уехала по доске")
+        self.assertEqual(self.agent_tags(tid), [f"agent:{AGENT}"])
+        self.assertIn(f"ПЛАН (agent:{AGENT})", self.note_of(tid))
+
+    def test_unknown_section_is_refused_without_touching_the_task(self):
+        tid = self.make_task("zz: перенос в несуществующую секцию")
+        was = self.group_of(tid)
+        p = self.cli("regroup", tid, "zz-такой секции нет", expect=1)
+        self.assertIn("не найдена", p.stderr)
+        self.assertNotIn("HTTP 400", p.stderr, "наружу утёк ответ API")
+        self.assertEqual(self.group_of(tid), was, "отказ всё-таки что-то записал")
+
+
 class CycleTest(LiveBase):
 
     def test_full_cycle_start_report_done(self):

@@ -1158,13 +1158,30 @@ def field_show(name, value):
 
 
 # Имена полей в выводе — человеческие, в теле запроса — те, что понимает API.
-FIELD_TITLES = {"priority": "приоритет", "deadline": "дедлайн"}
+FIELD_TITLES = {"priority": "приоритет", "deadline": "дедлайн", "group": "секция"}
 
 
 def project_groups(project_id):
     """Секции проекта. У каждого проекта есть безымянная fake-группа — она не секция."""
     return [g for g in paged("/task-group", "taskGroups", {"parent": project_id})
             if not g.get("removed") and not g.get("fake") and (g.get("title") or "").strip()]
+
+
+def fake_group(project_id):
+    """id безымянной служебной группы проекта — то самое «вне секций».
+
+    «Вне секций» — это НЕ `null`: замер на живой задаче (2026-09-19) показал, что
+    только что созданная задача уже лежит в `group=Q-…` служебной группы, а
+    `PATCH {"group": null}` и `{"group": ""}` сервер отвергает — `400 Must start
+    with one of: "Q-"`. Поэтому снятие секции = запись сюда этого id.
+
+    Вычислять его нельзя (api.md): `Q-<projectId>` совпадает лишь у 9 служебных
+    групп из 56, остальные — обычные `Q-<uuid>`. Только чтение списка.
+    """
+    hit = next((g for g in paged("/task-group", "taskGroups", {"parent": project_id})
+                if not g.get("removed")
+                and (g.get("fake") or not (g.get("title") or "").strip())), None)
+    return hit["id"] if hit else None
 
 
 def resolve_group(project_id, ref, create=False):
@@ -2625,7 +2642,10 @@ def cmd_rename(args):
              if saved.strip() != new else ""))
 
 
-def set_task_fields(task_id, fields, task=None):
+SET_WATCHED = ("title", "checked", "journalDate", "complete", "projectId")
+
+
+def set_task_fields(task_id, fields, task=None, watched=SET_WATCHED):
     """Записать поля задачи ОДНИМ PATCH и подтвердить ПЕРЕЧИТЫВАНИЕМ.
 
     Возвращает `(было, стало)` — словарь прежних значений и свежую задачу.
@@ -2636,10 +2656,11 @@ def set_task_fields(task_id, fields, task=None):
     паузой, что у `rename_task()` и `set_task_tags()`.
 
     PATCH с лишним полем легко стирает состояние задачи, поэтому то, чего
-    правка касаться не должна, сверяется до и после.
+    правка касаться не должна, сверяется до и после. Набор сверяемых полей —
+    параметр: `regroup` стережёт ещё и родителя с заметкой (`REGROUP_WATCHED`),
+    для приоритета с дедлайном они избыточны.
     """
     task = task or request("GET", f"/task/{task_id}")
-    watched = ("title", "checked", "journalDate", "complete", "projectId")
 
     def snapshot(t):
         state = {k: t.get(k) for k in watched}
@@ -2723,6 +2744,96 @@ def cmd_set(args):
         print(f"{args.id}: {FIELD_TITLES[k]} {field_show(k, value_of(task, k))}"
               f" -> {field_show(k, value_of(fresh, k))}")
     print(f"  {task_link(args.id)}")
+
+
+# Секция и колонка ортогональны (api.md), поэтому `regroup` стережёт и то, чего
+# `set` не стережёт: родителя и заметку. Именно их теряет PATCH с лишним полем, а
+# заметка в этом скилле — постановка задачи и вся история отчётов.
+REGROUP_WATCHED = SET_WATCHED + ("parent", "note")
+
+
+def cmd_regroup(args):
+    """Перенести СУЩЕСТВУЮЩУЮ задачу в секцию проекта или снять секцию.
+
+    `--group` был только у `add`: секция задавалась один раз при создании. Разложить
+    уже стоящую на доске очередь по разделам было нечем — либо руками в приложении,
+    либо пересоздавать карточку с потерей `T-`id, тегов `agent:*` и отчётов.
+
+    Снятие секции — не `null`: у задач «вне секций» в поле `group` лежит id
+    безымянной служебной группы проекта (см. `fake_group`), а `null` сервер
+    отвергает четырёхсотым. Отсюда `--clear`, который эту группу находит чтением.
+    """
+    cfg, _ = load_config(required=False)
+    task = assert_task_allowed(args.id, cfg)
+    pid = task["projectId"]
+    if bool(args.group) == bool(args.clear):
+        die(f"{args.id}: нужно ровно одно — название секции или --clear.\n"
+            "  sing.py regroup <T-id> \"Название секции\"   # перенести\n"
+            "  sing.py regroup <T-id> --clear              # вернуть вне секций")
+
+    known = {g["id"]: g["title"] for g in project_groups(pid)}
+    if args.clear:
+        gid = fake_group(pid)
+        if not gid:
+            die(f"{args.id}: у проекта {pid} нет служебной группы — снимать секцию "
+                "некуда.\n  «вне секций» в этом API — это её id, а не null: "
+                "PATCH {\"group\": null} отвергается (400).")
+        where = "вне секций"
+    else:
+        # resolve_group пропускает любой `Q-…` без проверки — для `add` этого
+        # хватает (ошибётся сервер при создании), а здесь неизвестная секция
+        # обязана отказывать ДО записи, поэтому id сверяется со списком секций.
+        gid = resolve_group(pid, args.group)
+        if gid not in known:
+            listing = ", ".join(f"«{t}»" for t in known.values()) or "нет ни одной"
+            die(f"{args.id}: секции {gid} нет в проекте. Есть: {listing}.\n"
+                f"  Завести: sing.py groups --create \"...\"")
+        where = f"«{known[gid]}»"
+
+    was = task.get("group")
+    was_where = f"«{known[was]}»" if was in known else "вне секций"
+    # Уже в этой секции — PATCH не отправляется вовсе: подтверждать было бы
+    # нечего, «поле равно ожидаемому» верно и до записи (та же логика, что в set).
+    if was == gid:
+        out = sys.stderr if args.json else sys.stdout
+        print(f"{args.id}: уже {where} — не трогаю\n  {task_link(args.id)}", file=out)
+        if args.json:
+            _regroup_json(args.id, task, cfg, known)
+        return
+
+    # Колонка — не поле задачи, а отдельная связка, и снимком до/после её не
+    # поймать изнутри set_task_fields. Проверяется здесь: перенос между секциями
+    # доски касаться не должен вовсе (секция и колонка ортогональны).
+    col_before = task_column(args.id, pid)
+    _, fresh = set_task_fields(args.id, {"group": gid}, task, watched=REGROUP_WATCHED)
+    col_after = task_column(args.id, pid)
+    if col_before != col_after:
+        die(f"{args.id}: перенос в секцию задел доску — колонка была {col_before}, "
+            f"стала {col_after}.\n  Секция и колонка ортогональны, меняться должна "
+            "только секция: проверь задачу в трекере.")
+
+    out = sys.stderr if args.json else sys.stdout
+    print(f"{args.id}: {was_where} -> {where}\n  {task_link(args.id)}", file=out)
+    if args.json:
+        _regroup_json(args.id, fresh, cfg, known)
+
+
+def _regroup_json(task_id, task, cfg, known):
+    """Подтверждённое состояние карточки тем же объектом, что у show/list.
+
+    Машинный вывод у меняющей команды — это ПЕРЕЧИТАННОЕ состояние, а не эхо
+    запроса: по нему вызывающий и сверяет, что секция действительно та.
+    """
+    pid = task.get("projectId")
+    cid = task_column(task_id, pid)
+    roles = {v: k for k, v in (cfg or {}).get("columns", {}).items()}
+    names = {s["id"]: s["name"] for s in project_statuses(pid)}
+    titles = tag_titles([task])
+    json_out(task_json(task, role=roles.get(cid),
+                       column_name=names.get(cid) if cid else None,
+                       tags=task_tags(task, titles),
+                       group_title=known.get(task.get("group")),
+                       appUrl=task_link_app(task_id)))
 
 
 def cmd_rm(args):
@@ -2967,11 +3078,17 @@ def warn_if_skill_drifted(command):
 # --------------------------------------------------------------------------- CLI
 
 
-# Команды, которые ПОКАЗЫВАЮТ состояние, — у всех до одной есть `--json`.
-# Список нужен не для красоты: на нём стоит проверка в tests/test_pure.py, и
-# новая показывающая команда без флага уронит её, а не обнаружится через месяц
-# ответом argparse «unrecognized arguments: --json» посреди чужой сверки.
-JSON_COMMANDS = ("projects", "board", "next", "groups", "list", "show")
+# Команды с машинным выводом. Список нужен не для красоты: на нём стоит проверка
+# в tests/test_pure.py, и новая команда без флага уронит её, а не обнаружится
+# через месяц ответом argparse «unrecognized arguments: --json» посреди чужой
+# сверки. Проверяются обе стороны — флаг без строки в списке тоже красный.
+#
+# Показывающие команды здесь все до одной. Меняющая попала одна — `regroup`: она
+# и печатает не эхо запроса, а ПЕРЕЧИТАННУЮ карточку, то есть ровно то, ради чего
+# вызывающий и читает машинный вывод. Остальные меняющие (`set`, `rename`, `move`)
+# флага не имеют: добавлять его надо тем же механизмом и вместе со строкой здесь,
+# а не вторым способом печатать JSON.
+JSON_COMMANDS = ("projects", "board", "next", "groups", "list", "show", "regroup")
 
 JSON_HELP = ("машинный вывод: в stdout только JSON, предупреждения и подсказки — "
              "в stderr; формат объекта задачи одинаков во всех командах")
@@ -3123,6 +3240,16 @@ def build_parser():
     sp.add_argument("--deadline",
                     help=DEADLINE_HELP + "; пустая строка '' — снять дедлайн")
     sp.set_defaults(fn=cmd_set)
+
+    sp = sub.add_parser("regroup", help="перенести задачу в секцию проекта или снять секцию")
+    sp.add_argument("id")
+    sp.add_argument("group", nargs="?", metavar="СЕКЦИЯ",
+                    help="название секции или Q-id; секции нет — отказ "
+                         "(завести: sing.py groups --create)")
+    sp.add_argument("--clear", action="store_true",
+                    help="снять секцию: задача вернётся «вне секций»")
+    json_flag(sp)
+    sp.set_defaults(fn=cmd_regroup)
 
     sp = sub.add_parser("rm", help="удалить задачу (уборка за собой)")
     sp.add_argument("id")

@@ -1251,8 +1251,9 @@ class JsonFlagCoverageTest(unittest.TestCase):
     def test_the_flag_actually_parses(self):
         """Состав флагов — ещё не разбор: проверяем, что команда с ним доходит
         до своей функции, а не падает на parse_args."""
+        needs_id = {"show", "regroup"}
         for name in sing.JSON_COMMANDS:
-            argv = [name, "T-1"] if name == "show" else [name]
+            argv = [name, "T-1"] if name in needs_id else [name]
             args = sing.build_parser().parse_args([*argv, "--json"])
             self.assertTrue(args.json, name)
 
