@@ -644,5 +644,75 @@ class StartDateTest(EditBase):
         self.assertNotIn("позже дедлайна", out)
 
 
+class SeriesInstanceDateTest(EditBase):
+    """ЭКЗЕМПЛЯР повторяющейся серии, а не обычная задача: у него дата приходит
+    не от нас, и приходит в другой форме.
+
+    Замер на живом проекте (19.09.2026, карточки `T-3309e039-…-20260921` и
+    `T-efcc60fa-…-20260921`): срок экземпляра лежит в том же `start`, что читает
+    `not_ready_reason`, но записан ЛОКАЛЬНОЙ полночью в UTC —
+    `2026-09-20T21:00:00.000Z` при зоне +03. Мы свои даты пишем полднем UTC, и
+    на них дефект был не виден: `start[:10]` давал верный день. На полуночных —
+    предыдущий, и накануне очередь выдавала экземпляр на сутки раньше срока
+    (T-d4d2eac7).
+
+    Проверяется вся связка на ОДНОЙ карточке: `next` её не выдаёт, `board` и
+    `list` показывают с пометкой того дня, что стоит в суффиксе id, `--json`
+    отдаёт ту же дату полем. Порознь любая половина ничего не доказывает.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.day = datetime.date.today() + datetime.timedelta(days=2)
+        self.shown = self.day.isoformat()
+        self.tid = "T-серия-" + self.day.strftime("%Y%m%d")
+        STATE["tasks"][self.tid] = {
+            "id": self.tid, "title": "экземпляр серии", "projectId": PROJ,
+            "group": SEC_B, "checked": 0, "complete": 0, "priority": 1,
+            "parent": "", "note": NOTE, "tags": [], "journalDate": None,
+            # ключевое: ровно та форма, в какой дату отдаёт живой API
+            "start": support.utc_of_local(self.day),
+            # у экземпляра нет `recurrence` — иначе он скрывался бы как шаблон,
+            # и проверка молча меряла бы не то
+            "recurrenceGeneratorId": "T-серия",
+        }
+        STATE["links"][self.tid] = COLS["todo"]
+
+    def test_the_stub_really_holds_an_instance_not_a_template(self):
+        """Контроль самой проверки: если бы сюда попал `recurrence`, карточка
+        скрывалась бы по другой причине и дата не проверялась бы вовсе."""
+        self.assertNotIn("recurrence", STATE["tasks"][self.tid])
+        self.assertTrue(STATE["tasks"][self.tid]["start"].endswith("Z"))
+
+    def test_next_does_not_offer_it_before_its_day(self):
+        """Секция — способ оставить в очереди ОДНУ задачу: иначе `next` выдаст
+        соседнюю, и «не выдал именно эту» доказано не будет."""
+        p = self.cli("next", "--group", "Раздел B", code=2)
+        self.assertIn("брать нельзя", p.stdout)
+        self.assertIn(self.tid, p.stdout)
+        self.assertIn(f"начало {self.shown}", p.stdout)
+
+    def test_board_and_list_show_it_with_the_day_from_its_id(self):
+        for argv in (("board",), ("list",)):
+            out = self.cli(*argv).stdout
+            self.assertIn(self.tid, out, f"{argv[0]} потерял экземпляр серии")
+            self.assertIn(f"[начало {self.shown}]", out,
+                          f"{argv[0]} назвал день по Гринвичу, а не тот, что в id")
+
+    def test_json_carries_the_same_day(self):
+        hit = next(t for t in json.loads(self.cli("list", "--json").stdout)
+                   if t["id"] == self.tid)
+        self.assertEqual(hit["start"], self.shown)
+        self.assertEqual(hit["notReady"], f"начало {self.shown}")
+        self.assertFalse(hit["recurring"], "экземпляр — не шаблон серии")
+
+    def test_on_its_own_day_it_becomes_ordinary_work(self):
+        """Иначе «не выдаётся» доказывало бы лишь то, что экземпляры не берутся
+        вообще, — а это уже сломанное правило, а не починенное."""
+        STATE["tasks"][self.tid]["start"] = support.utc_of_local(
+            datetime.date.today())
+        self.assertIn(self.tid, self.cli("next", "--group", "Раздел B").stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

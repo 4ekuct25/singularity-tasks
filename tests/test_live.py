@@ -311,6 +311,32 @@ class SetFieldsTest(LiveBase):
         line = next(s for s in self.cli("board").stdout.splitlines() if tid in s)
         self.assertIn(f"[начало {future}]", line, "доска показала её без пометки")
 
+        # ФОРМА ЭКЗЕМПЛЯРА СЕРИИ. Свои даты скилл пишет полднем UTC, и на них
+        # дефект T-d4d2eac7 был не виден. Сгенерированный сервером экземпляр
+        # несёт срок ЛОКАЛЬНОЙ полночью в UTC (замер 19.09.2026 на живых
+        # карточках `…-20260921`: `start=2026-09-20T21:00:00.000Z` при зоне +03),
+        # и срез строки давал предыдущий день — накануне очередь выдавала задачу
+        # на сутки раньше срока.
+        #
+        # ⚠ ОГРАНИЧЕНИЕ, честно: САМ экземпляр серии через API не создать —
+        # его порождает сервер по расписанию шаблона, эндпоинта «породи сейчас»
+        # нет (`recurrence` пишется в шаблон, а не в экземпляр). Поэтому живьём
+        # проверяется то, что проверить можно: сервер принимает и отдаёт ту же
+        # форму даты, а очередь и доска на ней называют ТОТ день, что видит
+        # человек. Связка «экземпляр целиком» — на заглушке
+        # (tests/test_edit.py, SeriesInstanceDateTest), где его можно собрать.
+        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        midnight = support.utc_of_local(tomorrow)
+        self.cli("set", tid, "--start", midnight)
+        self.assertEqual(self.field(tid, "start"), midnight,
+                         "сервер вернул дату в другой записи — сверка ниже "
+                         "мерила бы не ту форму")
+        p = self.cli("next", "--group", group, expect=2)
+        self.assertIn(f"начало {tomorrow.isoformat()}", p.stdout,
+                      "очередь назвала день по Гринвичу, а не местный")
+        line = next(s for s in self.cli("board").stdout.splitlines() if tid in s)
+        self.assertIn(f"[начало {tomorrow.isoformat()}]", line)
+
         self.cli("set", tid, "--start", past)
         self.assertIn(tid, self.cli("next", "--group", group).stdout,
                       "с прошедшей датой старта задача обязана выдаваться")

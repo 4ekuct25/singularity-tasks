@@ -17,6 +17,7 @@
 """
 
 import contextlib
+import datetime
 import importlib.util
 import os
 
@@ -66,6 +67,24 @@ def clean_env(**overrides):
         else:
             e[k] = v
     return e
+
+
+def utc_of_local(day, hour=0, minute=0):
+    """Локальные дата и время этой машины -> строка UTC-ISO, как их хранит трекер.
+
+    Так приложение и пишет выбранный человеком ДЕНЬ: замер по живой базе
+    (19.09.2026) — 970 задач со `start` ровно `21:00:00Z`, то есть полночь по
+    Москве (+03). Экземпляры повторяющихся серий приходят в этой же форме.
+
+    ⚠️ Проверки «какой это календарный день» обязаны строиться отсюда, а не из
+    написанного руками `…T00:00:00.000Z`. Такая строка означает РАЗНЫЙ день в
+    разных зонах: набор зеленел бы или краснел от зоны машины, а не от поведения
+    скилла, — и ровно так две проверки про `start` молча закрепляли UTC-срез
+    (T-d4d2eac7).
+    """
+    naive = datetime.datetime.combine(day, datetime.time(hour, minute))
+    return (naive.astimezone(datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.000Z"))
 
 
 def load_module(name, path):

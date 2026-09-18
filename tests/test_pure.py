@@ -927,13 +927,18 @@ class NotReadyReasonTest(unittest.TestCase):
         self.assertEqual(sing.not_ready_reason({"deferred": True}), "отложена")
 
     def test_future_start_is_not_offered(self):
-        self.assertEqual(sing.not_ready_reason({"start": "2099-01-01T00:00:00.000Z"}),
+        self.assertEqual(sing.not_ready_reason({"start": "2099-01-01T12:00:00.000Z"}),
                          "начало 2099-01-01")
 
     def test_today_is_ready_even_late_in_the_day(self):
         """start приходит полным ISO со временем: сравнение строк целиком
-        отложило бы задачу «на сегодня 23:59» до завтра."""
-        self.assertIsNone(sing.not_ready_reason({"start": self.today + "T23:59:00.000Z"}))
+        отложило бы задачу «на сегодня 23:59» до завтра.
+
+        23:59 берётся ПО МЕСТНЫМ часам (support.utc_of_local): написанное руками
+        `…T23:59Z` — это вообще другой календарный день восточнее Гринвича.
+        """
+        late = support.utc_of_local(datetime.date.today(), 23, 59)
+        self.assertIsNone(sing.not_ready_reason({"start": late}))
 
     def test_past_start_and_plain_task_are_ready(self):
         self.assertIsNone(sing.not_ready_reason({"start": "2020-01-01"}))
@@ -992,13 +997,54 @@ class RecurrenceTest(unittest.TestCase):
     def test_future_instance_still_waits_its_date(self):
         self.assertEqual(
             sing.not_ready_reason({"recurrenceGeneratorId": "T-серия",
-                                   "start": "2099-01-01T00:00:00.000Z"}),
+                                   "start": "2099-01-01T12:00:00.000Z"}),
             "начало 2099-01-01")
 
     def test_template_is_hidden_by_its_own_right_not_by_a_future_date(self):
         """В базе 30 из 31 шаблона имели дату в будущем и скрывались случайно.
         Шаблон без даты обязан скрываться сам по себе."""
         self.assertIsNotNone(sing.not_ready_reason({"recurrence": {}, "start": ""}))
+
+    def _instance(self, day):
+        """Экземпляр серии ровно в той форме, в какой его отдаёт живой API.
+
+        Снято с карточек `T-3309e039-…-20260921` и `T-efcc60fa-…-20260921`
+        (19.09.2026): суффикс id — ЛОКАЛЬНАЯ дата дня, `start` — полночь этого
+        дня в UTC (`2026-09-20T21:00:00.000Z` при +03), `recurrence` нет,
+        `recurrenceGeneratorId` указывает на шаблон.
+        """
+        return {"id": "T-серия-" + day.strftime("%Y%m%d"),
+                "recurrenceGeneratorId": "T-серия",
+                "start": support.utc_of_local(day)}
+
+    def test_instance_at_local_midnight_is_not_offered_a_day_early(self):
+        """Тот самый дефект (T-d4d2eac7): «скрипт предлагает задачи, у которых
+        дата ещё не настала».
+
+        Срез `start[:10]` читал UTC-дату — для полуночного старта это
+        ПРЕДЫДУЩИЙ день, и накануне сравнение `start > today` становилось ложным:
+        экземпляр «на 21 сентября» очередь выдавала 20-го.
+        """
+        day = datetime.date.today() + datetime.timedelta(days=2)
+        eve = (day - datetime.timedelta(days=1)).isoformat()
+        inst = self._instance(day)
+        self.assertEqual(sing.not_ready_reason(inst, today=eve),
+                         f"начало {day.isoformat()}",
+                         "накануне экземпляр серии уже считается свободным")
+        self.assertIsNone(sing.not_ready_reason(inst, today=day.isoformat()),
+                          "в свой день экземпляр обязан браться как обычная работа")
+
+    def test_the_date_shown_is_the_one_in_the_instance_id(self):
+        """Суффикс id — независимый свидетель того, какой день имеет в виду
+        приложение: по живой базе он совпал с локальной датой `start` у 914
+        экземпляров из 967 и лишь у 4 — с UTC-датой. Значит пометка обязана
+        называть его, а не день по Гринвичу."""
+        day = datetime.date.today() + datetime.timedelta(days=3)
+        inst = self._instance(day)
+        suffix = datetime.datetime.strptime(inst["id"].rsplit("-", 1)[1],
+                                            "%Y%m%d").date()
+        self.assertEqual(sing.starts_later(inst), suffix.isoformat(),
+                         "пометка называет день по Гринвичу, а не тот, что в id")
 
 
 class EffectiveColumnTest(unittest.TestCase):
@@ -1216,6 +1262,47 @@ class DateInstantTest(unittest.TestCase):
             self.assertIsNone(sing.date_instant(raw), raw)
 
 
+class LocalDateTest(unittest.TestCase):
+    """Датное поле -> КАЛЕНДАРНЫЙ ДЕНЬ, который человек видит в карточке.
+
+    Приложение хранит выбранный день его ЛОКАЛЬНОЙ полночью в UTC (замер по
+    живой базе: 970 задач со `start` ровно `21:00:00Z` при зоне +03). Срез
+    строки `raw[:10]` возвращал бы предыдущий день — и возвращал: доска писала
+    «начало 2026-09-20» на экземпляре серии от 21 сентября (T-d4d2eac7).
+    """
+
+    def test_local_midnight_stays_its_own_day(self):
+        day = datetime.date(2026, 9, 21)
+        self.assertEqual(sing.local_date(support.utc_of_local(day)),
+                         "2026-09-21")
+
+    def test_both_ends_of_a_local_day_are_the_same_day(self):
+        """Оба конца суток, а не только один: срез ошибался ровно на границе."""
+        day = datetime.date(2026, 9, 21)
+        for hh, mm in ((0, 0), (0, 1), (12, 0), (23, 59)):
+            self.assertEqual(sing.local_date(support.utc_of_local(day, hh, mm)),
+                             "2026-09-21", f"{hh:02d}:{mm:02d}")
+
+    def test_explicit_zone_is_honoured_not_sliced(self):
+        """Один и тот же момент в разных записях — один и тот же местный день."""
+        same = {sing.local_date(s) for s in
+                ("2026-09-20T21:00:00.000Z", "2026-09-20T21:00:00Z",
+                 "2026-09-21T00:00:00+03:00", "2026-09-20T13:00:00-08:00")}
+        self.assertEqual(len(same), 1, f"один момент дал разные дни: {same}")
+
+    def test_noon_utc_keeps_its_day_in_this_zone(self):
+        """Мы сами пишем дату полднем UTC (DATE_ONLY_TIME) именно ради этого —
+        иначе правка чтения сломала бы собственную запись скилла."""
+        self.assertEqual(sing.local_date("2026-10-15" + sing.DATE_ONLY_TIME),
+                         "2026-10-15")
+
+    def test_empty_is_none_and_garbage_falls_back_to_the_old_slice(self):
+        for raw in (None, "", "   "):
+            self.assertIsNone(sing.local_date(raw), repr(raw))
+        # Неразбираемое не выдумываем: прежний срез — не хуже, чем было.
+        self.assertEqual(sing.local_date("2026-10-15"), "2026-10-15")
+
+
 class FieldAppliedTest(unittest.TestCase):
     """Сверка по смыслу поля, а не по `==` из словаря."""
 
@@ -1259,9 +1346,10 @@ class StartsLaterTest(unittest.TestCase):
         self.today = datetime.date.today().isoformat()
 
     def test_future_yes_today_and_past_no(self):
-        self.assertEqual(sing.starts_later({"start": "2099-01-01T00:00:00.000Z"}),
+        self.assertEqual(sing.starts_later({"start": "2099-01-01T12:00:00.000Z"}),
                          "2099-01-01")
-        self.assertIsNone(sing.starts_later({"start": self.today + "T23:59:00.000Z"}))
+        late = support.utc_of_local(datetime.date.today(), 23, 59)
+        self.assertIsNone(sing.starts_later({"start": late}))
         self.assertIsNone(sing.starts_later({"start": "2020-01-01"}))
 
     def test_nothing_set_is_not_a_future_date(self):
