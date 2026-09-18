@@ -7,6 +7,8 @@
   1. $SINGULARITY_TOKEN
   2. macOS Keychain: security find-generic-password -s singularity-app -a rest-token
   3. ~/.claude/.singularity-token (chmod 600)
+Отказ Keychain (sandbox, замок, не-macOS) от отсутствия записи отличается по stderr,
+а не по коду возврата: он у обоих случаев 44 (см. classify_keychain).
 
 Привязка репозитория к проекту трекера ищется в <repo>/.agents/singularity.json,
 затем .claude/singularity.json, затем в корне (секретов не содержит, коммитится).
@@ -325,27 +327,129 @@ def system_status_id(project_id, role):
 # --------------------------------------------------------------------------- токен
 
 
-def get_token():
-    tok = os.environ.get("SINGULARITY_TOKEN")
-    if tok:
-        return tok.strip()
+TOKEN_FILE = "~/.claude/.singularity-token"
+
+# Четыре исхода чтения Keychain. Три последних раньше сливались в один диагноз
+# «Токен не найден» — и человек шёл пересоздавать токен вместо того, чтобы дать
+# среде доступ.
+KC_OK = "ok"                    # запись прочитана
+KC_ABSENT = "absent"            # Keychain отвечает, записи в нём нет
+KC_DENIED = "denied"            # до Keychain не достучались: sandbox, замок, отказ
+KC_NO_SECURITY = "no-security"  # утилиты `security` нет вовсе — не macOS
+
+# ⚠️ Замерено, а не взято из документации (числа — в JOURNAL.md).
+# Под sandbox (`sandbox-exec` с `deny mach-lookup com.apple.SecurityServer` —
+# ровно то, что делает Codex) `security find-generic-password` отвечает ТЕМ ЖЕ
+# кодом возврата 44 и ТОЙ ЖЕ строкой «could not be found in the keychain», что и
+# при реально отсутствующей записи. Различает случаи только ЛИШНЯЯ строка перед
+# ней — «SecKeychainSearchCreateFromAttributes: One or more parameters passed to
+# a function were not valid»: поиск не смог даже начаться.
+# Поэтому решение принимается по составу stderr, а не по коду возврата: гейт на
+# коде возврата здесь в принципе не умеет покраснеть.
+KC_NOT_FOUND_MARK = "could not be found in the keychain"
+
+
+def classify_keychain(returncode, stdout, stderr):
+    """«Записи нет» против «Keychain недоступен» — по составу stderr.
+
+    Чистая функция: сама никуда не ходит, поэтому и проверяется без Keychain.
+    """
+    if returncode == 0 and (stdout or "").strip():
+        return KC_OK
+    errs = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    # «Записи нет» — это РОВНО строки про ненайденный элемент и ничего кроме.
+    # Любая другая строка означает, что поиск не состоялся.
+    if [ln for ln in errs if KC_NOT_FOUND_MARK not in ln]:
+        return KC_DENIED
+    if errs:
+        return KC_ABSENT
+    # Ошибка без единого слова на stderr — например, процесс убит песочницей.
+    # Это не «записи нет»: об отсутствии записи `security` всегда говорит вслух.
+    return KC_ABSENT if returncode == 0 else KC_DENIED
+
+
+def read_keychain_token():
+    """(токен|None, статус). Наружу токен отдаётся только вызывающему get_token."""
     try:
         out = subprocess.run(
             ["security", "find-generic-password", "-s", "singularity-app",
              "-a", "rest-token", "-w"],
             capture_output=True, text=True, timeout=10,
         )
-        if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip()
+    except FileNotFoundError:
+        return None, KC_NO_SECURITY
     except (OSError, subprocess.SubprocessError):
-        pass
-    path = os.path.expanduser("~/.claude/.singularity-token")
+        # Сюда же таймаут: залоченный Keychain ждёт диалога разблокировки,
+        # которого в неинтерактивной среде никто не увидит (проверено — висит).
+        return None, KC_DENIED
+    status = classify_keychain(out.returncode, out.stdout, out.stderr)
+    return (out.stdout.strip() if status == KC_OK else None), status
+
+
+# Короткая строка — для doctor, развёрнутая — для отказа. Ни та ни другая не
+# печатает сам токен и не предлагает «положить токен в переменную»: подсказка,
+# уводящая секрет в окружение и историю шелла, — не безопасное действие.
+KC_DIAGNOSIS = {
+    KC_ABSENT: (
+        "записи в Keychain нет",
+        "Создай токен на https://me.singularity-app.com (раздел API) и положи:\n"
+        "  security add-generic-password -s singularity-app -a rest-token -w\n"
+        "Значение у -w опущено намеренно: токен спросят скрытым вводом, и он не\n"
+        "попадёт в историю шелла.",
+    ),
+    KC_DENIED: (
+        "Keychain не отвечает — доступ закрыт средой, а не запись отсутствует",
+        "Это типичная картина в sandbox (Codex, sandbox-exec): песочница закрывает\n"
+        "доступ к com.apple.SecurityServer, и `security` отвечает тем же кодом 44,\n"
+        "что и при отсутствующей записи. Запись при этом, скорее всего, на месте —\n"
+        "НЕ пересоздавай токен, он не виноват.\n"
+        "Что сделать:\n"
+        "  1. Проверь среду: `security list-keychains`. Список keychain'ов —\n"
+        "     доступ есть, дело в записи; ошибка SecKeychainCopySearchList —\n"
+        "     доступа нет, дело в среде.\n"
+        "  2. Дай среде доступ к Keychain (запуск без sandbox либо с разрешением\n"
+        "     на securityd) или выполни команду вне ограниченной среды.\n"
+        "  3. Если Keychain просто заперт — разблокируй его:\n"
+        "     `security unlock-keychain` (пароль спросят скрытым вводом).",
+    ),
+    KC_NO_SECURITY: (
+        "утилиты `security` в системе нет — Keychain здесь недоступен в принципе",
+        "Похоже, это не macOS. Положи токен в файл " + TOKEN_FILE + " с правами 600\n"
+        "(`chmod 600`) — скилл читает его следом за Keychain.",
+    ),
+}
+
+
+def token_problem(status):
+    """Текст отказа: заголовок по факту, а не общее «Токен не найден»."""
+    short, advice = KC_DIAGNOSIS.get(status, KC_DIAGNOSIS[KC_ABSENT])
+    return f"Токен не прочитан: {short}.\n{advice}"
+
+
+def token_source():
+    """Откуда берётся токен — БЕЗ самого токена. (источник|None, статус Keychain)."""
+    if os.environ.get("SINGULARITY_TOKEN"):
+        return "переменная окружения SINGULARITY_TOKEN", None
+    tok, status = read_keychain_token()
+    if tok:
+        return "macOS Keychain (singularity-app / rest-token)", status
+    if os.path.exists(os.path.expanduser(TOKEN_FILE)):
+        return f"файл {TOKEN_FILE}", status
+    return None, status
+
+
+def get_token():
+    tok = os.environ.get("SINGULARITY_TOKEN")
+    if tok:
+        return tok.strip()
+    tok, status = read_keychain_token()
+    if tok:
+        return tok
+    path = os.path.expanduser(TOKEN_FILE)
     if os.path.exists(path):
         with open(path) as f:
             return f.read().strip()
-    die("Токен не найден. Создай его на https://me.singularity-app.com (раздел API) и положи:\n"
-        "  security add-generic-password -s singularity-app -a rest-token -w '<ТОКЕН>'\n"
-        "либо экспортируй SINGULARITY_TOKEN.")
+    die(token_problem(status))
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -1092,6 +1196,17 @@ def doctor_write(cfg):
 
 
 def cmd_doctor(args):
+    # Источник токена называется ДО запроса к API. Иначе единственным, что видит
+    # человек в ограниченной среде, остаётся отказ get_token — и «Keychain закрыт
+    # песочницей» неотличимо от «токена нет». Сам токен не печатается.
+    src, status = token_source()
+    if src is None:
+        die(token_problem(status))
+    print(f"✓ токен: {src}")
+    if status in (KC_DENIED, KC_NO_SECURITY):
+        # Токен взялся из запасного источника, а Keychain при этом молчит:
+        # без этой строки расхождение всплывёт только на чужой машине.
+        print(f"  ⚠ Keychain недоступен: {KC_DIAGNOSIS[status][0]}")
     projects = paged("/project", "projects", limit=5)
     print(f"✓ токен рабочий, доступно проектов (первая страница): {len(projects)}")
     cfg, path = load_config(required=False)
