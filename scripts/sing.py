@@ -1227,6 +1227,56 @@ def repo_project_name(path="."):
     return os.path.basename(root.rstrip(os.sep))
 
 
+def is_git_repo(path="."):
+    """Проверить, является ли путь частью git-репозитория."""
+    root = os.path.abspath(path)
+    res = subprocess.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
+                         capture_output=True, text=True)
+    return res.returncode == 0 and res.stdout.strip() == "true"
+
+
+DEFAULT_PROJECT_TASKS = [
+    {
+        "title": "Удалить влитые и устаревшие ветки в локальном и удалённом репозитории",
+        "column": "todo",
+        "git_only": True,
+        "note": (
+            "Что сделать:\n"
+            "1. Проверить статус веток через git branch -a и их смерженность с main.\n"
+            "2. Удалить смерженные локальные ветки через git branch -d.\n"
+            "3. Удалить смерженные удаленные ветки через git push origin --delete (если есть).\n"
+            "4. Если ветка не смержена, но устарела/брошена — согласовать или удалить через -D.\n\n"
+            "Критерий готовности:\n"
+            "git branch -a содержит только ветку main (и актуальные рабочие ветки при их наличии)."
+        ),
+    },
+]
+
+
+def plan_default_tasks(existing_tasks, is_git, no_tasks=False):
+    """Определить список обязательных задач для проекта.
+
+    Идемпотентно: если задача с таким заголовком уже есть в проекте (открыта,
+    закрыта или оформлена шаблоном повторяющейся серии), она не дублируется.
+    Задачи с git_only=True создаются только в git-репозиториях.
+    """
+    if no_tasks:
+        return [], []
+    plan_lines = []
+    to_create = []
+    for tdef in DEFAULT_PROJECT_TASKS:
+        title = tdef["title"]
+        if tdef.get("git_only") and not is_git:
+            continue
+        already = any(same_title(t.get("title"), title) for t in existing_tasks)
+        if already:
+            plan_lines.append(f"ПРОПУСТИТЬ задачу «{title}» (уже есть в проекте)")
+        else:
+            plan_lines.append(f"СОЗДАТЬ задачу «{title}» (роль {tdef['column']})")
+            to_create.append(tdef)
+    return plan_lines, to_create
+
+
 # Правило «работа идёт по доске» кладётся в правила самого репозитория: агент,
 # зашедший в него, должен узнать о доске оттуда, а не от человека в каждом промпте.
 # AGENTS.md читают Codex, OpenCode, Antigravity и Qwen; Claude Code читает CLAUDE.md,
@@ -1382,6 +1432,12 @@ def cmd_init(args):
     ensure_agents_rule(repo_root, (target or {}).get("title") or args.project,
                        cfg_path, apply=False, plan=plan)
 
+    is_git = is_git_repo(repo_root)
+    existing_tasks = board_tasks(target["id"]) if target else []
+    tasks_plan, tasks_to_create = plan_default_tasks(
+        existing_tasks, is_git, no_tasks=getattr(args, "no_tasks", False))
+    plan.extend(tasks_plan)
+
     # Привязка к существующему проекту — рутина; создание нового в трекере человека
     # рутиной не является. По УГАДАННОМУ имени не создаём: иначе опечатка в имени
     # каталога или запуск не в том месте тихо заводят лишний проект. Проверено на
@@ -1433,6 +1489,24 @@ def cmd_init(args):
     for line in ensure_agents_rule(repo_root, target.get("title") or args.project,
                                    cfg_path, apply=True):
         print("  " + line)
+
+    if not getattr(args, "no_tasks", False) and tasks_to_create:
+        fresh_tasks = board_tasks(target["id"])
+        for tdef in tasks_to_create:
+            if any(same_title(t.get("title"), tdef["title"]) for t in fresh_tasks):
+                continue
+            body = {
+                "title": tdef["title"],
+                "projectId": target["id"],
+                "note": note_append(None, tdef["note"]),
+            }
+            t = request("POST", "/task", body=body)
+            tid = t["id"]
+            role = tdef["column"]
+            cid = mapping.get(role)
+            if cid:
+                move_to_column(tid, cid, fatal=False, project_id=target["id"])
+            print(f"создана обязательная задача «{tdef['title']}» ({tid}) в роли {role}")
 
 
 # Потолок ширины колонки «кто держит»: одно неудачно длинное имя агента не
@@ -2306,6 +2380,8 @@ def main():
     sp.add_argument("--own-columns", action="store_true",
                     help="создать свои колонки, даже если системных ещё нет "
                          "(доска раздвоится, когда приложение досоздаст свои)")
+    sp.add_argument("--no-tasks", action="store_true",
+                    help="не создавать обязательные задачи проекта")
     sp.add_argument("--apply", action="store_true", help="выполнить план")
     sp.set_defaults(fn=cmd_init)
 

@@ -880,3 +880,39 @@ class TaskLinkTest(unittest.TestCase):
         сделала бы ссылку нерабочей."""
         tid = "T-21722406-d150-4c4b-a864-9ec775df7d76-20260914"
         self.assertTrue(sing.task_link(tid).endswith(tid))
+
+
+class DefaultProjectTasksTest(unittest.TestCase):
+    """Обязательные задачи проекта при init."""
+
+    def test_plan_creates_task_when_git_repo_and_not_exists(self):
+        plan, to_create = sing.plan_default_tasks([], is_git=True)
+        self.assertEqual(len(to_create), 1)
+        self.assertEqual(to_create[0]["column"], "todo")
+        self.assertTrue(any("СОЗДАТЬ" in line for line in plan))
+
+    def test_plan_skips_when_already_exists(self):
+        existing = [{"title": "Удалить влитые и устаревшие ветки в локальном и удалённом репозитории"}]
+        plan, to_create = sing.plan_default_tasks(existing, is_git=True)
+        self.assertEqual(len(to_create), 0)
+        self.assertTrue(any("ПРОПУСТИТЬ" in line for line in plan))
+
+    def test_plan_case_and_whitespace_insensitive(self):
+        existing = [{"title": "   удалить влитые и устаревшие ВЕТКИ в локальном и удалённом репозитории \n"}]
+        plan, to_create = sing.plan_default_tasks(existing, is_git=True)
+        self.assertEqual(len(to_create), 0)
+        self.assertTrue(any("ПРОПУСТИТЬ" in line for line in plan))
+
+    def test_plan_skips_git_only_when_not_git(self):
+        plan, to_create = sing.plan_default_tasks([], is_git=False)
+        self.assertEqual(len(to_create), 0)
+        self.assertEqual(plan, [])
+
+    def test_plan_no_tasks_flag(self):
+        plan, to_create = sing.plan_default_tasks([], is_git=True, no_tasks=True)
+        self.assertEqual(len(to_create), 0)
+        self.assertEqual(plan, [])
+
+    def test_is_git_repo(self):
+        self.assertTrue(sing.is_git_repo(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        self.assertFalse(sing.is_git_repo(tempfile.gettempdir()))
