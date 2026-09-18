@@ -1757,18 +1757,27 @@ def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False,
                reasons=None):
     """include_done — для просмотра; `next` обязан брать только незакрытые.
 
+    Просмотр берёт ту же выборку, что и `board` (board_tasks): приложение уносит
+    закрытые задачи в дневник, проставляя `journalDate`, и без этого флага
+    «Готово» у `list` пустела на глазах — 13 карточек вместо 53, при живых
+    задачах в колонке. Выдача задачи (`next`) по-прежнему идёт от open_tasks:
+    брать в работу унесённое в дневник нельзя.
+
     ready_only — убрать отложенные, запланированные на будущее и ждущие своих
     подзадач (см. not_ready_reason). Включается только для выдачи задачи, не для
     показа. reasons — если передан словарь, заполняется {id задачи: причина}.
     """
     cid = col_id(cfg, role)
     cmap = column_map(cfg["projectId"])
-    source = live_tasks(cfg["projectId"]) if include_done else open_tasks(cfg["projectId"])
+    source = board_tasks(cfg["projectId"]) if include_done else open_tasks(cfg["projectId"])
     pool = [t for t in source if effective_column(t, cmap, cfg) == cid]
     if group:
         gid = resolve_group(cfg["projectId"], group)
         pool = [t for t in pool if t.get("group") == gid]
-    kids = open_children_counts(source)
+    # «Ждёт подзадачу» считается только по живым подзадачам: унесённая в дневник
+    # закрыта и никого не держит, а по checked её не отличить — приложение
+    # архивирует и невыполненные, когда архивируют весь проект.
+    kids = open_children_counts([t for t in source if not t.get("journalDate")])
     if reasons is not None:
         for t in pool:
             r = not_ready_reason(t, open_children=kids.get(t["id"], 0))
@@ -1865,6 +1874,10 @@ def cmd_list(args):
         extra = "  " + " ".join("#" + s for s in marks) if marks else ""
         if int(t.get("checked") or 0) == 1:
             extra += " ✓"
+        # та же пометка, что на доске: задача жива, просто приложение унесло её
+        # в дневник (архив) и в самом приложении в колонке её уже не видно
+        if t.get("journalDate"):
+            extra += " (в дневнике)"
         reason = reasons.get(t["id"])
         if reason and int(t.get("checked") or 0) == 0:
             extra += f"  [{reason}]"

@@ -290,20 +290,71 @@ class QueueOrderTest(unittest.TestCase):
         self.assertEqual(order[4], "T-low")
 
 
+class PoolJournalTest(unittest.TestCase):
+    """`list` и `next` берут РАЗНЫЕ выборки, и разница — дневник.
+
+    Приложение уносит закрытые задачи в архив (`journalDate`), поэтому колонка
+    «Готово» у показа пустеет, если показ идёт от live_tasks. Проверка красная,
+    если `_pick_pool(include_done=True)` вернуть на live_tasks.
+    """
+
+    def setUp(self):
+        self.cfg = {"projectId": "P-x", "columns": {"done": "KS-D"}}
+        self.tasks = [
+            {"id": "T-fresh", "checked": 1},
+            {"id": "T-journal", "checked": 1, "journalDate": "2026-09-13T23:15:30Z"},
+        ]
+        for name in ("column_map", "open_tasks", "live_tasks", "board_tasks"):
+            self.addCleanup(setattr, sing, name, getattr(sing, name))
+        sing.column_map = lambda pid: {t["id"]: "KS-D" for t in self.tasks}
+        sing.board_tasks = lambda pid: list(self.tasks)
+        sing.live_tasks = lambda pid: [t for t in self.tasks if not t.get("journalDate")]
+        sing.open_tasks = lambda pid: [t for t in sing.live_tasks(pid)
+                                       if not int(t.get("checked") or 0)]
+
+    def test_view_shows_journaled_and_queue_does_not(self):
+        shown = [t["id"] for t in sing._pick_pool(self.cfg, "done", include_done=True)]
+        self.assertIn("T-journal", shown,
+                      "показ колонки «Готово» потерял унесённое в дневник")
+        self.assertIn("T-fresh", shown)
+        queue = [t["id"] for t in sing._pick_pool(self.cfg, "done")]
+        self.assertEqual(queue, [], "в очередь не должно попасть ничего закрытого")
+
+    def test_journaled_subtask_does_not_hold_parent(self):
+        self.tasks.append({"id": "T-kid", "checked": 0, "parent": "T-fresh",
+                           "journalDate": "2026-09-13T23:15:30Z"})
+        reasons = {}
+        sing._pick_pool(self.cfg, "done", include_done=True, reasons=reasons)
+        self.assertNotIn("T-fresh", reasons,
+                         "подзадача из дневника не должна держать родителя")
+
+
 class TaskFilterTest(unittest.TestCase):
-    """Что вообще попадает в выборку. journalDate намеренно НЕ закреплён: по нему
-    открыта отдельная карточка («Закрытые задачи пропадают с доски»), и пинить
-    сегодняшнее поведение значило бы заранее покрасить её решение в красный."""
+    """Что вообще попадает в выборку.
+
+    `journalDate` («унесено в дневник», оно же архив) закреплён с двух сторон:
+    выдача задачи его не видит, а показ истории обязан видеть. Карточка про
+    пропажу закрытых задач с доски закрыта, поведение выбрано — см. references/api.md.
+    """
 
     def setUp(self):
         self.addCleanup(setattr, sing, "fetch_tasks", sing.fetch_tasks)
-        sing.fetch_tasks = lambda pid: [
-            {"id": "T-open", "checked": 0},
-            {"id": "T-done", "checked": 1},
-            {"id": "T-removed", "checked": 0, "removed": True},
-            {"id": "T-deleted", "checked": 0, "deleteDate": "2026-01-01"},
-            {"id": "T-note", "checked": 0, "isNote": True},
+        sing.fetch_tasks = lambda pid, include_archived=False: [
+            t for t in [
+                {"id": "T-open", "checked": 0},
+                {"id": "T-done", "checked": 1},
+                {"id": "T-journal", "checked": 1, "journalDate": "2026-09-13T23:15:30Z"},
+                {"id": "T-removed", "checked": 0, "removed": True},
+                {"id": "T-deleted", "checked": 0, "deleteDate": "2026-01-01"},
+                {"id": "T-note", "checked": 0, "isNote": True},
+            ] if include_archived or not t.get("journalDate")
         ]
+
+    def test_live_tasks_drop_journaled_but_board_keeps_them(self):
+        self.assertNotIn("T-journal", [t["id"] for t in sing.live_tasks("P-x")],
+                         "унесённую в дневник задачу нельзя отдавать в работу")
+        self.assertIn("T-journal", [t["id"] for t in sing.board_tasks("P-x")],
+                      "история сделанного обязана показывать дневник")
 
     def test_live_tasks_keep_completed_but_drop_trash_and_notes(self):
         ids = [t["id"] for t in sing.live_tasks("P-x")]
