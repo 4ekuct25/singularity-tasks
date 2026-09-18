@@ -1342,3 +1342,139 @@ class EnvRefusalTest(unittest.TestCase):
         text = ("FAIL: test_full_cycle_start_report_done\n"
                 "AssertionError: 'wip' != 'done'\n")
         self.assertEqual(self.runner.env_refusals(text), [])
+# ------------------------------------------------------- токен: Keychain vs sandbox
+
+
+class KeychainDiagnosisTest(unittest.TestCase):
+    """Ложный диагноз «Токен не найден» в sandbox уводил пересоздавать живой токен.
+
+    Транскрипты stderr ниже — снятые с `security` дословно, а не сочинённые:
+    под запретом mach-lookup на com.apple.SecurityServer утилита отвечает ТЕМ ЖЕ
+    кодом 44 и ТОЙ ЖЕ строкой «could not be found», что и при отсутствии записи.
+    Поэтому проверка на коде возврата покраснеть не может — судим по stderr.
+
+    Keychain здесь не читается ни разу: `subprocess` подменён в пространстве
+    имён модуля (группа fast обязана проходить там, где Keychain пуст).
+    """
+
+    ABSENT_ERR = ("security: SecKeychainSearchCopyNext: The specified item "
+                  "could not be found in the keychain.\n")
+    DENIED_ERR = ("security: SecKeychainSearchCreateFromAttributes: One or more "
+                  "parameters passed to a function were not valid.\n"
+                  "security: SecKeychainSearchCopyNext: The specified item "
+                  "could not be found in the keychain.\n")
+
+    def fake_subprocess(self, result=None, raises=None):
+        """Подменить subprocess ТОЛЬКО внутри sing, не трогая настоящий модуль."""
+        import types
+
+        def run(*a, **kw):
+            if raises is not None:
+                raise raises
+            return result
+
+        saved = sing.subprocess
+        self.addCleanup(lambda: setattr(sing, "subprocess", saved))
+        sing.subprocess = types.SimpleNamespace(
+            run=run,
+            SubprocessError=subprocess.SubprocessError,
+            TimeoutExpired=subprocess.TimeoutExpired,
+        )
+
+    @staticmethod
+    def completed(returncode, stdout="", stderr=""):
+        return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+    # --- классификация (чистая функция, без Keychain вовсе)
+
+    def test_absent_and_denied_share_exit_code(self):
+        """Главный факт задачи: код 44 одинаков, решает только stderr."""
+        self.assertEqual(sing.classify_keychain(44, "", self.ABSENT_ERR),
+                         sing.KC_ABSENT)
+        self.assertEqual(sing.classify_keychain(44, "", self.DENIED_ERR),
+                         sing.KC_DENIED)
+
+    def test_ok_when_value_read(self):
+        self.assertEqual(sing.classify_keychain(0, "t0k\n", ""), sing.KC_OK)
+        # код 0 без значения — не «ок»
+        self.assertNotEqual(sing.classify_keychain(0, "  \n", ""), sing.KC_OK)
+
+    def test_killed_without_stderr_is_denied(self):
+        """Процесс убит песочницей: об отсутствии записи `security` говорит вслух,
+        молчаливый отказ — это не «записи нет»."""
+        self.assertEqual(sing.classify_keychain(-9, "", ""), sing.KC_DENIED)
+
+    # --- чтение (подменён subprocess)
+
+    def test_missing_security_binary(self):
+        self.fake_subprocess(raises=FileNotFoundError("security"))
+        self.assertEqual(sing.read_keychain_token(), (None, sing.KC_NO_SECURITY))
+
+    def test_timeout_is_denied_not_absent(self):
+        """Залоченный Keychain ждёт диалога разблокировки — это отказ, не отсутствие."""
+        self.fake_subprocess(raises=subprocess.TimeoutExpired("security", 10))
+        self.assertEqual(sing.read_keychain_token(), (None, sing.KC_DENIED))
+
+    def test_reads_value_without_leaking_it_on_failure(self):
+        self.fake_subprocess(result=self.completed(0, "t0k3n\n"))
+        self.assertEqual(sing.read_keychain_token(), ("t0k3n", sing.KC_OK))
+        self.fake_subprocess(result=self.completed(44, "", self.DENIED_ERR))
+        self.assertEqual(sing.read_keychain_token(), (None, sing.KC_DENIED))
+
+    # --- сообщения
+
+    def test_messages_differ_and_are_actionable(self):
+        absent = sing.token_problem(sing.KC_ABSENT)
+        denied = sing.token_problem(sing.KC_DENIED)
+        self.assertNotEqual(absent, denied)
+        # отсутствие записи -> создать и положить
+        self.assertIn("add-generic-password", absent)
+        # отказ среды -> НЕ пересоздавать токен, а разобраться с доступом
+        self.assertIn("list-keychains", denied)
+        self.assertIn("sandbox", denied.lower())
+        self.assertNotIn("add-generic-password", denied)
+
+    def test_messages_never_advise_putting_secret_into_env(self):
+        """Совет «экспортируй токен в переменную» уводит секрет в историю шелла."""
+        for status in (sing.KC_ABSENT, sing.KC_DENIED, sing.KC_NO_SECURITY):
+            msg = sing.token_problem(status)
+            self.assertNotIn("SINGULARITY_TOKEN", msg)
+            self.assertNotIn("export", msg.lower())
+
+    def test_get_token_dies_with_the_matching_diagnosis(self):
+        """Ни токена в окружении, ни файла: остаётся ровно диагноз Keychain."""
+        with tempfile.TemporaryDirectory() as home:
+            for status, err, mark in (
+                (sing.KC_ABSENT, self.ABSENT_ERR, "add-generic-password"),
+                (sing.KC_DENIED, self.DENIED_ERR, "list-keychains"),
+            ):
+                self.fake_subprocess(result=self.completed(44, "", err))
+                with support.env(SINGULARITY_TOKEN=None, HOME=home):
+                    with quiet() as out, self.assertRaises(SystemExit):
+                        sing.get_token()
+                text = out.getvalue()
+                self.assertIn(mark, text, status)
+                # сам секрет в отказ не попадает ни при каком исходе
+                self.assertNotIn("t0k3n", text)
+
+    # --- doctor
+
+    def test_token_source_names_place_not_value(self):
+        self.fake_subprocess(result=self.completed(0, "t0k3n\n"))
+        with support.env(SINGULARITY_TOKEN=None):
+            src, status = sing.token_source()
+        self.assertEqual(status, sing.KC_OK)
+        self.assertIn("Keychain", src)
+        self.assertNotIn("t0k3n", src)
+
+    def test_token_source_reports_denied_keychain_behind_fallback_file(self):
+        """Токен взялся из файла, а Keychain молчит — doctor обязан это назвать."""
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, ".claude"))
+            with open(os.path.join(home, ".claude", ".singularity-token"), "w") as f:
+                f.write("t0k3n\n")
+            self.fake_subprocess(result=self.completed(44, "", self.DENIED_ERR))
+            with support.env(SINGULARITY_TOKEN=None, HOME=home):
+                src, status = sing.token_source()
+        self.assertIn(".singularity-token", src)
+        self.assertEqual(status, sing.KC_DENIED)
