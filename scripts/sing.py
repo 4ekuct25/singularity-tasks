@@ -1147,6 +1147,11 @@ def field_applied(name, task, want):
         return prio_of(task) == int(want)
     if name == "deadline":
         return deadline_instant(task.get("deadline")) == deadline_instant(want)
+    if name == "note":
+        # Сверять дельту строкой нельзя: одна и та же заметка записывается
+        # разными операциями (а сервер вправе их нормализовать). Значение имеет
+        # текст, его человек и читает в карточке.
+        return note_to_text(task.get("note")) == note_to_text(want)
     return task.get(name) == want
 
 
@@ -1154,11 +1159,20 @@ def field_show(name, value):
     """Значение поля так, как его читает человек."""
     if name == "priority":
         return prio_label(int(value)) if value is not None else "—"
+    if name == "note":
+        text = note_to_text(value).strip()
+        return (f"«{text[:60]}…»" if len(text) > 60 else f"«{text}»") if text else "—"
     return value or "—"
 
 
 # Имена полей в выводе — человеческие, в теле запроса — те, что понимает API.
-FIELD_TITLES = {"priority": "приоритет", "deadline": "дедлайн", "group": "секция"}
+FIELD_TITLES = {"priority": "приоритет", "deadline": "дедлайн", "group": "секция",
+                "note": "заметка"}
+
+# Что сверяется до и после ЛЮБОЙ правки полей (`set_task_fields`): PATCH с лишним
+# полем стирает состояние задачи, и ловится это только снимком. Команды со своим
+# набором дополняют этот — `REGROUP_WATCHED`, `NOTE_WATCHED`.
+SET_WATCHED = ("title", "checked", "journalDate", "complete", "projectId")
 
 
 def project_groups(project_id):
@@ -2234,16 +2248,146 @@ def cmd_groups(args):
         print(f"{'вне секций':<41}открытых={loose}")
 
 
+# Заметка — это задача с `isNote=true` (api.md), поэтому её id такой же `T-…`, и
+# правится она тем же `PATCH /task`. Сверяемое при правке шире, чем у `set`: у
+# заметки нет колонки, зато есть признак `isNote` — потеряв его, заметка встанет
+# в очередь задач, и агент попробует её «выполнить».
+NOTE_WATCHED = SET_WATCHED + ("isNote", "parent", "group")
+
+
+def note_task(note_id, cfg=None):
+    """Заметка по id — с проверкой области и того, что это действительно заметка."""
+    t = assert_task_allowed(note_id, cfg)
+    if not t.get("isNote"):
+        die(f"{note_id}: это задача, а не заметка проекта.\n"
+            f"  карточка: sing.py show {note_id}")
+    if t.get("removed") or t.get("deleteDate"):
+        die(f"{note_id}: заметка удалена — читать и править нечего.")
+    return t
+
+
+def note_json(note, group_title=None, tags=()):
+    """Заметка тем же объектом, что и задача: формат один на все команды.
+
+    Заметка и есть задача (`isNote`), просто не попавшая на канбан, — отсюда
+    `column: null`. Отдельная форма объекта заставила бы вызывающего писать
+    разбор под каждую команду, от чего `--json` и уходил.
+    """
+    return task_json(note, tags=tags, group_title=group_title,
+                     note=note_to_text(note.get("note")),
+                     appUrl=task_link_app(note["id"]))
+
+
+def notes_out(args, payload, lines):
+    """Человеку — строки, машине — JSON; и то и другое ровно в свой поток.
+
+    Под `--json` человеческие строки не исчезают, а уходят в stderr: в stdout
+    должен разбираться JSON ЦЕЛИКОМ, одна строка сверху — и вызывающий получает
+    исключение вместо данных.
+    """
+    out = sys.stderr if args.json else sys.stdout
+    for line in lines:
+        print(line, file=out)
+    if args.json:
+        json_out(payload)
+
+
 def cmd_notes(args):
+    """Заметки проекта: показать, создать, дописать, переписать, удалить.
+
+    Раньше здесь было только создание (`--add/--text`): долгоживущий контекст,
+    который SKILL.md велит читать перед работой, нельзя было ни поправить, ни
+    убрать иначе как руками в приложении (T-ac96c736). Контекст, который агент не
+    может сопровождать, расходится с реальностью — ровно тот класс расхождений,
+    против которого написан весь скилл.
+    """
     cfg, _ = load_config()
+    pid = cfg["projectId"]
+    modes = [f"--{m}" for m in ("add", "show", "edit", "rm") if getattr(args, m)]
+    if len(modes) > 1:
+        die(f"{', '.join(modes)} — это разные действия, за раз делается одно.")
+    # Молча проигнорированный флаг — это правка, которая «прошла», но не туда:
+    # `--append` без `--edit` выглядел бы как дописывание, а был бы ничем.
+    if args.append and not args.edit:
+        die("--append дописывает в СУЩЕСТВУЮЩУЮ заметку и работает только с --edit.\n"
+            "  sing.py notes --edit <T-id> --append --text \"...\"")
+
+    if args.show:
+        n = note_task(args.show, cfg)
+        text = note_to_text(n.get("note")).strip()
+        notes_out(args, note_json(n, group_titles(pid).get(n.get("group")))
+                  if args.json else None,
+                  [f"=== {n['id']}  {n.get('title', '')}", text or "(пусто)",
+                   f"  {task_link(n['id'])}"])
+        return
+
+    if args.rm:
+        n = note_task(args.rm, cfg)
+        title = n.get("title", "")
+        if not args.yes:
+            die(f"{args.rm}: «{title}»\n"
+                "  удаление необратимо — подтверди явно: "
+                f"sing.py notes --rm {args.rm} --yes")
+        request("DELETE", f"/task/{args.rm}")
+        # Факт, а не код ответа: этот API умеет ответить 200, ничего не сделав.
+        if request("GET", f"/task/{args.rm}", soft=True) is not None:
+            die(f"{args.rm}: сервер ответил, но заметка на месте — не удалена.")
+        notes_out(args, note_json(n) if args.json else None,
+                  [f"{args.rm}: заметка удалена — {title}"])
+        return
+
+    if args.edit:
+        n = note_task(args.edit, cfg)
+        if not (args.text or "").strip():
+            die(f"{args.edit}: нечего писать — нужен --text с непустым текстом.\n"
+                f"  переписать:  sing.py notes --edit {args.edit} --text \"...\"\n"
+                f"  дописать:    sing.py notes --edit {args.edit} --append --text \"...\"\n"
+                f"  удалить:     sing.py notes --rm {args.edit} --yes")
+        body = (note_append(n.get("note"), args.text) if args.append
+                else note_dump(_body_ops(args.text)))
+        # Запись, которая ничего не меняет, обязана падать, а не рапортовать
+        # успехом: подтверждать её нечем — «текст равен ожидаемому» верно и до
+        # запроса, и сервер на повторную запись тем же значением отвечает 200
+        # (замер). Молчаливое «ок» здесь и есть способ не заметить, что правка
+        # ушла не туда.
+        if field_applied("note", n, body):
+            die(f"{args.edit}: текст тот же — правка ничего не изменит.\n"
+                "  Проверить, что в заметке сейчас: "
+                f"sing.py notes --show {args.edit}")
+        was = len(note_to_text(n.get("note")))
+        _, fresh = set_task_fields(args.edit, {"note": body}, n, watched=NOTE_WATCHED)
+        text = note_to_text(fresh.get("note"))
+        notes_out(args,
+                  note_json(fresh, group_titles(pid).get(fresh.get("group")))
+                  if args.json else None,
+                  [f"{args.edit}: заметка {'дополнена' if args.append else 'переписана'}"
+                   f" — было {was} символов, стало {len(text)}",
+                   f"  {task_link(args.edit)}"])
+        return
+
     if args.add:
         n = request("POST", "/task",
-                    body={"title": args.add, "projectId": cfg["projectId"],
-                          "isNote": True,
+                    body={"title": args.add, "projectId": pid, "isNote": True,
                           "note": note_append(None, args.text or "")})
-        print(f"{n['id']}: заметка создана — {args.add}")
+        # Перечитывание, а не ответ на POST: созданная заметка обязана быть
+        # заметкой и нести тот текст, который просили (AGENTS.md §4).
+        fresh = note_task(n["id"], cfg)
+        if not field_applied("note", fresh, note_append(None, args.text or "")):
+            die(f"{n['id']}: заметка создана, но текст в ней не тот, что отправлен"
+                f" — {field_show('note', fresh.get('note'))}.\n"
+                f"  дописать: sing.py notes --edit {n['id']} --append --text \"...\"")
+        notes_out(args,
+                  note_json(fresh, group_titles(pid).get(fresh.get("group")))
+                  if args.json else None,
+                  [f"{n['id']}: заметка создана — {args.add}",
+                   f"  {task_link(n['id'])}"])
         return
-    notes = project_notes(cfg["projectId"])
+
+    notes = project_notes(pid)
+    if args.json:
+        gnames = group_titles(pid)
+        json_out([note_json(n, gnames.get(n.get("group"))) for n in notes])
+        return
     if not notes:
         print("Заметок в проекте нет.")
         return
@@ -2640,9 +2784,6 @@ def cmd_rename(args):
     print(f"{args.id}: переименована\n  было:  {old}\n  стало: {saved}"
           + ("\n  ⚠ трекер сохранил не то, что отправлено — показан сохранённый"
              if saved.strip() != new else ""))
-
-
-SET_WATCHED = ("title", "checked", "journalDate", "complete", "projectId")
 
 
 def set_task_fields(task_id, fields, task=None, watched=SET_WATCHED):
@@ -3083,12 +3224,13 @@ def warn_if_skill_drifted(command):
 # через месяц ответом argparse «unrecognized arguments: --json» посреди чужой
 # сверки. Проверяются обе стороны — флаг без строки в списке тоже красный.
 #
-# Показывающие команды здесь все до одной. Меняющая попала одна — `regroup`: она
-# и печатает не эхо запроса, а ПЕРЕЧИТАННУЮ карточку, то есть ровно то, ради чего
-# вызывающий и читает машинный вывод. Остальные меняющие (`set`, `rename`, `move`)
-# флага не имеют: добавлять его надо тем же механизмом и вместе со строкой здесь,
-# а не вторым способом печатать JSON.
-JSON_COMMANDS = ("projects", "board", "next", "groups", "list", "show", "regroup")
+# Показывающие команды здесь все до одной. Из меняющих попали `regroup` и `notes`:
+# обе печатают не эхо запроса, а ПЕРЕЧИТАННОЕ состояние, то есть ровно то, ради
+# чего вызывающий и читает машинный вывод. Остальные меняющие (`set`, `rename`,
+# `move`) флага не имеют: добавлять его надо тем же механизмом и вместе со строкой
+# здесь, а не вторым способом печатать JSON.
+JSON_COMMANDS = ("projects", "board", "next", "groups", "list", "show", "regroup",
+                 "notes")
 
 JSON_HELP = ("машинный вывод: в stdout только JSON, предупреждения и подсказки — "
              "в stderr; формат объекта задачи одинаков во всех командах")
@@ -3145,9 +3287,18 @@ def build_parser():
     json_flag(sp)
     sp.set_defaults(fn=cmd_groups)
 
-    sp = sub.add_parser("notes", help="заметки проекта (контекст для агента)")
+    sp = sub.add_parser("notes", help="заметки проекта (контекст для агента): "
+                                      "без аргументов — показать все")
     sp.add_argument("--add", metavar="ЗАГОЛОВОК", help="создать заметку")
-    sp.add_argument("--text", help="текст создаваемой заметки")
+    sp.add_argument("--show", metavar="ID", help="одна заметка целиком")
+    sp.add_argument("--edit", metavar="ID",
+                    help="переписать заметку текстом из --text")
+    sp.add_argument("--append", action="store_true",
+                    help="с --edit: дописать --text в конец, а не переписывать")
+    sp.add_argument("--rm", metavar="ID", help="удалить заметку (нужен --yes)")
+    sp.add_argument("--yes", action="store_true", help="подтвердить удаление")
+    sp.add_argument("--text", help="текст заметки (для --add и --edit)")
+    json_flag(sp)
     sp.set_defaults(fn=cmd_notes)
 
     sp = sub.add_parser("list", help="задачи в колонке")

@@ -34,6 +34,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import support  # noqa: E402
+# Набор ключей объекта задачи перечислен ОДИН раз и отдельно от sing.py — там же,
+# где стоит контракт машинного вывода. Второй список рядом разошёлся бы с первым.
+from test_json import CORE_KEYS  # noqa: E402
 
 SING_UNDER_TEST = os.environ.get("SING_UNDER_TEST") or support.SING
 
@@ -75,6 +78,13 @@ def reset_state():
             "T-in-a": {"id": "T-in-a", "title": "в разделе A", "projectId": PROJ,
                        "group": SEC_A, "checked": 0, "complete": 0, "priority": 1,
                        "parent": "", "note": NOTE, "tags": [], "journalDate": None},
+            # заметка проекта — это задача с isNote (api.md), без связки с доской
+            "T-note": {"id": "T-note", "title": "Контекст проекта",
+                       "projectId": PROJ, "group": FAKE, "isNote": True,
+                       "checked": 0, "complete": 0, "priority": 1, "parent": "",
+                       "note": json.dumps([{"insert": "прод через ansible\n"}],
+                                          ensure_ascii=False),
+                       "tags": [], "journalDate": None},
             "T-alien": {"id": "T-alien", "title": "в чужом проекте",
                         "projectId": OUTSIDE, "group": "Q-fake-outside",
                         "checked": 0, "complete": 0, "priority": 1, "parent": "",
@@ -84,7 +94,9 @@ def reset_state():
         "patches": [],          # тела всех PATCH /task — по ним видно, что ушло
         "drop_note": False,     # сервер «теряет» заметку на любом PATCH
         "move_column": False,   # сервер утаскивает карточку в другую колонку
-        "ignore_group": False,  # сервер отвечает 200, не применив поле
+        "ignore_write": False,  # сервер отвечает 200, не применив поле
+        "drop_isnote": False,   # сервер теряет признак заметки
+        "next_id": 1,
     })
 
 
@@ -162,22 +174,45 @@ class TrackerStub(BaseHTTPRequestHandler):
             if body["group"] not in {g["id"] for g in STATE["groups"]}:
                 return self._send({"statusCode": 400,
                                    "message": "Task group not found"}, 400)
-        if not STATE["ignore_group"]:
+        if not STATE["ignore_write"]:
             task.update(body)
         if STATE["drop_note"]:
             task["note"] = None
         if STATE["move_column"]:
             STATE["links"][tid] = "KS-done"
+        if STATE["drop_isnote"]:
+            task["isNote"] = False
         self._send(task)
 
     def do_POST(self):
-        if urllib.parse.urlsplit(self.path).path != "/task-group":
-            return self._send({"error": "нет такого пути"}, 404)
+        path = urllib.parse.urlsplit(self.path).path
         body = self._body()
-        gid = f"Q-new{len(STATE['groups'])}"
-        STATE["groups"].append({"id": gid, "title": body["title"],
-                                "parent": body["parent"], "parentOrder": 9})
-        self._send({"id": gid})
+        if path == "/task-group":
+            gid = f"Q-new{len(STATE['groups'])}"
+            STATE["groups"].append({"id": gid, "title": body["title"],
+                                    "parent": body["parent"], "parentOrder": 9})
+            return self._send({"id": gid})
+        if path == "/task":
+            tid = f"T-new{STATE['next_id']}"
+            STATE["next_id"] += 1
+            task = {"id": tid, "checked": 0, "complete": 0, "priority": 1,
+                    "parent": "", "tags": [], "journalDate": None, "group": FAKE}
+            task.update(body)
+            if STATE["drop_note"]:
+                task["note"] = None
+            STATE["tasks"][tid] = task
+            return self._send(task)
+        self._send({"error": "нет такого пути"}, 404)
+
+    def do_DELETE(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if not path.startswith("/task/"):
+            return self._send({"error": "нет такого пути"}, 404)
+        tid = path[len("/task/"):]
+        if not STATE["ignore_write"]:
+            STATE["tasks"].pop(tid, None)
+            STATE["links"].pop(tid, None)
+        self._send({"ok": True})
 
 
 class EditBase(unittest.TestCase):
@@ -307,7 +342,7 @@ class RegroupTest(EditBase):
     # --------------------------------------------- сервер ответил 200, не сделав
     def test_silent_refusal_of_the_server_is_caught(self):
         """Ровно тот случай, ради которого AGENTS.md §4: 200 и ничего не сделано."""
-        STATE["ignore_group"] = True
+        STATE["ignore_write"] = True
         p = self.cli("regroup", "T-loose", "Раздел A", code=1)
         self.assertIn("не применилась", p.stderr)
         self.assertEqual(self.group_of("T-loose"), FAKE)
@@ -342,6 +377,145 @@ class RegroupTest(EditBase):
         r = self.cli("regroup", "T-in-a", "Раздел A", "--json")
         self.assertEqual(json.loads(r.stdout)["groupTitle"], "Раздел A")
         self.assertEqual(STATE["patches"], [])
+
+
+class NotesTest(EditBase):
+    """У `notes` было только создание: долгоживущий контекст, который SKILL.md велит
+    читать перед работой, нельзя было ни перечитать по id, ни поправить, ни убрать
+    иначе как руками в приложении (T-ac96c736)."""
+
+    def stored(self, tid):
+        """Текст заметки так, как он лежит в трекере."""
+        raw = STATE["tasks"][tid]["note"]
+        ops = json.loads(raw)
+        self.assertIsInstance(ops, list,
+                              "заметка записана не голым массивом операций — "
+                              "приложение покажет сырой JSON вместо текста")
+        return "".join(op.get("insert", "") for op in ops
+                       if isinstance(op.get("insert"), str))
+
+    def created_id(self, stdout):
+        return stdout.split(":")[0].strip()
+
+    # ------------------------------------------------------------------ чтение
+    def test_one_note_is_shown_by_id(self):
+        r = self.cli("notes", "--show", "T-note")
+        self.assertIn("прод через ansible", r.stdout)
+        self.assertIn("Контекст проекта", r.stdout)
+
+    def test_show_refuses_a_task_that_is_not_a_note(self):
+        p = self.cli("notes", "--show", "T-loose", code=1)
+        self.assertIn("не заметка", p.stderr)
+        self.assertIn("sing.py show T-loose", p.stderr, "нет подсказки, куда идти")
+
+    def test_listing_still_prints_every_note(self):
+        self.assertIn("прод через ansible", self.cli("notes").stdout)
+
+    # -------------------------------------------------------------- создание
+    def test_add_creates_a_note_and_rereads_it(self):
+        out = self.cli("notes", "--add", "Соглашения",
+                       "--text", "не трогать прод по пятницам").stdout
+        tid = self.created_id(out)
+        self.assertTrue(STATE["tasks"][tid]["isNote"], "создана задача, а не заметка")
+        self.assertIn("не трогать прод по пятницам", self.stored(tid))
+
+    def test_add_fails_when_the_server_swallows_the_text(self):
+        """Ответ на POST — не доказательство: карточка перечитывается."""
+        STATE["drop_note"] = True
+        p = self.cli("notes", "--add", "Пропадёт", "--text", "текст", code=1)
+        self.assertIn("текст в ней не тот", p.stderr)
+
+    # ---------------------------------------------------------------- правка
+    def test_edit_replaces_the_text(self):
+        self.cli("notes", "--edit", "T-note", "--text", "прод через kubernetes")
+        self.assertEqual(self.stored("T-note").strip(), "прод через kubernetes")
+        self.assertEqual([set(b) for b in STATE["patches"]], [{"note"}],
+                         "PATCH унёс не только заметку")
+
+    def test_append_keeps_what_was_there(self):
+        self.cli("notes", "--edit", "T-note", "--append", "--text", "и ещё вот что")
+        text = self.stored("T-note")
+        self.assertIn("прод через ansible", text, "дописывание затёрло прежний текст")
+        self.assertIn("и ещё вот что", text)
+
+    def test_writing_the_same_text_is_refused(self):
+        """Критерий карточки: запись, которая ничего не меняет, обязана ронять
+        команду. Подтверждать её нечем — текст равен ожидаемому и до запроса."""
+        p = self.cli("notes", "--edit", "T-note", "--text", "прод через ansible",
+                     code=1)
+        self.assertIn("текст тот же", p.stderr)
+        self.assertEqual(STATE["patches"], [], "отказ всё-таки что-то записал")
+
+    def test_edit_without_text_is_refused(self):
+        p = self.cli("notes", "--edit", "T-note", code=1)
+        self.assertIn("нечего писать", p.stderr)
+        p = self.cli("notes", "--edit", "T-note", "--text", "   ", code=1)
+        self.assertIn("нечего писать", p.stderr)
+        self.assertEqual(STATE["patches"], [])
+
+    def test_silent_refusal_of_the_server_is_caught(self):
+        STATE["ignore_write"] = True
+        p = self.cli("notes", "--edit", "T-note", "--text", "новый текст", code=1)
+        self.assertIn("не применилась", p.stderr)
+        self.assertIn("прод через ansible", self.stored("T-note"))
+
+    def test_a_lost_isnote_flag_is_caught(self):
+        """Потеряв `isNote`, заметка встанет в очередь задач, и агент попробует её
+        «выполнить». PATCH с лишним полем делает это молча."""
+        STATE["drop_isnote"] = True
+        p = self.cli("notes", "--edit", "T-note", "--text", "новый текст", code=1)
+        self.assertIn("задела лишнее", p.stderr)
+        self.assertIn("isNote", p.stderr)
+
+    def test_edit_refuses_a_task_that_is_not_a_note(self):
+        p = self.cli("notes", "--edit", "T-loose", "--text", "текст", code=1)
+        self.assertIn("не заметка", p.stderr)
+        self.assertEqual(STATE["patches"], [])
+
+    # -------------------------------------------------------------- удаление
+    def test_rm_needs_a_confirmation(self):
+        p = self.cli("notes", "--rm", "T-note", code=1)
+        self.assertIn("--yes", p.stderr)
+        self.assertIn("T-note", STATE["tasks"], "заметка удалена без подтверждения")
+
+    def test_rm_removes_the_note_for_real(self):
+        r = self.cli("notes", "--rm", "T-note", "--yes")
+        self.assertIn("удалена", r.stdout)
+        self.assertNotIn("T-note", STATE["tasks"])
+
+    def test_rm_checks_the_fact_not_the_status_code(self):
+        """`200` у этого API успеха не доказывает — и у удаления тоже."""
+        STATE["ignore_write"] = True
+        p = self.cli("notes", "--rm", "T-note", "--yes", code=1)
+        self.assertIn("заметка на месте", p.stderr)
+
+    # ------------------------------------------------------------- остальное
+    def test_two_modes_at_once_are_refused(self):
+        p = self.cli("notes", "--add", "Раз", "--rm", "T-note", code=1)
+        self.assertIn("за раз делается одно", p.stderr)
+
+    def test_append_without_edit_is_refused(self):
+        """Молча проигнорированный флаг — это правка, которая «прошла», но никуда."""
+        p = self.cli("notes", "--add", "Раз", "--append", "--text", "два", code=1)
+        self.assertIn("--append", p.stderr)
+        self.assertEqual(len(STATE["tasks"]), 4, "заметка всё-таки создалась")
+
+    def test_json_of_the_listing_and_of_one_note(self):
+        items = json.loads(self.cli("notes", "--json").stdout)
+        self.assertEqual([n["id"] for n in items], ["T-note"])
+        self.assertEqual(CORE_KEYS - set(items[0]), set(),
+                         "заметка описана не тем же объектом, что задача")
+        one = json.loads(self.cli("notes", "--show", "T-note", "--json").stdout)
+        for key in sorted(CORE_KEYS):
+            self.assertEqual(one[key], items[0][key], f"поле {key} разное")
+        self.assertIn("прод через ansible", one["note"])
+        self.assertIsNone(one["column"], "заметки на канбане нет")
+
+    def test_json_of_an_edit_is_the_reread_note(self):
+        r = self.cli("notes", "--edit", "T-note", "--text", "новый текст", "--json")
+        out = json.loads(r.stdout)
+        self.assertIn("новый текст", out["note"])
+        self.assertIn("переписана", r.stderr, "человеку не осталось ни строки")
 
 
 if __name__ == "__main__":

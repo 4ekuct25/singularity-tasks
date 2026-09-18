@@ -485,6 +485,52 @@ class BoardRepairTest(LiveBase):
         self.assertIsNone(self.sing.request("GET", f"/task/{tid}", soft=True))
 
 
+class NotesTest(LiveBase):
+    """Круг заметки целиком: создана → дописана → перечитана → удалена. Это и есть
+    критерий готовности карточки T-ac96c736 — до правок из CLI жил только первый шаг.
+
+    Один тест на весь круг намеренно: каждая команда здесь — запросы к живому
+    трекеру, а прогоны подряд он не держит (429)."""
+
+    def test_note_is_created_appended_reread_and_removed(self):
+        out = self.cli("notes", "--add", "zz: контекст проекта",
+                       "--text", "прод разворачивается через ansible").stdout
+        nid = out.split(":")[0].strip()
+        self.assertTrue(nid.startswith("T-"), out)
+        note = self.sing.request("GET", f"/task/{nid}")
+        self.assertTrue(note.get("isNote"), "создана задача, а не заметка")
+        self.assertIn("ansible", self.note_of(nid))
+        # заметке не место в очереди задач: канбан её не видит
+        self.assertNotIn(nid, self.cli("list").stdout)
+        self.assertNotIn(nid, self.cli("board").stdout)
+
+        self.cli("notes", "--edit", nid, "--append", "--text", "с 2026-09 — kubernetes")
+        text = self.note_of(nid)
+        self.assertIn("ansible", text, "дописывание затёрло прежний текст")
+        self.assertIn("kubernetes", text)
+
+        shown = self.cli("notes", "--show", nid).stdout
+        self.assertIn("kubernetes", shown)
+        self.assertIn("zz: контекст проекта", shown)
+
+        # та же правка второй раз: сервер ответит 200, поэтому команда обязана
+        # отказать сама, а не отчитаться успехом
+        p = self.cli("notes", "--edit", nid, "--text", text.rstrip("\n"), expect=1)
+        self.assertIn("текст тот же", p.stderr)
+
+        self.cli("notes", "--rm", nid, expect=1)              # без --yes не удаляет
+        self.assertIsNotNone(self.sing.request("GET", f"/task/{nid}", soft=True))
+        self.cli("notes", "--rm", nid, "--yes")
+        self.assertIsNone(self.sing.request("GET", f"/task/{nid}", soft=True),
+                          "заметка осталась, а команда отчиталась успехом")
+
+    def test_notes_refuse_a_task_that_is_not_a_note(self):
+        tid = self.make_task("zz: обычная задача, не заметка")
+        p = self.cli("notes", "--edit", tid, "--text", "текст", expect=1)
+        self.assertIn("не заметка", p.stderr)
+        self.assertEqual(self.note_of(tid), "", "отказ всё-таки что-то записал")
+
+
 class ScopeGuardTest(LiveBase):
     """Ограничение области проверяется по факту на каждой операции, а не один раз
     при привязке. Здесь дёшево: список проектов уже в памятке."""
