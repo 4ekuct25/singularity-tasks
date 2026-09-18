@@ -938,3 +938,79 @@ class DefaultProjectTasksTest(unittest.TestCase):
             with open(os.path.join(td, "JOURNAL.md"), "w") as f:
                 f.write("# Journal\n")
             self.assertTrue(sing.has_logs_or_journal(td))
+
+
+# ------------------------------------------------------------------- дедлайн
+
+
+class ParseDeadlineTest(unittest.TestCase):
+    """`--deadline` обещал «ISO-дату», а API берёт только полный ISO-8601 с явной
+    таймзоной: голая `2026-10-15` — `400`, задача не создаётся (T-daa1e87c).
+    Разбор обязан быть ЛОКАЛЬНЫМ: формат ловится до запроса, с примером в тексте."""
+
+    def test_short_date_becomes_noon_utc(self):
+        """Полдень, а не полночь: полночь в зоне со сдвигом уезжает в соседние
+        сутки по UTC, и доска (`brief()` режет deadline[:10]) показала бы 14-е."""
+        self.assertEqual(sing.parse_deadline("2026-10-15"),
+                         "2026-10-15T12:00:00.000Z")
+        self.assertEqual(sing.parse_deadline("  2026-10-15  "),
+                         "2026-10-15T12:00:00.000Z")
+        # Календарный день держится при сдвиге −11:59…+11:59. Шире не бывает:
+        # зоны занимают 26 часов, одной точки, верной для всех, не существует.
+        stamp = sing.parse_deadline("2026-10-15")
+        self.assertTrue(stamp.startswith("2026-10-15"))
+        moment = datetime.datetime(2026, 10, 15, 12, tzinfo=datetime.timezone.utc)
+        for minutes in (-719, -540, -330, 0, 180, 345, 719):
+            shifted = moment.astimezone(
+                datetime.timezone(datetime.timedelta(minutes=minutes)))
+            self.assertEqual(shifted.date(), datetime.date(2026, 10, 15),
+                             f"календарный день съехал при сдвиге {minutes:+d} мин")
+
+    def test_full_iso_passes_through_unchanged(self):
+        """Явная зона — осознанный выбор автора, нормализовать её нельзя."""
+        for raw in ("2026-10-15T18:00:00.000Z",
+                    "2026-10-15T18:00:00Z",
+                    "2026-10-15T18:00Z",
+                    "2026-10-15T18:00:00.123456Z",
+                    "2026-10-15T18:00:00+03:00",
+                    "2026-10-15T18:00:00-08:00",
+                    "2026-10-15T18:00:00+0300"):
+            self.assertEqual(sing.parse_deadline(raw), raw, raw)
+
+    def test_empty_means_nothing_to_send(self):
+        """Пустой ввод — это «снять дедлайн»; отличать его от «не трогать»
+        обязан вызывающий, по `is None` самого аргумента."""
+        self.assertIsNone(sing.parse_deadline(""))
+        self.assertIsNone(sing.parse_deadline("   "))
+        self.assertIsNone(sing.parse_deadline(None))
+
+    def test_datetime_without_timezone_is_refused_with_a_hint(self):
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.parse_deadline("2026-10-15T18:00:00")
+        text = err.getvalue()
+        self.assertIn("таймзон", text)
+        self.assertIn("2026-10-15T18:00:00.000Z", text, "нет примера формата")
+
+    def test_impossible_calendar_dates_are_refused_locally(self):
+        """Сервер на них отвечает тем же 400 — незачем узнавать это по сети."""
+        for raw in ("2026-02-30", "2026-13-01", "2026-04-31",
+                    "2026-02-30T12:00:00Z", "2026-10-15T25:00:00Z"):
+            with quiet() as err, self.assertRaises(SystemExit):
+                sing.parse_deadline(raw)
+            self.assertIn("календар", err.getvalue(), raw)
+
+    def test_garbage_is_refused_with_an_example(self):
+        for raw in ("завтра", "15.10.2026", "2026/10/15", "2026-10",
+                    "15-10-2026", "2026-10-15T18:00:00+25:00"):
+            with quiet() as err, self.assertRaises(SystemExit):
+                sing.parse_deadline(raw)
+            text = err.getvalue()
+            self.assertIn("--deadline", text, raw)
+            self.assertIn("2026-10-15", text, f"нет примера формата для {raw}")
+
+    def test_field_name_appears_in_the_refusal(self):
+        """Одно и то же сообщение обслуживает и `add`, и правку существующей
+        карточки — имя поля должно быть тем, которое человек набрал."""
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.parse_deadline("завтра", field="--deadline у set")
+        self.assertIn("--deadline у set", err.getvalue())

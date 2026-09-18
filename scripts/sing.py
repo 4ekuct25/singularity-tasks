@@ -932,6 +932,77 @@ def prio_of(t):
     return 1 if p is None else int(p)
 
 
+# Полдень UTC, а не полночь. Дата без времени — это КАЛЕНДАРНЫЙ день, и он не
+# должен съезжать при переводе в зону: полночь по Москве — это 21:00 предыдущих
+# суток по UTC, и доска (`brief()` режет `deadline[:10]`) показала бы 14 октября
+# вместо 15-го. Полдень UTC держит тот же календарный день при сдвиге от -11:59
+# до +11:59, то есть всюду, кроме крайних UTC+12…+14 (Новая Зеландия, Фиджи,
+# Кирибати) — там в приложении дата покажется следующим днём. Единой точки,
+# верной для всех зон, не существует: их диапазон 26 часов шире суток.
+DATE_ONLY_TIME = "T12:00:00.000Z"
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Полный ISO-8601: дата, T или пробел, время, обязательная явная зона (Z или ±HH:MM).
+# Дробная часть не фиксирована — в базе живут формы с 6, 3 и 0 знаками (api.md).
+_ISO_DT_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(\.\d+)?"
+    r"(Z|[+-]\d{2}:?\d{2})$", re.I)
+
+DEADLINE_HELP = (
+    "дата 2026-10-15 (станет полднем UTC того же дня) либо полный ISO-8601 "
+    "с явной таймзоной: 2026-10-15T18:00:00.000Z, 2026-10-15T18:00:00+03:00")
+
+
+def parse_deadline(raw, field="--deadline"):
+    """Привести дату к тому виду, который API принимает, ЛИБО объяснить отказ.
+
+    Голую дату `2026-10-15` сервер отвечает `400` — и это была не косметика: `add`
+    падал сырым дампом ответа API, задача не создавалась (T-daa1e87c). Справка при
+    этом обещала «ISO-дату», то есть ровно ту форму, которую сервер не берёт.
+
+    Разбор здесь, ДО запроса: непонятный формат обязан ловиться локально, с
+    примером в тексте, а не превращаться в дамп чужого ответа. Календарная
+    корректность (`2026-02-30`, `2026-13-01`) проверяется тем же разбором —
+    регулярка её не видит, а сервер видит и отвечает тем же 400.
+
+    Возвращает строку для тела запроса; `None` — только для пустого ввода
+    (`--deadline ''` = снять дедлайн), и отличать «снять» от «не трогать» обязан
+    вызывающий, по `is None` самого аргумента.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+
+    def bad(why):
+        die(f"{field}: {why}\n  ожидается: {DEADLINE_HELP}\n  получено: {raw}")
+
+    if _DATE_ONLY_RE.match(raw):
+        y, m, d = (int(x) for x in raw.split("-"))
+        try:
+            datetime.date(y, m, d)
+        except ValueError as e:
+            bad(f"такой даты нет в календаре ({e})")
+        return raw + DATE_ONLY_TIME
+
+    hit = _ISO_DT_RE.match(raw)
+    if not hit:
+        if re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d", raw):
+            bad("нет таймзоны — сервер берёт только время с явной зоной "
+                "(Z или ±HH:MM)")
+        bad("не похоже ни на дату, ни на ISO-8601 datetime")
+    y, m, d, hh, mm, ss, frac, zone = hit.groups()
+    try:
+        datetime.datetime(int(y), int(m), int(d), int(hh), int(mm), int(ss or 0))
+    except ValueError as e:
+        bad(f"такой даты/времени нет в календаре ({e})")
+    if zone.upper() != "Z":
+        off_h, off_m = int(zone[1:3]), int(zone[-2:])
+        if off_h > 14 or off_m > 59:
+            bad(f"таймзона {zone} вне диапазона ±14:00")
+    # Полный ISO отдаём КАК ПРИСЛАЛИ: явная зона — это осознанный выбор автора,
+    # и нормализовать её в UTC значило бы молча подменить то, что он написал.
+    return raw
+
+
 def project_groups(project_id):
     """Секции проекта. У каждого проекта есть безымянная fake-группа — она не секция."""
     return [g for g in paged("/task-group", "taskGroups", {"parent": project_id})
@@ -2056,7 +2127,7 @@ def cmd_add(args):
     if args.priority is not None:
         body["priority"] = args.priority
     if args.deadline:
-        body["deadline"] = args.deadline
+        body["deadline"] = parse_deadline(args.deadline)
     t = request("POST", "/task", body=body)
     tid = t["id"]
     # Задача уже создана. Всё, что упадёт дальше, обязано назвать её id: без него
@@ -2503,8 +2574,9 @@ def main():
     sp.add_argument("--note", help="описание: что сделать, критерий готовности")
     sp.add_argument("--no-note", action="store_true",
                     help="осознанно без описания (заголовок исчерпывает задачу)")
-    sp.add_argument("--priority", type=int, choices=[0, 1, 2])
-    sp.add_argument("--deadline", help="ISO-дата")
+    sp.add_argument("--priority", type=int, choices=[0, 1, 2],
+                    help="0=высокий, 1=обычный, 2=низкий")
+    sp.add_argument("--deadline", help=DEADLINE_HELP)
     sp.set_defaults(fn=cmd_add)
 
     sp = sub.add_parser("move", help="переставить задачу в колонку (починка доски)")

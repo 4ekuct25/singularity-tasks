@@ -188,6 +188,47 @@ class AddTest(LiveBase):
         p = self.cli("add", "zz: без описания", expect=1)
         self.assertIn("нужно описание", p.stderr)
 
+    def test_short_deadline_is_accepted_by_the_server(self):
+        """Голую дату API отвергает `400`, и `add` падал сырым дампом ответа, не
+        создав задачу (T-daa1e87c). Проверяется ФАКТОМ: поле перечитывается из
+        трекера, а не берётся из кода ответа — 200 здесь ничего не доказывает.
+
+        Прогонять надо именно живьём: разбор даты можно проверить на заглушке, а
+        вот что сервер берёт получившуюся форму — только здесь.
+        """
+        out = self.cli("add", "zz: дедлайн короткой датой",
+                       "--note", "критерий: задача создалась",
+                       "--deadline", "2026-10-15").stdout
+        tid = out.split(":")[0].strip()
+        self.assertTrue(tid.startswith("T-"), out)
+        saved = self.sing.request("GET", f"/task/{tid}").get("deadline")
+        self.assertTrue(saved, "дедлайн не сохранился, а команда не упала")
+        self.assertEqual(saved[:10], "2026-10-15",
+                         f"календарный день съехал: {saved}")
+        # доска печатает первые 10 символов — человек должен видеть ту же дату
+        self.assertIn("дедлайн=2026-10-15", self.cli("list").stdout)
+
+    def test_full_iso_deadline_is_accepted_as_written(self):
+        out = self.cli("add", "zz: дедлайн полным ISO",
+                       "--note", "критерий: своя таймзона не потерялась",
+                       "--deadline", "2026-10-15T18:00:00+03:00").stdout
+        tid = out.split(":")[0].strip()
+        saved = self.sing.request("GET", f"/task/{tid}").get("deadline")
+        self.assertTrue(saved, "дедлайн не сохранился, а команда не упала")
+        self.assertEqual(saved[:10], "2026-10-15", f"день съехал: {saved}")
+
+    def test_broken_deadline_is_refused_before_the_request(self):
+        """Отказ обязан быть локальным и внятным: ни дампа ответа API, ни
+        задачи-сироты, которую потом никто не найдёт."""
+        title = "zz: дедлайн из несуществующей даты"
+        p = self.cli("add", title, "--note", "не должна создаться",
+                     "--deadline", "2026-02-30", expect=1)
+        self.assertIn("--deadline", p.stderr)
+        self.assertIn("2026-10-15", p.stderr, "в отказе нет примера формата")
+        self.assertNotIn("HTTP 400", p.stderr, "наружу утёк ответ API")
+        self.assertNotIn(title, self.cli("board").stdout,
+                         "задача всё-таки создалась")
+
 
 class CycleTest(LiveBase):
 
