@@ -619,5 +619,88 @@ class ScopeGuardTest(LiveBase):
         self.assertIn("корневой проект", p.stderr.lower())
 
 
+class AdHocProjectTest(LiveBase):
+    """`--project` из каталога БЕЗ привязки — ровно тот случай, ради которого
+    флаг заведён (T-11e50aee): дефект соседнего проекта надо было куда-то
+    записать, а подходящего репозитория под рукой не оказалось.
+
+    Каталог здесь настоящий и пустой: привязки в нём нет и появиться не должна.
+    """
+
+    def setUp(self):
+        self.foreign = tempfile.mkdtemp(prefix="zz-noconfig-")
+        self.addCleanup(shutil.rmtree, self.foreign, ignore_errors=True)
+        self.assertIsNone(self.sing.find_config(self.foreign),
+                          "каталог для проверки обязан быть без привязки")
+
+    def here(self, *argv, expect=0):
+        """Команда из каталога без привязки — не из чернового репозитория."""
+        p = subprocess.run(
+            [sys.executable, support.SING, *argv],
+            cwd=self.foreign, env=support.clean_env(SINGULARITY_AGENT=AGENT),
+            capture_output=True, text=True)
+        self.assertEqual(p.returncode, expect,
+                         f"sing.py {' '.join(argv)} -> код {p.returncode}\n"
+                         f"stdout: {p.stdout}\nstderr: {p.stderr}")
+        return p
+
+    def test_without_the_flag_there_is_nowhere_to_write(self):
+        """Исходный дефект: из непривязанного каталога карточку завести нечем."""
+        p = self.here("add", "zz: некуда записать", "--no-note", expect=1)
+        self.assertIn("не привязан", p.stderr)
+
+    def test_add_lands_in_the_addressed_project_and_leaves_no_binding(self):
+        title = "zz: заведено по --project"
+        out = self.here("add", title, "--note", "критерий: карточка в соседнем проекте",
+                        "--project", self.proj["id"]).stdout
+        tid = out.split(":")[0].strip()
+        self.assertTrue(tid.startswith("T-"), out)
+        self.addCleanup(self.sing.request, "DELETE", f"/task/{tid}")
+        task = self.sing.request("GET", f"/task/{tid}")
+        self.assertEqual(task["projectId"], self.proj["id"],
+                         "задача ушла не в адресованный проект")
+        self.assertEqual(self.column_of(tid), "todo",
+                         "колонку чужой доски скилл обязан найти сам")
+        self.assertIsNone(self.sing.find_config(self.foreign),
+                          "--project записал привязку — это переключение, а не адресация")
+
+    def draft_name(self):
+        """Название черновика берём из списка проектов — из того же источника,
+        по которому флаг ищет проект, а не из ответа на его создание."""
+        hit = next((p for p in self.sing.all_projects()
+                    if p["id"] == self.proj["id"]), None)
+        self.assertIsNotNone(hit, "черновик не виден в списке проектов")
+        return hit["title"]
+
+    def test_board_by_title_says_out_loud_that_the_project_is_foreign(self):
+        out = self.here("board", "--project", self.draft_name()).stdout
+        self.assertIn(self.proj["id"], out)
+        self.assertIn("ЧУЖОЙ ПРОЕКТ", out,
+                      "чужую доску легко принять за свою — пометка обязательна")
+
+    def test_root_project_is_refused(self):
+        p = self.here("list", "--project", self.sing.ROOT_PROJECT_TITLE, expect=1)
+        self.assertIn("корневой", p.stderr)
+
+    def test_project_outside_the_root_is_refused(self):
+        """Настоящий проект аккаунта вне «ИИ проекты»: отказ обязан работать на
+        живых данных, а не только на заглушке."""
+        projects = self.sing.all_projects()
+        root = self.sing.resolve_root(projects)
+        scope = {p["id"] for p in self.sing.projects_in_scope(projects)}
+        outside = [p for p in projects
+                   if p["id"] not in scope and p["id"] != root["id"]]
+        if not outside:
+            self.skipTest("в аккаунте нет проектов вне области — отказ покрыт fast")
+        p = self.here("list", "--project", outside[0]["id"], expect=1)
+        self.assertIn("ЗАПРЕЩЕНО", p.stderr)
+
+    def test_taking_work_from_a_foreign_project_is_not_offered(self):
+        """Решение, а не недоделка: читать чужую доску можно, брать оттуда
+        задачу в работу из чужого репозитория — нет."""
+        p = self.here("next", "--project", self.draft_name(), expect=2)
+        self.assertIn("unrecognized arguments", p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
