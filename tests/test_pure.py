@@ -938,3 +938,41 @@ class DefaultProjectTasksTest(unittest.TestCase):
             with open(os.path.join(td, "JOURNAL.md"), "w") as f:
                 f.write("# Journal\n")
             self.assertTrue(sing.has_logs_or_journal(td))
+
+
+# ------------------------------------------------------------ вердикт по прогону
+
+
+class EnvRefusalTest(unittest.TestCase):
+    """Красный от отказа трекера и красный от регрессии — разные новости.
+
+    Живой набор упирается в троттлинг аккаунта (429), в `500 Sync error` на
+    запись и в `400 Default task group not found`; ни одно из трёх не означает,
+    что скилл поменял поведение. Набор обязан называть такие отказы — и обязан
+    МОЛЧАТЬ, когда их нет, иначе «опять трекер» станет универсальным объяснением
+    любого падения.
+    """
+
+    runner = support.load_module("run_under_test",
+                                 os.path.join(support.HERE, "run.py"))
+
+    def test_throttling_is_named_and_counted(self):
+        text = ("GET /task/T-1 -> HTTP 429 (попыток: 4, ждали 9.0 с)\n"
+                "GET /task/T-2 -> HTTP 429 (попыток: 4, ждали 9.0 с)\n")
+        found = self.runner.env_refusals(text)
+        self.assertEqual(len(found), 1)
+        why, n = found[0]
+        self.assertEqual(n, 2)
+        self.assertIn("429", why)
+
+    def test_write_refusals_are_named_too(self):
+        text = ('POST /task -> HTTP 400: {"message":"Default task group not found"}\n'
+                'POST /project -> HTTP 500: {"message":"Sync error: number in queue 7"}\n')
+        self.assertEqual(sorted(n for _, n in self.runner.env_refusals(text)), [1, 1])
+
+    def test_plain_assertion_failure_is_not_blamed_on_the_tracker(self):
+        """Контроль: без строк отказа вердикт пуст. Иначе ловушка прикрывала бы
+        настоящую регрессию — ровно то, ради чего она и заводилась."""
+        text = ("FAIL: test_full_cycle_start_report_done\n"
+                "AssertionError: 'wip' != 'done'\n")
+        self.assertEqual(self.runner.env_refusals(text), [])
