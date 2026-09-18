@@ -8,6 +8,7 @@
 Запуск: tests/run.py fast
 """
 
+import argparse
 import contextlib
 import io
 import json
@@ -1014,3 +1015,199 @@ class ParseDeadlineTest(unittest.TestCase):
         with quiet() as err, self.assertRaises(SystemExit):
             sing.parse_deadline("завтра", field="--deadline у set")
         self.assertIn("--deadline у set", err.getvalue())
+
+
+class DeadlineInstantTest(unittest.TestCase):
+    """Сохранённое сравнивается как МОМЕНТ, а не строкой: одно и то же время
+    записывается по-разному (в базе три формы дробной части), а зону сервер
+    вправе нормализовать. Строковая сверка тогда сказала бы «поле не
+    изменилось» и уронила бы команду на успешной правке."""
+
+    def test_same_moment_in_different_notations(self):
+        same = ["2026-10-15T15:00:00.000Z", "2026-10-15T15:00:00Z",
+                "2026-10-15T15:00:00.000000Z", "2026-10-15T18:00:00+03:00",
+                "2026-10-15T07:00:00-08:00", "2026-10-15 15:00:00Z"]
+        moments = {sing.deadline_instant(s) for s in same}
+        self.assertEqual(len(moments), 1, f"одно время разошлось: {moments}")
+
+    def test_different_moments_stay_different(self):
+        self.assertNotEqual(sing.deadline_instant("2026-10-15T12:00:00Z"),
+                            sing.deadline_instant("2026-10-15T12:00:00+03:00"))
+
+    def test_empty_and_garbage_are_none(self):
+        for raw in (None, "", "   ", "завтра", "2026-10-15", "2026-10-15T12:00:00"):
+            self.assertIsNone(sing.deadline_instant(raw), raw)
+
+
+class FieldAppliedTest(unittest.TestCase):
+    """Сверка по смыслу поля, а не по `==` из словаря."""
+
+    def test_missing_priority_means_normal(self):
+        """Ноль ложный, а отсутствие приоритета — это «обычный» (1)."""
+        self.assertTrue(sing.field_applied("priority", {}, 1))
+        self.assertFalse(sing.field_applied("priority", {}, 0))
+        self.assertTrue(sing.field_applied("priority", {"priority": 0}, 0))
+
+    def test_deadline_compared_as_a_moment(self):
+        task = {"deadline": "2026-10-15T15:00:00.000Z"}
+        self.assertTrue(sing.field_applied("deadline", task,
+                                           "2026-10-15T18:00:00+03:00"))
+        self.assertFalse(sing.field_applied("deadline", task,
+                                            "2026-10-16T15:00:00.000Z"))
+
+    def test_cleared_deadline_matches_only_emptiness(self):
+        self.assertTrue(sing.field_applied("deadline", {"deadline": None}, None))
+        self.assertTrue(sing.field_applied("deadline", {}, None))
+        self.assertFalse(sing.field_applied("deadline",
+                                            {"deadline": "2026-10-15T12:00:00Z"}, None))
+
+
+class SetTaskFieldsTest(unittest.TestCase):
+    """AGENTS.md §4: 200 ничего не доказывает. Правка полей обязана
+    подтверждаться перечитыванием и не задевать остального."""
+
+    def setUp(self):
+        self.addCleanup(setattr, sing, "request", sing.request)
+        self.addCleanup(setattr, sing, "TAG_SETTLE_PAUSE", sing.TAG_SETTLE_PAUSE)
+        sing.TAG_SETTLE_PAUSE = 0
+        self.patched = []
+
+    def _server(self, reads):
+        it = iter(reads)
+        last = [reads[0]]
+
+        def req(method, path, **kw):
+            if method == "PATCH":
+                self.patched.append(kw.get("body"))
+                return {}
+            try:
+                last[0] = next(it)
+            except StopIteration:
+                pass
+            return last[0]
+
+        sing.request = req
+
+    def test_confirms_by_reread_not_by_status(self):
+        task = {"title": "з", "checked": 0, "tags": [], "priority": 1}
+        self._server([dict(task, priority=0)])
+        before, fresh = sing.set_task_fields("T-1", {"priority": 0}, task)
+        self.assertEqual(before, {"priority": 1})
+        self.assertEqual(fresh["priority"], 0)
+        self.assertEqual(self.patched, [{"priority": 0}],
+                         "PATCH обязан нести только названные поля")
+
+    def test_waits_out_a_lagging_queue(self):
+        task = {"title": "з", "checked": 0, "tags": [], "priority": 1}
+        self._server([task, task, dict(task, priority=0)])
+        _, fresh = sing.set_task_fields("T-1", {"priority": 0}, task)
+        self.assertEqual(fresh["priority"], 0)
+
+    def test_silent_200_is_a_failure_not_a_success(self):
+        """Сервер ответил успехом, поле не изменилось — это отказ, а не успех."""
+        task = {"title": "з", "checked": 0, "tags": [], "priority": 1}
+        self._server([task])
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.set_task_fields("T-1", {"priority": 0}, task)
+        text = err.getvalue()
+        self.assertIn("не применилась", text)
+        self.assertIn("приоритет", text, "не названо поле, которое не записалось")
+
+    def test_clearing_a_deadline_is_confirmed_too(self):
+        task = {"title": "з", "checked": 0, "tags": [],
+                "deadline": "2026-10-15T12:00:00.000Z"}
+        self._server([dict(task, deadline=None)])
+        sing.set_task_fields("T-1", {"deadline": None}, task)
+        self.assertEqual(self.patched, [{"deadline": None}])
+
+    def test_deadline_that_stays_is_a_failure(self):
+        task = {"title": "з", "checked": 0, "tags": [],
+                "deadline": "2026-10-15T12:00:00.000Z"}
+        self._server([task])
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.set_task_fields("T-1", {"deadline": None}, task)
+        self.assertIn("дедлайн", err.getvalue())
+
+    def test_normalized_timezone_is_not_a_failure(self):
+        """Сервер вправе вернуть тот же момент в другой записи — это успех."""
+        task = {"title": "з", "checked": 0, "tags": [], "deadline": None}
+        self._server([dict(task, deadline="2026-10-15T15:00:00.000Z")])
+        sing.set_task_fields("T-1", {"deadline": "2026-10-15T18:00:00+03:00"}, task)
+
+    def test_dies_when_the_patch_touches_anything_else(self):
+        """PATCH с лишним полем стирает состояние задачи — это обязано вскрыться."""
+        task = {"title": "з", "checked": 1, "tags": ["A-1"], "priority": 1}
+        self._server([{"title": "з", "checked": 0, "tags": ["A-1"], "priority": 0}])
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.set_task_fields("T-1", {"priority": 0}, task)
+        self.assertIn("задела лишнее", err.getvalue())
+
+
+class SetCommandTest(unittest.TestCase):
+    """`--deadline ''` (снять) и отсутствие флага (не трогать) — разные вещи."""
+
+    def setUp(self):
+        self.addCleanup(setattr, sing, "load_config", sing.load_config)
+        self.addCleanup(setattr, sing, "assert_task_allowed", sing.assert_task_allowed)
+        self.addCleanup(setattr, sing, "set_task_fields", sing.set_task_fields)
+        sing.load_config = lambda **kw: ({"projectId": "P-1"}, "/tmp/x.json")
+        self.task = {"id": "T-1", "priority": 1,
+                     "deadline": "2026-10-15T12:00:00.000Z"}
+        sing.assert_task_allowed = lambda tid, cfg=None: self.task
+        self.sent = []
+
+        def fake(task_id, fields, task=None):
+            self.sent.append(fields)
+            fresh = dict(self.task, **fields)
+            return {k: self.task.get(k) for k in fields}, fresh
+
+        sing.set_task_fields = fake
+
+    def _run(self, **kw):
+        args = argparse.Namespace(id="T-1", priority=None, deadline=None)
+        for k, v in kw.items():
+            setattr(args, k, v)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sing.cmd_set(args)
+        return out.getvalue()
+
+    def test_empty_deadline_clears_it(self):
+        self._run(deadline="")
+        self.assertEqual(self.sent, [{"deadline": None}],
+                         "пустая строка обязана писать null, а не пропускаться")
+
+    def test_missing_flag_touches_nothing(self):
+        self._run(priority=0)
+        self.assertEqual(self.sent, [{"priority": 0}],
+                         "дедлайн ушёл в запрос, хотя его не просили менять")
+
+    def test_both_fields_go_in_one_patch(self):
+        self._run(priority=0, deadline="2026-11-20")
+        self.assertEqual(self.sent, [{"priority": 0,
+                                      "deadline": "2026-11-20T12:00:00.000Z"}])
+
+    def test_nothing_to_change_is_refused_with_examples(self):
+        with quiet() as err, self.assertRaises(SystemExit):
+            self._run()
+        self.assertIn("нечего менять", err.getvalue())
+        self.assertIn("--deadline ''", err.getvalue())
+        self.assertEqual(self.sent, [])
+
+    def test_same_value_is_not_written_at_all(self):
+        """Запись «того же самого» не подтверждает ничего: поле равно ожидаемому
+        и до PATCH, то есть проверка перестала бы быть проверкой."""
+        out = self._run(priority=1, deadline="2026-10-15T15:00:00+03:00")
+        self.assertEqual(self.sent, [])
+        self.assertIn("уже", out)
+
+    def test_clearing_an_absent_deadline_writes_nothing(self):
+        self.task.pop("deadline")
+        out = self._run(deadline="")
+        self.assertEqual(self.sent, [])
+        self.assertIn("уже", out)
+
+    def test_broken_deadline_never_reaches_the_request(self):
+        with quiet(), self.assertRaises(SystemExit):
+            self._run(deadline="2026-02-30")
+        self.assertEqual(self.sent, [])

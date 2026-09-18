@@ -1003,6 +1003,60 @@ def parse_deadline(raw, field="--deadline"):
     return raw
 
 
+def deadline_instant(raw):
+    """Дедлайн как МОМЕНТ времени; `None` — пусто или не разбирается.
+
+    Сверять сохранённое строкой нельзя: одно и то же время записывается
+    по-разному (замер, api.md: в базе живут формы с 6, 3 и 0 знаками дробной
+    части). Сегодня сервер отдаёт строку байт в байт как прислана — проверено
+    на живом API, `+03:00` вернулся `+03:00`, — но подтверждение правки обязано
+    переживать нормализацию зоны, иначе безобидное `18:00+03:00` -> `15:00Z`
+    выглядело бы как «поле не изменилось» и роняло команду на ровном месте.
+    """
+    hit = _ISO_DT_RE.match((raw or "").strip())
+    if not hit:
+        return None
+    y, m, d, hh, mm, ss, frac, zone = hit.groups()
+    try:
+        moment = datetime.datetime(int(y), int(m), int(d), int(hh), int(mm),
+                                   int(ss or 0),
+                                   int(float(frac or 0) * 1_000_000))
+    except ValueError:
+        return None
+    if zone.upper() == "Z":
+        shift = datetime.timedelta(0)
+    else:
+        sign = -1 if zone[0] == "-" else 1
+        shift = sign * datetime.timedelta(hours=int(zone[1:3]),
+                                          minutes=int(zone[-2:]))
+    return moment.replace(tzinfo=datetime.timezone.utc) - shift
+
+
+def field_applied(name, task, want):
+    """Поле задачи в трекере уже равно тому, что мы хотим записать?
+
+    Сверка по СМЫСЛУ поля, а не по «== из словаря»: у приоритета отсутствие
+    значения означает «обычный» (`prio_of`), у дедлайна сравниваются моменты
+    времени, а не строки.
+    """
+    if name == "priority":
+        return prio_of(task) == int(want)
+    if name == "deadline":
+        return deadline_instant(task.get("deadline")) == deadline_instant(want)
+    return task.get(name) == want
+
+
+def field_show(name, value):
+    """Значение поля так, как его читает человек."""
+    if name == "priority":
+        return prio_label(int(value)) if value is not None else "—"
+    return value or "—"
+
+
+# Имена полей в выводе — человеческие, в теле запроса — те, что понимает API.
+FIELD_TITLES = {"priority": "приоритет", "deadline": "дедлайн"}
+
+
 def project_groups(project_id):
     """Секции проекта. У каждого проекта есть безымянная fake-группа — она не секция."""
     return [g for g in paged("/task-group", "taskGroups", {"parent": project_id})
@@ -1047,10 +1101,19 @@ def plain(s):
     return _LINK_RE.sub(r"\1", s or "")
 
 
+PRIORITY_NAMES = {0: "высокий", 1: "обычный", 2: "низкий"}
+
+
+def prio_label(p):
+    """Метка приоритета для человека. «!» у высокого — чтобы он был виден в списке."""
+    name = PRIORITY_NAMES.get(p, "?")
+    return "!" + name if p == 0 else name
+
+
 def brief(t, extra=""):
-    prio = {0: "!высокий", 1: "обычный", 2: "низкий"}.get(prio_of(t), "?")
     dl = f" дедлайн={t['deadline'][:10]}" if t.get("deadline") else ""
-    return f"{t['id']}  [{prio}]{dl}  {plain(t.get('title', ''))}{extra}"
+    return (f"{t['id']}  [{prio_label(prio_of(t))}]{dl}  "
+            f"{plain(t.get('title', ''))}{extra}")
 
 
 # --------------------------------------------------------------------------- команды
@@ -2138,6 +2201,17 @@ def cmd_add(args):
         die(f"{tid}: СОЗДАНА, но осталась без колонки (сеть не дала привязать).\n"
             f"  задача существует, повторный add сделает дубль — почини её:\n"
             f"    sing.py move {tid} {args.column}")
+    # Сервер в ответе на POST отдаёт созданный объект — это готовое свидетельство
+    # того, что поле он взял, и стоит оно ноль лишних запросов. Молча проглоченный
+    # `priority`/`deadline` выглядел бы как успех: задача создана, поле пустое.
+    # Не `die`: задача уже существует, ронять команду здесь значит толкать на
+    # повторный add и дубль. Поэтому — предупреждение и готовая починка.
+    dropped = [k for k in ("priority", "deadline")
+               if k in body and not field_applied(k, t, body[k])]
+    if dropped:
+        fix = " ".join(f"--{k} '{body[k]}'" for k in dropped)
+        print(f"  ⚠ трекер не взял {', '.join(FIELD_TITLES[k] for k in dropped)} — "
+              f"дописать: sing.py set {tid} {fix}")
     print(f"{tid}: создана в колонке '{args.column}' — {args.title}")
 
 
@@ -2216,6 +2290,106 @@ def cmd_rename(args):
     print(f"{args.id}: переименована\n  было:  {old}\n  стало: {saved}"
           + ("\n  ⚠ трекер сохранил не то, что отправлено — показан сохранённый"
              if saved.strip() != new else ""))
+
+
+def set_task_fields(task_id, fields, task=None):
+    """Записать поля задачи ОДНИМ PATCH и подтвердить ПЕРЕЧИТЫВАНИЕМ.
+
+    Возвращает `(было, стало)` — словарь прежних значений и свежую задачу.
+    Поле не применилось за отведённые перечитывания — `die`: этот API умеет
+    ответить `200`, ничего не сделав (AGENTS.md §4), и докладывать об успехе по
+    коду ответа нельзя. Одно немедленное чтение при этом не отличает «ещё не
+    применил» от «не применил» — различает только время, отсюда тот же цикл с
+    паузой, что у `rename_task()` и `set_task_tags()`.
+
+    PATCH с лишним полем легко стирает состояние задачи, поэтому то, чего
+    правка касаться не должна, сверяется до и после.
+    """
+    task = task or request("GET", f"/task/{task_id}")
+    watched = ("title", "checked", "journalDate", "complete", "projectId")
+
+    def snapshot(t):
+        state = {k: t.get(k) for k in watched}
+        state["tags"] = sorted(t.get("tags") or [])
+        return state
+
+    before_guard = snapshot(task)
+    before = {k: task.get(k) for k in fields}
+    request("PATCH", f"/task/{task_id}", body=fields)
+
+    fresh = None
+    for attempt in range(1, TAG_SETTLE_TRIES + 1):
+        fresh = request("GET", f"/task/{task_id}")
+        missed = [k for k, v in fields.items() if not field_applied(k, fresh, v)]
+        if not missed:
+            break
+        if attempt < TAG_SETTLE_TRIES:
+            time.sleep(TAG_SETTLE_PAUSE)
+    else:
+        lines = "\n".join(
+            f"    {FIELD_TITLES.get(k, k)}: просили {field_show(k, fields[k])}, "
+            f"в трекере {field_show(k, (fresh or {}).get(k))}" for k in missed)
+        die(f"{task_id}: правка не применилась за {TAG_SETTLE_TRIES} "
+            f"перечитываний ({TAG_SETTLE_PAUSE * (TAG_SETTLE_TRIES - 1):.0f} с):\n"
+            f"{lines}\n"
+            "  Сервер ответил успехом, но поле не изменилось. Это уже не лаг "
+            "синхронизации: проверь задачу в трекере.")
+
+    touched = [k for k, v in snapshot(fresh).items() if before_guard[k] != v]
+    if touched:
+        die(f"{task_id}: правка задела лишнее — {', '.join(touched)}.\n"
+            f"  было { {k: before_guard[k] for k in touched} }, "
+            f"стало { {k: snapshot(fresh)[k] for k in touched} }.\n"
+            "  Меняться должны только названные поля.")
+    return before, fresh
+
+
+def cmd_set(args):
+    """Сменить приоритет и/или дедлайн у СУЩЕСТВУЮЩЕЙ задачи.
+
+    До этой команды `--priority`/`--deadline` были только у `add`, то есть поля
+    задавались один раз при создании и больше не менялись. На живой сессии
+    шесть карточек оказались принятыми рисками, а понизить им приоритет было
+    нечем: либо руками в приложении, либо пересоздавать карточку — а это потеря
+    id, тегов `agent:*` и истории отчётов (T-62ba2372).
+    """
+    cfg, _ = load_config(required=False)
+    task = assert_task_allowed(args.id, cfg)
+
+    fields = {}
+    if args.priority is not None:
+        fields["priority"] = args.priority
+    # `is None` против пустой строки — это не придирка: «не трогать» и «снять»
+    # обязаны различаться. `--deadline ''` пишет null, отсутствие флага не
+    # отправляет поле вовсе.
+    if args.deadline is not None:
+        fields["deadline"] = parse_deadline(args.deadline)
+    if not fields:
+        die(f"{args.id}: нечего менять — нужен --priority и/или --deadline.\n"
+            "  sing.py set <id> --priority 0            # 0=высокий, 1=обычный, 2=низкий\n"
+            "  sing.py set <id> --deadline 2026-10-15\n"
+            "  sing.py set <id> --deadline ''           # снять дедлайн")
+
+    def value_of(t, k):
+        """Приоритета может не быть в задаче вовсе, и это «обычный», а не пусто."""
+        return prio_of(t) if k == "priority" else t.get(k)
+
+    # Уже такое значение — не пишем вовсе. Иначе подтверждение перечитыванием
+    # ничего не подтверждает: «поле равно ожидаемому» было бы верно и до PATCH.
+    already = [k for k, v in fields.items() if field_applied(k, task, v)]
+    todo = {k: v for k, v in fields.items() if k not in already}
+    for k in already:
+        print(f"{args.id}: {FIELD_TITLES[k]} уже {field_show(k, value_of(task, k))}"
+              " — не трогаю")
+    if not todo:
+        print(f"  {task_link(args.id)}")
+        return
+
+    _, fresh = set_task_fields(args.id, todo, task)
+    for k in todo:
+        print(f"{args.id}: {FIELD_TITLES[k]} {field_show(k, value_of(task, k))}"
+              f" -> {field_show(k, value_of(fresh, k))}")
+    print(f"  {task_link(args.id)}")
 
 
 def cmd_rm(args):
@@ -2588,6 +2762,14 @@ def main():
     sp.add_argument("id")
     sp.add_argument("title")
     sp.set_defaults(fn=cmd_rename)
+
+    sp = sub.add_parser("set", help="сменить приоритет и/или дедлайн у существующей задачи")
+    sp.add_argument("id")
+    sp.add_argument("--priority", type=int, choices=[0, 1, 2],
+                    help="0=высокий, 1=обычный, 2=низкий")
+    sp.add_argument("--deadline",
+                    help=DEADLINE_HELP + "; пустая строка '' — снять дедлайн")
+    sp.set_defaults(fn=cmd_set)
 
     sp = sub.add_parser("rm", help="удалить задачу (уборка за собой)")
     sp.add_argument("id")

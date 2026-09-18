@@ -230,6 +230,76 @@ class AddTest(LiveBase):
                          "задача всё-таки создалась")
 
 
+class SetFieldsTest(LiveBase):
+    """`--priority`/`--deadline` были только у `add`: у созданной карточки эти поля
+    из CLI не менялись, и понизить приоритет можно было либо руками в приложении,
+    либо пересозданием — с потерей id, тегов `agent:*` и истории (T-62ba2372).
+
+    Проверяется ФАКТОМ: поле перечитывается из трекера. Ответ `200` тут ничего не
+    доказывает — на системных колонках этот же API так и делает."""
+
+    def field(self, task_id, name):
+        return self.sing.request("GET", f"/task/{task_id}").get(name)
+
+    def test_priority_changes_on_an_existing_task(self):
+        tid = self.make_task("zz: приоритет существующей задачи")
+        out = self.cli("set", tid, "--priority", "0").stdout
+        self.assertIn("приоритет", out)
+        self.assertEqual(self.field(tid, "priority"), 0,
+                         "приоритет не записался, а команда не упала")
+        line = next(s for s in self.cli("list").stdout.splitlines() if tid in s)
+        self.assertIn("[!высокий]", line, "доска показывает прежний приоритет")
+        # то же значение второй раз не пишется вовсе: подтверждать перечитыванием
+        # там нечего, поле равно ожидаемому и до запроса
+        self.assertIn("уже", self.cli("set", tid, "--priority", "0").stdout)
+        # и обратно: не разовый эффект, а нормальная правка
+        self.cli("set", tid, "--priority", "2")
+        self.assertEqual(self.field(tid, "priority"), 2)
+
+    def test_deadline_is_set_and_then_cleared(self):
+        """Снятие дедлайна обязано отличаться от «не трогать»: `--deadline ''`
+        пишет null, отсутствие флага не отправляет поле вовсе."""
+        tid = self.make_task("zz: дедлайн существующей задачи")
+        self.cli("set", tid, "--deadline", "2026-10-15")
+        self.assertEqual((self.field(tid, "deadline") or "")[:10], "2026-10-15")
+
+        # правка соседнего поля дедлайн не трогает
+        self.cli("set", tid, "--priority", "0")
+        self.assertEqual((self.field(tid, "deadline") or "")[:10], "2026-10-15",
+                         "дедлайн уехал вместе с приоритетом")
+
+        self.cli("set", tid, "--deadline", "")
+        self.assertFalse(self.field(tid, "deadline"),
+                         "дедлайн не снялся, а команда отчиталась успехом")
+        self.assertEqual(self.field(tid, "priority"), 0,
+                         "снятие дедлайна задело приоритет")
+
+    def test_set_keeps_the_task_intact(self):
+        """PATCH с лишним полем стирает состояние. Взятая в работу задача обязана
+        остаться взятой: тег держателя, колонка и заметка на месте."""
+        tid = self.make_task("zz: правка не ломает задачу")
+        self.cli("start", tid, "--plan", "проверяю правку полей")
+        self.cli("set", tid, "--priority", "0", "--deadline", "2026-10-15")
+        self.assertEqual(self.agent_tags(tid), [f"agent:{AGENT}"])
+        self.assertEqual(self.column_of(tid), "wip")
+        self.assertIn(f"ПЛАН (agent:{AGENT})", self.note_of(tid))
+
+    def test_refusals_do_not_touch_the_task(self):
+        """Отказ обязан быть локальным: ни дампа ответа API, ни половинчатой
+        правки. Обе ветки на одной задаче — живой прогон и так упирается в
+        rate limit, лишняя пара запросов здесь дороже отдельного теста."""
+        tid = self.make_task("zz: отказы правки полей")
+        p = self.cli("set", tid, expect=1)
+        self.assertIn("нечего менять", p.stderr)
+
+        p = self.cli("set", tid, "--deadline", "завтра", expect=1)
+        self.assertIn("--deadline", p.stderr)
+        self.assertNotIn("HTTP 400", p.stderr, "наружу утёк ответ API")
+        self.assertFalse(self.field(tid, "deadline"))
+        self.assertEqual(self.field(tid, "priority") or 1, 1,
+                         "отказ всё-таки что-то записал")
+
+
 class CycleTest(LiveBase):
 
     def test_full_cycle_start_report_done(self):
