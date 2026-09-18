@@ -684,6 +684,50 @@ def _body_ops(text):
     return ops
 
 
+# Порог «стены» в символах. 400 — не круглое число из головы: замер по живым
+# карточкам проекта (tools/note-format-audit.py, снапшот 2026-09-19) дал 76 записей
+# агентов, из них 68 (89%) без единого маркера списка и 38 (50%) — сплошным абзацем
+# длиннее 400 символов в ОДНУ строку, медиана РЕЗУЛЬТАТа 1205 символов. Ниже этого
+# порога записи в выборке читаются и без списка.
+WALL_CHARS = 400
+
+
+def wall_warning(text, what="запись"):
+    """Предупреждение, если текст уедет в карточку стеной. Иначе None.
+
+    Стена — абзац длиннее WALL_CHARS, в котором нет ни одной строки списка.
+    Проверяется САМЫЙ ДЛИННЫЙ абзац, а не вся длина: отчёт из шести строк по
+    сто символов читается, а один абзац на шестьсот — нет.
+
+    Намеренно предупреждение, а не отказ: агент в середине работы не должен
+    упираться в гейт из-за косметики — потерянная команда дороже некрасивой
+    карточки. Но и молчать нельзя: правило, которое негде увидеть в момент
+    записи, вспоминается уже после того, как стена уехала на доску.
+    """
+    body = (text or "").strip()
+    if not body:
+        return None
+    lines = body.split("\n")
+    if any(line.lstrip()[:2] in ("- ", "* ") for line in lines):
+        return None
+    longest = max(len(line.strip()) for line in lines)
+    if longest <= WALL_CHARS:
+        return None
+    return (f"⚠ в карточку ушла стена ({what}): абзац {longest} символов, "
+            "ни одной строки списка.\n"
+            "  Первая строка — итог одной фразой, дальше факты с числами, "
+            "каждый с новой строки и с «- »:\n"
+            "  скилл превращает такие строки в маркированный список, а сплошной "
+            "абзац человек у доски не читает.")
+
+
+def warn_wall(text, what="запись"):
+    """Напечатать предупреждение о стене, если оно есть. Никогда не роняет команду."""
+    msg = wall_warning(text, what)
+    if msg:
+        print(msg)
+
+
 def note_append(note, text, label=None):
     """Дописать абзац, приведя заметку к формату, который понимает приложение.
 
@@ -1914,7 +1958,10 @@ def cmd_start(args):
     task = assert_task_allowed(args.id, cfg)
     if not args.plan and not args.no_plan:
         die(f"{args.id}: нужен план — что собираешься сделать, в двух-трёх пунктах.\n"
-            f"  sing.py start {args.id} --plan \"...\"\n"
+            f"  sing.py start {args.id} --plan \"итог одной фразой\n"
+            "- шаг с проверяемым признаком\n"
+            "- шаг с проверяемым признаком\"\n"
+            "Пункты с новой строки и с «- » — в карточке это маркированный список.\n"
             "Задача на одно движение и планировать нечего — явно: --no-plan.")
     # Захват — первым действием: проигравший гонку не должен успеть подвинуть доску.
     who = claim_task(args.id, cfg, args.agent, take_over=args.take_over)
@@ -1927,6 +1974,8 @@ def cmd_start(args):
                                           label=f"ПЛАН ({AGENT_TAG_PREFIX}{who})")})
     print(f"{args.id}: {res} (в работе), тег {AGENT_TAG_PREFIX}{who}"
           + (", план записан" if args.plan else ", без плана"))
+    if args.plan:
+        warn_wall(args.plan, "план")
 
 
 def cmd_release(args):
@@ -1958,6 +2007,7 @@ def cmd_report(args):
             body={"note": note_append(t.get("note"), args.text)})
     mark_agent(args.id, cfg, getattr(args, "agent", None))
     print(f"{args.id}: отчёт дописан в заметку")
+    warn_wall(args.text, "запись")
 
 
 def cmd_done(args):
@@ -1965,7 +2015,12 @@ def cmd_done(args):
     task = assert_task_allowed(args.id, cfg)
     if not args.report and not args.no_report:
         die(f"{args.id}: нужен результат — что сделано, чем проверено, каким коммитом.\n"
-            f"  sing.py done {args.id} --report \"...\"\n"
+            f"  sing.py done {args.id} --report \"итог одной фразой\n"
+            "- что изменено: файл, поведение\n"
+            "- чем проверено: числа, а не «ок»\n"
+            "- коммит: <хеш>\"\n"
+            "Факты — отдельными строками с «- »: в карточке это маркированный список,\n"
+            "а сплошной абзац человек у доски не читает.\n"
             "Карточка без результата бесполезна: через неделю неясно, что именно закрыли.\n"
             "Совсем нечего написать — явно: --no-report.")
     # Обязательность плана держалась только со стороны `start`, и обойти её было
@@ -1991,6 +2046,8 @@ def cmd_done(args):
         request("POST", f"/task/{args.id}/complete")
     print(f"{args.id}: {'отправлена на проверку' if args.review else 'закрыта'}\n"
           f"  {task_link(args.id)}")
+    if args.report:
+        warn_wall(args.report, "результат")
 
 
 def cmd_block(args):
@@ -2002,6 +2059,7 @@ def cmd_block(args):
     move_to_column(args.id, col_id(cfg, "blocked"), project_id=cfg["projectId"])
     print(f"{args.id}: заблокирована, причина записана в заметку\n"
           f"  {task_link(args.id)}")
+    warn_wall(args.reason, "причина блокировки")
 
 
 def same_title(a, b):
@@ -2068,6 +2126,8 @@ def cmd_add(args):
             f"  задача существует, повторный add сделает дубль — почини её:\n"
             f"    sing.py move {tid} {args.column}")
     print(f"{tid}: создана в колонке '{args.column}' — {args.title}")
+    if args.note:
+        warn_wall(args.note, "постановка")
 
 
 def cmd_move(args):

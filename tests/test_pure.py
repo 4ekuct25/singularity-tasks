@@ -104,6 +104,64 @@ class NoteDeltaTest(unittest.TestCase):
         self.assertIn("привет", sing.note_dump([{"insert": "привет"}]))
 
 
+class WallWarningTest(unittest.TestCase):
+    """Стена в карточке: длинный абзац без единой строки списка.
+
+    Замер по живым карточкам проекта (tools/note-format-audit.py, снапшот
+    2026-09-19): 68 из 76 записей агентов без маркеров, 38 из 76 — сплошным
+    абзацем. Предупреждение обязано краснеть ровно на таких и молчать на
+    нормально оформленных, иначе его перестанут читать.
+    """
+
+    WALL = "факт про замер, " * 40          # ~640 символов, одна строка
+    # Каждая строка списка сама длиннее порога: иначе проверка проходила бы по
+    # длине, не задев ветку «есть маркер», и сломанный разбор маркеров не ловила.
+    LIST = ("итог одной фразой\n"
+            + "- " + "факт с числом, " * 40 + "\n"
+            + "- " + "ещё факт, " * 40)
+
+    def test_long_single_paragraph_warns(self):
+        msg = sing.wall_warning(self.WALL, "результат")
+        self.assertIsNotNone(msg)
+        self.assertIn("результат", msg)
+        self.assertIn(str(len(self.WALL.strip())), msg)
+
+    def test_bulleted_text_is_silent_even_when_long(self):
+        self.assertGreater(len(self.LIST), sing.WALL_CHARS)
+        self.assertIsNone(sing.wall_warning(self.LIST))
+
+    def test_star_bullet_counts_too(self):
+        self.assertIsNone(sing.wall_warning("итог\n* " + "факт, " * 100))
+
+    def test_short_text_is_silent(self):
+        self.assertIsNone(sing.wall_warning("починено, тесты 19/19"))
+        self.assertIsNone(sing.wall_warning(""))
+        self.assertIsNone(sing.wall_warning(None))
+
+    def test_measures_longest_paragraph_not_total_length(self):
+        """Шесть коротких строк — не стена, хотя сумма больше порога.
+
+        Порог на сумме ругался бы на нормально разбитый отчёт, и предупреждение
+        стало бы фоном.
+        """
+        many_short = "\n".join(["строка отчёта с числом 42, коротко"] * 20)
+        self.assertGreater(len(many_short), sing.WALL_CHARS)
+        self.assertIsNone(sing.wall_warning(many_short))
+
+    def test_warning_is_printed_not_raised(self):
+        """Предупреждение не роняет команду: гейт в середине работы дороже
+        некрасивой карточки."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sing.warn_wall(self.WALL, "план")
+        self.assertIn("стена", out.getvalue())
+        self.assertIn("план", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sing.warn_wall("коротко")
+        self.assertEqual("", out.getvalue())
+
+
 # --------------------------------------------------------------------- заголовки
 
 
