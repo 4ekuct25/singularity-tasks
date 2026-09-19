@@ -710,6 +710,39 @@ class FreshProjectKanbanTest(LiveBase):
             set(cols), expected,
             "состав колонок в базе приложения разошёлся с тем, что завёл init")
 
+    def test_fresh_project_columns_stand_in_role_order(self):
+        """Пять колонок свежего проекта идут todo → wip → review → done → blocked,
+        и ни у двух ролей не совпадает `kanbanOrder`.
+
+        Проверка на свежем проекте, а не на общем черновике, потому что дефект
+        живёт только здесь: у созданного через API проекта системные колонки
+        имеют порядок 1 / 2 / 3, и прежняя формула «середина между wip и done»
+        давала `(2 + 3) // 2 = 2` — то же значение, что у «В работе». Замер
+        доски, разложенной прежним кодом: 1 / 2 / 2 / 3 / 50003, «На проверке»
+        стояла ПЕРЕД «В работе». На давно живущем проекте (порядки 0 / 89583 /
+        94791 / 100000) не воспроизводится вовсе — поэтому проверять надо тут.
+
+        Судим по перечитанному состоянию: POST и PATCH этого API отвечают `200`
+        эхом того, что им дали, и дробный `kanbanOrder` принимают, молча усекая
+        (7,5 → 7).
+        """
+        self._init()
+        with open(os.path.join(self.dir, ".agents", "singularity.json")) as f:
+            columns = json.load(f)["columns"]
+        board = [s for s in self.sing.project_statuses(self.fresh["id"])
+                 if not s.get("removed")]
+        by_id = {s["id"]: s for s in board}
+        seq = [(role, by_id[columns[role]].get("kanbanOrder") or 0,
+                by_id[columns[role]].get("name"))
+               for role in self.sing.COLUMN_ORDER]
+        shown = ", ".join(f"{r}:{o} «{n}»" for r, o, n in seq)
+        orders = [o for _, o, _ in seq]
+        self.assertEqual(len(set(orders)), 5, f"порядки колонок совпадают — {shown}")
+        self.assertEqual(orders, sorted(orders), f"роли идут не по порядку — {shown}")
+        self.assertEqual(
+            self.sing.column_order_problems(columns, board), [],
+            f"порядок колонок нарушен — {shown}")
+
     def test_second_init_changes_nothing(self):
         """Повторный `init --apply` не должен добирать доску второй раз."""
         self._init()

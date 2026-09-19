@@ -75,6 +75,13 @@ SYSTEM_SUFFIX = {"todo": "-TODO", "wip": "-IN-PROGRESS", "done": "-DONE"}
 COLUMN_ORDER_HINT = {"todo": 0, "wip": 50000, "review": 75000,
                      "done": 100000, "blocked": 150000}
 
+# Шаг, которым колонка отодвигается от левого соседа, когда середины между
+# соседями не существует. Тем же шагом двигаются те, кому не хватило места
+# справа (см. plan_column_orders). Число крупное намеренно: после раздвижки
+# между соседями снова есть куда вставить колонку, и следующий `init` ничего
+# не двигает.
+COLUMN_ORDER_GAP = 50000
+
 
 AGENT_TAG_PREFIX = "agent:"
 
@@ -308,15 +315,89 @@ def add_task_tag(task_id, tag_id):
     return set_task_tags(task_id, add=[tag_id])
 
 
-def desired_order(role, mapping, statuses):
-    """review — между wip и done, blocked — после done, по живым значениям."""
-    order = {s["id"]: (s.get("kanbanOrder") or 0) for s in statuses}
-    wip, done = order.get(mapping.get("wip")), order.get(mapping.get("done"))
-    if role == "review" and wip is not None and done is not None:
-        return (wip + done) // 2
-    if role == "blocked" and done is not None:
-        return done + 50000
-    return COLUMN_ORDER_HINT.get(role, 0)
+def plan_column_orders(mapping, statuses, to_create):
+    """Раскладка `kanbanOrder` пяти ролей: куда поставить новые колонки и кого
+    подвинуть, чтобы роли шли todo → wip → review → done → blocked.
+
+    Возвращает `(orders, moves)`: `orders` — {роль: kanbanOrder} для ролей из
+    `to_create`, `moves` — [(id колонки, новый kanbanOrder)] для уже живущих
+    колонок, которым иначе не хватило бы места справа. Функция чистая: никуда
+    не ходит, применяет результат вызывающий.
+
+    ⚠️ Середины между соседями может не быть. `kanbanOrder` — **целое** поле:
+    дробное значение API принимает с `200` и даже возвращает его в ответе на
+    PATCH, но при перечитывании оно усечено (замер: 7,5 → 7; 7,4 → 7). Поэтому
+    «поставить посередине» работает только там, где между соседями есть целое
+    число, а у свежего проекта системные колонки идут 1 / 2 / 3 — между «В
+    работе» (2) и «Готово» (3) места нет вовсе, и прежняя формула
+    `(wip + done) // 2` давала ровно порядок «В работе»: колонка «На проверке»
+    вставала ПЕРЕД ней.
+
+    Значит, единственный способ — раздвигать соседей, а не искать несуществующую
+    середину. Двигать их можно: PATCH `kanbanOrder` применяется и к СИСТЕМНЫМ
+    колонкам (замер на живом проекте: «В работе» 2 → 50000, перечитано фактом).
+
+    Колонки вне пяти ролей (чужие, заведённые человеком) не трогаются и в
+    раскладке не участвуют: скилл отвечает за порядок своих ролей, а не за всю
+    доску.
+    """
+    live = {s["id"]: (s.get("kanbanOrder") or 0) for s in statuses}
+    # слот роли: живая колонка с её порядком, создаваемая колонка (None) — либо
+    # роли в раскладке нет вовсе (её колонка не живёт и не создаётся сейчас:
+    # в такую дырку ставить нечего, и место под неё не резервируется).
+    slots = []
+    for role in COLUMN_ORDER:
+        cid = mapping.get(role)
+        if cid is not None and role not in to_create and cid in live:
+            slots.append((role, cid, live[cid]))
+        elif role in to_create:
+            slots.append((role, None, None))
+
+    orders, moves = {}, []
+    prev = None  # порядок предыдущей роли — уже с учётом сделанных сдвигов
+    for i, (role, cid, order) in enumerate(slots):
+        if cid is None:
+            if prev is None:
+                # соседей слева нет вовсе (ни одной живой роли) — фиксированная подсказка
+                value = COLUMN_ORDER_HINT.get(role, 0)
+            else:
+                nxt = next((o for _, c, o in slots[i + 1:] if c is not None), None)
+                if nxt is not None and nxt - prev >= 2:
+                    value = (prev + nxt) // 2     # место есть — встаём посередине
+                else:
+                    value = prev + COLUMN_ORDER_GAP   # места нет — раздвигаем правых
+            orders[role] = value
+            prev = value
+        elif prev is not None and order <= prev:
+            value = prev + COLUMN_ORDER_GAP
+            moves.append((cid, value))
+            prev = value
+        else:
+            prev = order
+    return orders, moves
+
+
+def column_order_problems(mapping, statuses):
+    """Чем доска не соответствует контракту: роли строго по возрастанию порядка.
+
+    Проверка факта, а не кода ответа (AGENTS.md §4): и POST, и PATCH на этом API
+    отвечают `200` с тем телом, что им дали, поэтому судить о порядке можно
+    только по перечитанному состоянию.
+    """
+    live = {s["id"]: s for s in statuses if not s.get("removed")}
+    problems, prev = [], None
+    for role in COLUMN_ORDER:
+        cid = mapping.get(role)
+        col = live.get(cid)
+        if not col:
+            continue
+        order = col.get("kanbanOrder") or 0
+        if prev is not None and order <= prev[1]:
+            problems.append(
+                f"роль {role} «{col.get('name')}» стоит {order}, "
+                f"а {prev[0]} — {prev[1]}: {'то же место' if order == prev[1] else 'левее'}")
+        prev = (role, max(order, prev[1]) if prev else order)
+    return problems
 
 
 def system_status_id(project_id, role):
@@ -1732,8 +1813,8 @@ def cmd_doctor(args):
         return
     print(f"✓ привязка: {path}")
     print(f"  проект: {cfg.get('projectTitle')} ({cfg['projectId']})")
-    live = {s["id"]: s["name"] for s in project_statuses(cfg["projectId"])
-            if not s.get("removed")}
+    statuses = [s for s in project_statuses(cfg["projectId"]) if not s.get("removed")]
+    live = {s["id"]: s["name"] for s in statuses}
     for role in COLUMN_ORDER:
         cid = (cfg.get("columns") or {}).get(role)
         # Два разных диагноза, и путать их дорого: «пропала в трекере» отправляет
@@ -1770,6 +1851,16 @@ def cmd_doctor(args):
                 print(f"      одинаковое имя «{name}»: {cid}{mark}")
         print("      системные колонки удалить нельзя — чинится переездом задач на "
               "них и удалением своих (см. README, раздел про раздвоенную доску).")
+    # Порядок колонок виден только по числам: имена на доске те же, а роли идут
+    # не подряд. Доски, разложенные прежними версиями скилла на свежем проекте,
+    # живут именно так — «На проверке» стоит на месте «В работе».
+    order_problems = column_order_problems(cfg.get("columns") or {}, statuses)
+    if order_problems:
+        print("  ⚠ порядок колонок нарушен: роли идут не todo → wip → review → done → blocked.")
+        for p in order_problems:
+            print(f"      {p}")
+        print("      чинится повторным init --apply: он раздвигает соседей "
+              f"шагом {COLUMN_ORDER_GAP} и ставит роли по порядку.")
     if getattr(args, "write", False):
         doctor_write(cfg)
 
@@ -2232,13 +2323,31 @@ def cmd_init(args):
                                           args.own_columns, lines)
         for line in lines:
             print("  · " + line)
-    fresh = project_statuses(target["id"])
+    fresh = [s for s in project_statuses(target["id"]) if not s.get("removed")]
+    live_names = {s["id"]: s.get("name") for s in fresh}
+    orders, moves = plan_column_orders(mapping, fresh, [r for r, _ in to_create])
+    # Сначала раздвинуть, потом вставлять: иначе новая колонка на мгновение
+    # встаёт на чужое место, и доска в приложении успевает это показать.
+    for cid, order in moves:
+        request("PATCH", f"/kanban-status/{cid}", body={"kanbanOrder": order})
+        print(f"подвинута колонка «{live_names.get(cid, cid)}» -> порядок {order}")
     for role, want in to_create:
         st = request("POST", "/kanban-status",
                      body={"name": want, "projectId": target["id"],
-                           "kanbanOrder": desired_order(role, mapping, fresh)})
+                           "kanbanOrder": orders.get(role, COLUMN_ORDER_HINT.get(role, 0))})
         mapping[role] = st["id"]
         print(f"создана колонка «{want}» -> {st['id']}")
+
+    # Перечитать и сверить: этот API отвечает `200` и эхом того, что ему дали,
+    # даже когда записал другое (дробный `kanbanOrder` — ровно такой случай).
+    if moves or to_create:
+        problems = column_order_problems(mapping, project_statuses(target["id"]))
+        if problems:
+            die("Порядок колонок на доске не тот, что записывался:\n"
+                + "".join(f"  · {p}\n" for p in problems)
+                + "  Колонки созданы, но привязка НЕ записана — на доске роли идут не по\n"
+                  "  порядку todo → wip → review → done → blocked. Проверь проект в\n"
+                  "  трекере и повтори init: он двигает колонки повторно.")
 
     cfg = {
         "projectId": target["id"],

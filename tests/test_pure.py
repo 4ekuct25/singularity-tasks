@@ -515,15 +515,81 @@ class ColumnTest(unittest.TestCase):
         self.assertIsNone(sing.system_status_id("P-x", "review"))
         self.assertIsNone(sing.system_status_id("P-x", "blocked"))
 
-    def test_desired_order_uses_live_neighbours(self):
+    def test_column_orders_use_live_neighbours(self):
+        """Соседи далеко — новые колонки встают между ними, двигать некого."""
         mapping = {"wip": "KS-W", "done": "KS-D"}
         statuses = [{"id": "KS-W", "kanbanOrder": 40000},
                     {"id": "KS-D", "kanbanOrder": 90000}]
-        self.assertEqual(sing.desired_order("review", mapping, statuses), 65000)
-        self.assertEqual(sing.desired_order("blocked", mapping, statuses), 140000)
+        orders, moves = sing.plan_column_orders(mapping, statuses, ["review", "blocked"])
+        self.assertEqual(orders["review"], 65000)
+        self.assertEqual(orders["blocked"], 140000)
+        self.assertEqual(moves, [])
         # соседей не видно — откат на фиксированную подсказку
-        self.assertEqual(sing.desired_order("review", {}, []),
-                         sing.COLUMN_ORDER_HINT["review"])
+        orders, moves = sing.plan_column_orders({}, [], ["review"])
+        self.assertEqual(orders["review"], sing.COLUMN_ORDER_HINT["review"])
+        self.assertEqual(moves, [])
+
+    def test_column_orders_make_room_when_neighbours_are_adjacent(self):
+        """Свежий проект: системные колонки 1 / 2 / 3, середины между 2 и 3 нет.
+
+        Прежняя формула `(wip + done) // 2` давала здесь 2 — ровно порядок «В
+        работе», и «На проверке» вставала ПЕРЕД ней (замер на живом свежем
+        проекте: 1 / 2 / 2 / 3 / 50003). Целого между соседями не существует,
+        дробное поле не хранит, поэтому правым соседям надо освободить место.
+        """
+        mapping = {"todo": "KS-T", "wip": "KS-W", "done": "KS-D"}
+        statuses = [{"id": "KS-T", "kanbanOrder": 1},
+                    {"id": "KS-W", "kanbanOrder": 2},
+                    {"id": "KS-D", "kanbanOrder": 3}]
+        orders, moves = sing.plan_column_orders(mapping, statuses, ["review", "blocked"])
+        gap = sing.COLUMN_ORDER_GAP
+        self.assertEqual(orders["review"], 2 + gap)
+        self.assertEqual(moves, [("KS-D", 2 + 2 * gap)], "«Готово» обязано уступить место")
+        self.assertEqual(orders["blocked"], 2 + 3 * gap)
+        # результат — строго возрастающая последовательность без совпадений
+        final = [1, 2, orders["review"], 2 + 2 * gap, orders["blocked"]]
+        self.assertEqual(final, sorted(set(final)), f"порядки совпали: {final}")
+
+    def test_column_orders_repair_a_board_already_broken(self):
+        """Доска, разложенная прежней версией: review стоит там же, где wip.
+
+        `init` по такой доске проходит повторно (колонки переиспользуются), и
+        раскладка обязана её починить, а не оставить как есть.
+        """
+        mapping = {"todo": "KS-T", "wip": "KS-W", "review": "KS-R",
+                   "done": "KS-D", "blocked": "KS-B"}
+        statuses = [{"id": "KS-T", "kanbanOrder": 1}, {"id": "KS-W", "kanbanOrder": 2},
+                    {"id": "KS-R", "kanbanOrder": 2}, {"id": "KS-D", "kanbanOrder": 3},
+                    {"id": "KS-B", "kanbanOrder": 50003}]
+        orders, moves = sing.plan_column_orders(mapping, statuses, [])
+        gap = sing.COLUMN_ORDER_GAP
+        self.assertEqual(orders, {})
+        # «Заблокировано» стояло на 50003 — после сдвига «Готово» оно оказалось
+        # левее него, и едет следом: сдвиг соседа тянет за собой всех правых.
+        self.assertEqual(moves, [("KS-R", 2 + gap), ("KS-D", 2 + 2 * gap),
+                                 ("KS-B", 2 + 3 * gap)])
+
+    def test_column_orders_leave_a_healthy_board_alone(self):
+        """Идемпотентность: по разложенной доске второй проход не двигает ничего."""
+        mapping = {"todo": "KS-T", "wip": "KS-W", "review": "KS-R",
+                   "done": "KS-D", "blocked": "KS-B"}
+        statuses = [{"id": "KS-T", "kanbanOrder": 1}, {"id": "KS-W", "kanbanOrder": 2},
+                    {"id": "KS-R", "kanbanOrder": 50002},
+                    {"id": "KS-D", "kanbanOrder": 100002},
+                    {"id": "KS-B", "kanbanOrder": 150002}]
+        self.assertEqual(sing.plan_column_orders(mapping, statuses, []), ({}, []))
+
+    def test_column_order_problems_sees_a_tie_and_keeps_quiet_on_a_good_board(self):
+        mapping = {"todo": "KS-T", "wip": "KS-W", "review": "KS-R", "done": "KS-D"}
+        tie = [{"id": "KS-T", "kanbanOrder": 1}, {"id": "KS-W", "kanbanOrder": 2},
+               {"id": "KS-R", "kanbanOrder": 2}, {"id": "KS-D", "kanbanOrder": 3}]
+        problems = sing.column_order_problems(mapping, tie)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("review", problems[0])
+        self.assertIn("то же место", problems[0])
+        good = [{"id": "KS-T", "kanbanOrder": 1}, {"id": "KS-W", "kanbanOrder": 2},
+                {"id": "KS-R", "kanbanOrder": 50002}, {"id": "KS-D", "kanbanOrder": 100002}]
+        self.assertEqual(sing.column_order_problems(mapping, good), [])
 
     def test_col_id_refuses_missing_role(self):
         with quiet() as err, self.assertRaises(SystemExit):
