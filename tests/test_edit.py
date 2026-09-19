@@ -134,6 +134,12 @@ class TrackerStub(BaseHTTPRequestHandler):
         if path == "/task":
             items = [t for t in STATE["tasks"].values()
                      if not q.get("projectId") or t["projectId"] == q["projectId"][0]]
+            # Как живой сервер: задачи с `journalDate` (дневник, он же архив) из
+            # выборки выпадают, пока их не попросили флагом (api.md). Без этого
+            # заглушка отдавала бы дневник всем подряд, и проверка «команда
+            # взяла выборку С дневником» зеленела бы на любой выборке.
+            if (q.get("includeArchived") or ["false"])[0] != "true":
+                items = [t for t in items if not t.get("journalDate")]
             return self._page("tasks", items, q)
         if path == "/project":
             return self._page("projects", PROJECTS, q)
@@ -712,6 +718,109 @@ class SeriesInstanceDateTest(EditBase):
         STATE["tasks"][self.tid]["start"] = support.utc_of_local(
             datetime.date.today())
         self.assertIn(self.tid, self.cli("next", "--group", "Раздел B").stdout)
+
+
+class DupCheckTest(EditBase):
+    """`add` против уже СДЕЛАННОЙ работы (T-cf565316).
+
+    Двойник искался по `open_tasks()` — среди незакрытых. Закрытая задача с тем
+    же заголовком не всплывала (а приложение вдобавок уносит её в дневник, и
+    сервер без флага её не отдаёт), поэтому агент заводил сделанное заново, а
+    отказ на открытого двойника писал «уже открыта».
+
+    Здесь проверяется целиком та развилка, ради которой правка и делалась:
+    открытый двойник — отказ, закрытый — предупреждение И созданная задача,
+    экземпляр серии — молчание. Порознь любая половина доказывает не то: «нет
+    предупреждения» одинаково выглядит и у починенного молчания на серии, и у
+    сломанной проверки.
+    """
+
+    ARCHIVED = "уже сделано и в дневнике"
+    CLOSED = "уже сделано, дневник ещё не прошёл"
+    SERIES = "Выполнить ротацию логов проекта"
+
+    def setUp(self):
+        super().setUp()
+        # закрыта и унесена в дневник: сервер отдаёт её только по includeArchived
+        STATE["tasks"]["T-arch"] = {
+            "id": "T-arch", "title": self.ARCHIVED, "projectId": PROJ,
+            "group": SEC_A, "checked": 1, "complete": 0, "priority": 1,
+            "parent": "", "note": NOTE, "tags": [],
+            "journalDate": support.utc_of_local(datetime.date(2026, 9, 14), 10)}
+        # закрыта, но проход архивации ещё не случился (на живой доске таких 15
+        # из 55): `checked` есть, `journalDate` нет — второе поле не заменяет первое
+        STATE["tasks"]["T-closed"] = {
+            "id": "T-closed", "title": self.CLOSED, "projectId": PROJ,
+            "group": SEC_A, "checked": 1, "complete": 0, "priority": 1,
+            "parent": "", "note": NOTE, "tags": [], "journalDate": None,
+            "modificatedDate": str(int(
+                datetime.datetime(2026, 9, 18, 15, 0).timestamp() * 1000))}
+        # экземпляр серии: закрыт, в дневнике и совпадает по заголовку со всеми
+        # предыдущими экземплярами — по устройству серии, а не по ошибке
+        STATE["tasks"]["T-серия-20260917"] = {
+            "id": "T-серия-20260917", "title": self.SERIES, "projectId": PROJ,
+            "group": SEC_B, "checked": 1, "complete": 0, "priority": 1,
+            "parent": "", "note": NOTE, "tags": [],
+            "journalDate": support.utc_of_local(datetime.date(2026, 9, 17), 10),
+            "recurrenceGeneratorId": "T-серия"}
+        STATE["links"]["T-arch"] = COLS["done"]
+        STATE["links"]["T-closed"] = COLS["done"]
+
+    def created(self, title):
+        return [t for t in STATE["tasks"].values()
+                if t["title"] == title and t["id"].startswith("T-new")]
+
+    def add(self, title, *extra, code=0):
+        return self.cli("add", title, "--note", "постановка", *extra, code=code)
+
+    def test_the_stub_hides_the_journal_unless_asked(self):
+        """Контроль самой проверки: если заглушка отдаёт дневник и без флага,
+        «команда нашла закрытого двойника» не доказывает ровно ничего."""
+        import urllib.request
+        plain = json.loads(urllib.request.urlopen(
+            f"{self.api}/task?projectId={PROJ}&maxCount=200").read())["tasks"]
+        withal = json.loads(urllib.request.urlopen(
+            f"{self.api}/task?projectId={PROJ}&maxCount=200"
+            "&includeArchived=true").read())["tasks"]
+        self.assertNotIn("T-arch", [t["id"] for t in plain])
+        self.assertIn("T-arch", [t["id"] for t in withal])
+
+    def test_a_task_closed_and_archived_warns_but_is_created(self):
+        out = self.add(self.ARCHIVED).stdout
+        self.assertIn("уже делали и закрыли", out,
+                      "закрытый двойник снова невидим — это и был дефект")
+        self.assertIn("T-arch", out)
+        self.assertIn("в дневнике с 2026-09-14", out)
+        self.assertIn("https://", out, "без ссылки предупреждение не проверить")
+        self.assertEqual(len(self.created(self.ARCHIVED)), 1,
+                         "предупреждение не должно мешать созданию")
+
+    def test_a_task_closed_but_not_yet_archived_is_found_too(self):
+        """«Закрыто» — это `checked` ИЛИ `journalDate`: поле только одно из двух,
+        и проверка по любому одному теряет половину случаев."""
+        out = self.add(self.CLOSED).stdout
+        self.assertIn("T-closed", out)
+        self.assertIn("последняя правка 2026-09-18", out)
+        self.assertEqual(len(self.created(self.CLOSED)), 1)
+
+    def test_an_open_twin_is_still_a_refusal(self):
+        p = self.add("вне секций", code=1)
+        self.assertIn("уже открыта", p.stderr)
+        self.assertIn("T-loose", p.stderr)
+        self.assertEqual(self.created("вне секций"), [],
+                         "отказ обязан быть ДО создания")
+
+    def test_a_closed_instance_of_a_series_says_nothing(self):
+        out = self.add(self.SERIES).stdout
+        self.assertNotIn("уже делали и закрыли", out,
+                         "предупреждение на каждом экземпляре серии приучает "
+                         "его игнорировать")
+        self.assertEqual(len(self.created(self.SERIES)), 1)
+
+    def test_dup_ok_silences_the_warning_as_well(self):
+        out = self.add(self.ARCHIVED, "--dup-ok").stdout
+        self.assertNotIn("уже делали и закрыли", out)
+        self.assertEqual(len(self.created(self.ARCHIVED)), 1)
 
 
 if __name__ == "__main__":

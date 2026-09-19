@@ -189,6 +189,79 @@ class TitleTest(unittest.TestCase):
         self.assertTrue(sing.same_title(None, ""))
 
 
+class DupTwinsTest(unittest.TestCase):
+    """Кого `add` считает двойником (T-cf565316).
+
+    До этой правки двойник искался только среди открытых задач: уже сделанную
+    работу агент заводил заново, а отказ писал «уже открыта». Разделение на
+    «открытые — отказ» и «закрытые — предупреждение» и есть поведение, поэтому
+    оно проверяется отдельно от команды.
+    """
+
+    OPEN = {"id": "T-open", "title": "Починить X", "checked": 0}
+    DONE = {"id": "T-done", "title": "починить  X", "checked": 1}
+    # закрытие и дневник — РАЗНЫЕ состояния: архив проекта уносит и незакрытое
+    ARCHIVED_UNCHECKED = {"id": "T-arch", "title": "Починить X", "checked": 0,
+                          "journalDate": "2026-09-13T23:15:30.158Z"}
+
+    def test_open_twin_and_closed_twin_land_in_different_baskets(self):
+        opened, done = sing.dup_twins(
+            [self.OPEN, self.DONE, {"id": "T-other", "title": "Другое"}],
+            "починить x")
+        self.assertEqual([t["id"] for t in opened], ["T-open"])
+        self.assertEqual([t["id"] for t in done], ["T-done"])
+
+    def test_archived_without_checked_counts_as_closed(self):
+        """`journalDate` без `checked` — не открытая задача: в очередь её не
+        вернуть, и предлагать «продолжи её» бессмысленно."""
+        opened, done = sing.dup_twins([self.ARCHIVED_UNCHECKED], "Починить X")
+        self.assertEqual(opened, [])
+        self.assertEqual([t["id"] for t in done], ["T-arch"])
+
+    def test_recurring_instances_are_not_closed_twins(self):
+        """Экземпляр серии совпадает по заголовку ВСЕГДА — предупреждение на
+        каждом приучает его игнорировать. На живой доске все три группы
+        одинаковых заголовков — это серии."""
+        pool = [{"id": "T-gen-20260917", "title": "Ротация логов", "checked": 1,
+                 "journalDate": "2026-09-17T21:00:00.000Z",
+                 "recurrenceGeneratorId": "T-gen"},
+                {"id": "T-gen", "title": "Ротация логов", "checked": 1,
+                 "recurrence": {"type": "daily"}}]
+        opened, done = sing.dup_twins(pool, "Ротация логов")
+        self.assertEqual((opened, done), ([], []))
+
+    def test_open_instance_of_a_series_is_still_an_open_twin(self):
+        """Открытый экземпляр уже стоит на доске — заводить его заново незачем,
+        и прежний отказ здесь остаётся правильным ответом."""
+        opened, done = sing.dup_twins(
+            [{"id": "T-gen-20260921", "title": "Ротация логов", "checked": 0,
+              "recurrenceGeneratorId": "T-gen"}], "Ротация логов")
+        self.assertEqual([t["id"] for t in opened], ["T-gen-20260921"])
+        self.assertEqual(done, [])
+
+
+class ClosedMarkTest(unittest.TestCase):
+    """Даты закрытия у задачи нет ни одной (api.md): `complete`=0,
+    `completeLast`=null у всех 55 закрытых живой доски. Поэтому фраза обязана
+    называть источник даты, а не выдавать её за дату закрытия."""
+
+    def test_journal_date_is_shown_as_the_journal_date(self):
+        day = support.utc_of_local(datetime.date(2026, 9, 14), 10)
+        self.assertEqual(sing.closed_mark({"journalDate": day}),
+                         "в дневнике с 2026-09-14")
+
+    def test_without_journal_falls_back_to_the_last_edit(self):
+        """`modificatedDate` — epoch МС строкой, а не ISO: срез строки и
+        `local_date()` дали бы здесь мусор."""
+        stamp = datetime.datetime(2026, 9, 18, 15, 0).timestamp()
+        self.assertEqual(sing.closed_mark({"modificatedDate": str(int(stamp * 1000))}),
+                         "последняя правка 2026-09-18")
+
+    def test_no_dates_at_all_says_so(self):
+        self.assertEqual(sing.closed_mark({"id": "T-x"}),
+                         "когда закрыта — трекер не говорит")
+
+
 # --------------------------------------------------------------------- доска
 
 
