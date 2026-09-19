@@ -656,6 +656,60 @@ class FreshProjectKanbanTest(LiveBase):
         self.assertEqual(twins, [], f"доска раздвоилась: {names}")
         self.assertEqual(len(board), 5, f"колонок {len(board)}, а ролей пять: {names}")
 
+    def test_the_app_adds_no_columns_of_its_own_after_sync(self):
+        """Вторая половина критерия: доска не раздваивается ПОСЛЕ того, как до
+        проекта дошла синхронизация приложения.
+
+        API на этот вопрос не свидетель: он показывает ровно то, что записал сам
+        скилл. Свидетель локальный и независимый — журнал живой базы приложения
+        (что оно записало у себя) и его лог синхронизации (что оно получило и что
+        отдало в облако). Оба читаются `tools/watch-app-columns.py`, только на
+        чтение.
+
+        Замер, из-за которого проверка устроена так (19.09.2026): приложение
+        забрало проект через 7 с после `POST /project` — само, без открытия
+        проекта в интерфейсе и без переключения режима. Поэтому ждать здесь
+        секунды, а не «пока человек откроет».
+
+        Проверка ПРОПУСКАЕТСЯ, а не краснеет, если приложения на машине нет, оно
+        не запущено или за отведённое время до проекта не дошло: это состояние
+        машины, а не дефект скилла, и зелёный прогон, ничего не проверивший,
+        дороже честного пропуска с числом.
+        """
+        watch = support.load_tool("watch-app-columns.py")
+        if not os.path.isdir(watch.LEVELDB_DIR):
+            self.skipTest("приложения SingularityApp на этой машине нет")
+
+        self._init()
+        pid = self.fresh["id"]
+        expected = {f"KS-{pid}{s}" for s in self.sing.SYSTEM_SUFFIX.values()}
+        with open(os.path.join(self.dir, ".agents", "singularity.json")) as f:
+            expected |= set(json.load(f)["columns"].values())
+        self.assertEqual(len(expected), 5, "init завёл не пять колонок")
+
+        deadline, checks, cols = time.time() + 90, 0, {}
+        while time.time() < deadline:
+            checks += 1
+            try:
+                _, cols, _ = watch.wal_columns(pid)
+            except OSError as exc:                       # база под своим замком
+                self.skipTest(f"живая база приложения не читается: {exc}")
+            if len(cols) >= len(expected):
+                break
+            time.sleep(5)
+        if len(cols) < len(expected):
+            self.skipTest(
+                f"за 90 с и {checks} проверок приложение записало у себя "
+                f"{len(cols)} колонок проекта из {len(expected)} — "
+                "синхронизация до него не дошла, судить о тёзках не по чему")
+
+        names = [v[0] for v in cols.values()]
+        twins = sorted({n for n in names if names.count(n) > 1})
+        self.assertEqual(twins, [], f"приложение добавило колонки-тёзки: {names}")
+        self.assertEqual(
+            set(cols), expected,
+            "состав колонок в базе приложения разошёлся с тем, что завёл init")
+
     def test_second_init_changes_nothing(self):
         """Повторный `init --apply` не должен добирать доску второй раз."""
         self._init()
