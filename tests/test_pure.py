@@ -1934,6 +1934,88 @@ class EnvRefusalTest(unittest.TestCase):
         text = ("FAIL: test_full_cycle_start_report_done\n"
                 "AssertionError: 'wip' != 'done'\n")
         self.assertEqual(self.runner.env_refusals(text), [])
+
+
+class UnconfirmedWriteVerdictTest(unittest.TestCase):
+    """Отставшая очередь трекера выглядит как регрессия — и наоборот.
+
+    Замер 19.09 (T-0c7531ce): живой прогон упал на `test_block_records_the_reason`
+    строкой «правка тегов не применилась за 4 перечитываний», `429` в логе ноль,
+    повтор класса в изоляции 3 из 3 зелёных, следующий полный прогон 41 зелёный.
+    По прежнему классификатору это падение было неотличимо от регрессии.
+
+    Но тем же текстом сообщает о себе настоящий дефект: `change-column` отвечает
+    `200` и не меняет связку — именно так его и поймали. Поэтому проверок здесь
+    две в обе стороны: на одиночном объекте вердикт есть и он развилка, а не
+    причина; на нескольких объектах (так выглядит сломанное подтверждение)
+    классификатор обязан молчать.
+    """
+
+    runner = support.load_module("run_verdict",
+                                 os.path.join(support.HERE, "run.py"))
+
+    # дословный кусок живого лога падения, только id заменён на другой реальный
+    LAG = ("FAIL: test_block_records_the_reason (test_live.BlockTest)\n"
+           "AssertionError: 1 != 0 : sing.py block T-9f2b1c0a-4d55-4f3e-8c21-7b6e0d1a2f34"
+           " -> код 1\nstdout: \nstderr: "
+           "T-9f2b1c0a-4d55-4f3e-8c21-7b6e0d1a2f34: правка тегов не применилась за 4 "
+           "перечитываний (3 с) — у задачи теги ['TG-a'], ожидались ['TG-b'].\n"
+           "  Это уже не лаг синхронизации. Метки задачи не изменились так, как "
+           "ожидалось: проверь её в трекере.\n"
+           "FAILED (failures=1)\n")
+
+    def test_a_single_stuck_object_is_named_as_a_fork_not_as_a_cause(self):
+        found = self.runner.env_refusals(self.LAG)
+        self.assertEqual(len(found), 1, "одиночное неподтверждение не названо вовсе")
+        why, n = found[0]
+        self.assertEqual(n, 1)
+        self.assertIn("похоже", why, "вердикт звучит как установленная причина")
+        self.assertIn("дефект", why, "вердикт снимает подозрение с дефекта")
+        self.assertIn("в изоляции", why, "вердикт не говорит, чем разрешить развилку")
+        # «отказ трекера» — формула ДРУГОГО класса, где причину сказал сам
+        # сервер. Здесь её нет ни в каком виде: иначе развилка на слух
+        # превращается в приговор среде, и повторять никто не пойдёт.
+        self.assertNotIn("отказ трекера", why)
+
+    def test_the_same_object_twice_is_still_one_incident(self):
+        """Один отказ печатается дважды: из `die()` и в тексте упавшей проверки.
+        Считаются объекты, иначе один и тот же лаг выглядел бы серией."""
+        found = self.runner.env_refusals(self.LAG + self.LAG)
+        self.assertEqual([n for _, n in found], [2])
+
+    def test_several_stuck_objects_are_not_blamed_on_the_queue(self):
+        """Сломанное подтверждение валит подряд всё, что идёт тем же путём.
+        Списать такое на среду — прикрыть ровно тот класс дефектов, ради
+        которого циклы подтверждения и писались."""
+        text = "".join(
+            f"T-{i}c3d4e5f-1111-2222-3333-444455556666: правка не применилась за 4 "
+            f"перечитываний (3 с):\n    приоритет: просили 1, в трекере 2\n"
+            for i in "abc")
+        self.assertEqual(self.runner.env_refusals(text), [])
+
+    def test_the_suites_own_stub_line_is_not_evidence(self):
+        """⚠ Замер: ЗЕЛЁНЫЙ прогон `fast` печатает эту строку сам — в нём
+        проверяется die-ветка `rename_task` на заглушке. Без гейта на форму id
+        классификатор ловил бы собственный набор и объявлял отставшую очередь на
+        любом красном `fast`."""
+        text = ("T-1: заголовок не применился за 4 перечитываний (0 с) — "
+                "в трекере по-прежнему «старый».\n"
+                "  Это уже не лаг синхронизации: проверь задачу в трекере.\n"
+                "FAIL: test_something_else\nAssertionError: 'a' != 'b'\n")
+        self.assertEqual(self.runner.env_refusals(text), [])
+
+    def test_every_mark_is_a_literal_from_the_source(self):
+        """Формулировки взяты из кода, а не по памяти, и обязаны там остаться:
+        переписали сообщение в `die()` — краснеет этот тест, а не следующий
+        живой прогон, который молча перестал бы узнавать свой же отказ."""
+        sources = ""
+        for path in (support.SING, os.path.join(support.TOOLS, "zz-project.py")):
+            with open(path, encoding="utf-8") as f:
+                sources += f.read()
+        for mark in self.runner.SETTLE_MARKS:
+            self.assertIn(mark, sources,
+                          f"формулировки «{mark}» в коде больше нет — "
+                          "классификатор ловит текст, которого никто не печатает")
 # ------------------------------------------------------- токен: Keychain vs sandbox
 
 
