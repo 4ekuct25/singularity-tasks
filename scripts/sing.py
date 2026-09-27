@@ -837,6 +837,13 @@ PAGE_SIZE = 200          # окно одного запроса
 PAGE_HARD_CAP = 50000    # предохранитель: сервер, игнорирующий offset, не должен крутить вечно
 
 
+# Недоборы выборки за этот процесс: (путь, обещано, собрано). Строка в stderr
+# годится человеку, но команде, сводящей несколько выборок в одну таблицу
+# (`ready`), нужно ЗНАТЬ, какая строка таблицы построена на неполных данных, —
+# иначе недобор по одному проекту молча превращается в «готовых задач нет».
+UNDERFILLED = []
+
+
 def paged(path, key, query=None, limit=None, page=PAGE_SIZE):
     """Собрать ВСЕ страницы списка.
 
@@ -894,6 +901,7 @@ def paged(path, key, query=None, limit=None, page=PAGE_SIZE):
                 "Прерываю, чтобы не крутить вечно.")
     if limit is None and total is not None and len(items) < total:
         # молчаливый недобор — ровно та ошибка, из-за которой правилась эта функция
+        UNDERFILLED.append((path, total, len(items)))
         print(f"⚠ GET {path}: сервер обещал {total} объектов, собрано {len(items)}. "
               "Выборка неполная — выводы по ней делать нельзя.", file=sys.stderr)
     return items
@@ -1495,7 +1503,7 @@ def open_tasks(project_id):
     return [t for t in live_tasks(project_id) if int(t.get("checked") or 0) == 0]
 
 
-def column_map(project_id):
+def column_map(project_id, statuses=None, links=None):
     """taskId -> statusId для проекта.
 
     Запрос на колонку давал 8 обращений на пятиколоночной доске (`board` — 12
@@ -1503,10 +1511,17 @@ def column_map(project_id):
     заходом (проверено: 46 штук, из них 8 этого проекта), и мы отбираем свои по
     statusId. ⚠️ `?projectId=` он НЕ поддерживает: возвращает пустой список, а не
     отказ, — фильтр, которого нет, выглядит как «связок нет».
+
+    statuses/links — уже полученные колонки проекта и связки аккаунта. Раз
+    связки общие на аккаунт, команде, обходящей несколько проектов (`ready`),
+    незачем тянуть их заново на каждый: один запрос вместо N.
     """
-    mine = {s["id"] for s in project_statuses(project_id)}
+    statuses = project_statuses(project_id) if statuses is None else statuses
+    links = (paged("/kanban-task-status", "kanbanTaskStatuses", {})
+             if links is None else links)
+    mine = {s["id"] for s in statuses}
     return {link["taskId"]: link["statusId"]
-            for link in paged("/kanban-task-status", "kanbanTaskStatuses", {})
+            for link in links
             if not link.get("removed") and link.get("statusId") in mine}
 
 
@@ -2965,9 +2980,23 @@ def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False,
     cid = col_id(cfg, role)
     cmap = column_map(cfg["projectId"])
     source = board_tasks(cfg["projectId"]) if include_done else open_tasks(cfg["projectId"])
+    gid = resolve_group(cfg["projectId"], group) if group else None
+    return pool_from(source, cmap, cfg, cid, gid=gid, ready_only=ready_only,
+                     reasons=reasons, children=children)
+
+
+def pool_from(source, cmap, cfg, cid, gid=None, ready_only=False,
+              reasons=None, children=None):
+    """Очередь колонки из УЖЕ полученной выборки — без единого запроса.
+
+    Вынесено из `_pick_pool`, чтобы «готова к взятию» считалась в одном месте:
+    её читают и `next` (один проект), и `ready` (все проекты области). Свой
+    фильтр в `ready` однажды разошёлся бы с очередью — а ровно так и ошибался
+    ручной обход досок до этой команды: отсеивал отодвинутые, но не закрытые,
+    и выдавал задачу из дневника за готовую.
+    """
     pool = [t for t in source if effective_column(t, cmap, cfg) == cid]
-    if group:
-        gid = resolve_group(cfg["projectId"], group)
+    if gid:
         pool = [t for t in pool if t.get("group") == gid]
     # «Ждёт подзадачу» считается только по живым подзадачам: унесённая в дневник
     # закрыта и никого не держит, а по checked её не отличить — приложение
@@ -2983,9 +3012,12 @@ def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False,
     if ready_only:
         pool = [t for t in pool
                 if not not_ready_reason(t, open_children=kids.get(t["id"], 0))]
-    return sorted(pool, key=lambda t: (prio_of(t),
-                                       t.get("deadline") or "9999",
-                                       t.get("createdDate") or ""))
+    return sorted(pool, key=queue_key)
+
+
+def queue_key(t):
+    """Порядок очереди: приоритет -> дедлайн -> возраст. Один на `next` и `ready`."""
+    return (prio_of(t), t.get("deadline") or "9999", t.get("createdDate") or "")
 
 
 def cmd_groups(args):
@@ -3224,6 +3256,175 @@ def cmd_next(args):
     print_checklist(checklist_items(t["id"]))
     print(f"\n  {task_link(t['id'])}"
           f"\nВзять в работу: sing.py start {t['id']} --plan \"...\"")
+
+
+# Причина «пока брать нельзя» -> короткий вид для сводки. Текст причины один
+# (not_ready_reason), здесь он только группируется: «начало 2026-09-28» и
+# «начало 2026-10-05» — одна и та же причина с разными датами.
+HELD_KINDS = (("начало", "с датой начала"), ("отложена", "отложены"),
+              ("повторяющаяся", "шаблоны серий"), ("ждёт подзадач", "ждут подзадач"))
+
+
+def held_kind(reason):
+    return next((label for prefix, label in HELD_KINDS if reason.startswith(prefix)),
+                reason)
+
+
+def ready_board(project, cfg, links):
+    """Одна строка сводки `ready`: готовые к взятию и чем занята остальная доска.
+
+    Готовность — ровно та же, что у `next` (pool_from поверх открытых задач),
+    поэтому первая задача проекта здесь и `next` в его репозитории совпадают.
+    Запросов на проект два: колонки и задачи; связки приходят снаружи, они
+    общие на аккаунт.
+    """
+    pid = project["id"]
+    before = len(UNDERFILLED)
+    statuses = project_statuses(pid)
+    columns = (cfg or {}).get("columns") or project_columns(pid, statuses)
+    pcfg = {"projectId": pid, "columns": columns}
+    cmap = column_map(pid, statuses=statuses, links=links)
+    tasks = board_tasks(pid)
+    row = {"id": pid, "title": project.get("title", ""), "bound": bool(cfg),
+           "complete": len(UNDERFILLED) == before, "hasQueue": "todo" in columns,
+           "unboundRoles": [r for r in COLUMN_ORDER if r not in columns],
+           "counts": {}, "queue": 0, "held": {}, "nextStart": None,
+           "ready": [], "kids": {},
+           "todoName": next((x.get("name") for x in statuses
+                             if x["id"] == columns.get("todo")), None)}
+    for role in ("wip", "review", "blocked"):
+        if role in columns:
+            row["counts"][role] = sum(1 for t in tasks
+                                      if effective_column(t, cmap, pcfg) == columns[role])
+    if "todo" not in columns:
+        return row
+    live = [t for t in tasks
+            if not t.get("journalDate") and int(t.get("checked") or 0) == 0]
+    reasons, kids = {}, {}
+    queue = pool_from(live, cmap, pcfg, columns["todo"], reasons=reasons, children=kids)
+    row["queue"] = len(queue)
+    row["kids"] = kids
+    row["ready"] = [t for t in queue if t["id"] not in reasons]
+    for r in reasons.values():
+        kind = held_kind(r)
+        row["held"][kind] = row["held"].get(kind, 0) + 1
+    starts = [local_date(t.get("start")) for t in queue
+              if reasons.get(t["id"], "").startswith("начало")]
+    row["nextStart"] = min(starts) if starts else None
+    return row
+
+
+def cmd_ready(args):
+    """Где есть что брать: готовые к взятию задачи по всем подпроектам области.
+
+    Раньше на этот вопрос отвечали обходом `board --project` по каждому проекту
+    и разбором его вывода — и дважды ошиблись: разбор отсеивал отодвинутые, но
+    не закрытые (задача из дневника вышла «готовой»), а дедлайн читал срезом
+    UTC. Здесь фильтр общий с `next` (pool_from), а недобор выборки не
+    пропадает в stderr, а помечает строку сводки.
+    """
+    projects = all_projects()
+    scope = sorted(projects_in_scope(projects), key=lambda x: x.get("title", ""))
+    archived = [p for p in scope if p.get("journalDate")]
+    scope = [p for p in scope if not p.get("journalDate")]
+    bound, _ = load_config(required=False, check_scope=False)
+    bound_id = (bound or {}).get("projectId")
+
+    before = len(UNDERFILLED)
+    links = paged("/kanban-task-status", "kanbanTaskStatuses", {})
+    links_complete = len(UNDERFILLED) == before
+    rows, failed = [], []
+    for p in scope:
+        try:
+            row = ready_board(p, bound if p["id"] == bound_id else None, links)
+        except SystemExit:
+            # Отказ по одному проекту не должен съедать сводку по остальным. Текст
+            # отказа die() уже напечатал в stderr; здесь только строка на месте
+            # проекта, чтобы он не пропал из таблицы молча.
+            failed.append(p)
+            rows.append({"id": p["id"], "title": p.get("title", ""),
+                         "bound": p["id"] == bound_id, "error": True})
+            continue
+        row["complete"] = row["complete"] and links_complete
+        rows.append(row)
+
+    ok = [r for r in rows if not r.get("error")]
+    total = sum(len(r["ready"]) for r in ok)
+    trusted = links_complete and not failed and all(r["complete"] for r in ok)
+
+    if args.json:
+        titles = tag_titles([t for r in ok for t in r["ready"]])
+        out = []
+        for r in rows:
+            if r.get("error"):
+                out.append({"id": r["id"], "title": r["title"], "bound": r["bound"],
+                            "error": True})
+                continue
+            gnames = group_titles(r["id"]) if r["ready"] else {}
+            out.append({
+                "id": r["id"], "title": r["title"], "bound": r["bound"],
+                "complete": r["complete"], "error": False,
+                "hasQueue": r["hasQueue"], "unboundRoles": r["unboundRoles"],
+                "queue": r["queue"], "readyCount": len(r["ready"]),
+                "held": r["held"], "nextStart": r["nextStart"],
+                "counts": r["counts"],
+                "ready": [task_json(t, role="todo", column_name=r["todoName"],
+                                    tags=task_tags(t, titles),
+                                    group_title=gnames.get(t.get("group")),
+                                    open_children=r["kids"].get(t["id"], 0))
+                          for t in r["ready"]]})
+        json_out({"total": total, "complete": trusted,
+                  "archivedSkipped": len(archived), "projects": out})
+        sys.exit(0 if trusted else 1)
+
+    with_ready = [r for r in ok if r["ready"]]
+    print(f"Готово к взятию: {total} на {len(with_ready)} из {len(scope)} досок "
+          f"(подпроекты «{ROOT_PROJECT_TITLE}»)")
+    if not links_complete:
+        print("⚠ НЕПОЛНАЯ ВЫБОРКА связок с колонками — колонки задач по всем "
+              "проектам могут быть неверны, числам ниже не верить.")
+
+    def tail(r):
+        """Хвост строки проекта: чем занята доска кроме очереди, и пометки."""
+        names = {"wip": "в работе", "review": "на проверке", "blocked": "заблокировано"}
+        busy = " · ".join(f"{names[k]} {n}" for k, n in r["counts"].items() if n)
+        # todo без колонки называется в самой строке — здесь только остальные роли
+        lost = [x for x in r["unboundRoles"] if x != "todo"]
+        parts = [x for x in (busy,
+                             "нет колонок: " + ", ".join(lost) if lost else "",
+                             "← этот репозиторий" if r["bound"] else "",
+                             "" if r["complete"] else "⚠ НЕПОЛНАЯ ВЫБОРКА") if x]
+        return "  (" + "; ".join(parts) + ")" if parts else ""
+
+    for r in with_ready:
+        print(f"\n{r['title']} — {len(r['ready'])}{tail(r)}")
+        for t in r["ready"][:args.limit]:
+            print("  " + brief(t))
+        if len(r["ready"]) > args.limit:
+            print(f"  … и ещё {len(r['ready']) - args.limit} (--limit)")
+
+    empty = [r for r in rows if r.get("error") or not r["ready"]]
+    if empty:
+        print("\nБез готовых:")
+        width = max(len(r["title"]) for r in empty)
+        for r in empty:
+            if r.get("error"):
+                why = "⚠ ОШИБКА чтения доски — причина выше в stderr"
+            elif not r["hasQueue"]:
+                why = "нет колонки очереди (роль todo) — очередь не определить"
+            elif not r["queue"]:
+                why = "очередь пуста"
+            else:
+                held = ", ".join(f"{k} {n}" for k, n in r["held"].items())
+                soon = f"; ближайшее начало {r['nextStart']}" if r["nextStart"] else ""
+                why = f"в очереди {r['queue']}, брать нельзя: {held}{soon}"
+            print(f"  {r['title']:<{width}}  {why}{'' if r.get('error') else tail(r)}")
+    if archived:
+        print(f"\nАрхивных подпроектов пропущено: {len(archived)}")
+    if not trusted:
+        print("\n⚠ Сводка неполная: см. пометки выше. Повторить команду — "
+              "недобор обычно разовый.", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_list(args):
@@ -4150,8 +4351,8 @@ def warn_if_skill_drifted(command):
 # чего вызывающий и читает машинный вывод. Остальные меняющие (`set`, `rename`,
 # `move`) флага не имеют: добавлять его надо тем же механизмом и вместе со строкой
 # здесь, а не вторым способом печатать JSON.
-JSON_COMMANDS = ("projects", "board", "next", "groups", "list", "show", "regroup",
-                 "notes")
+JSON_COMMANDS = ("projects", "board", "next", "ready", "groups", "list", "show",
+                 "regroup", "notes")
 
 JSON_HELP = ("машинный вывод: в stdout только JSON, предупреждения и подсказки — "
              "в stderr; формат объекта задачи одинаков во всех командах")
@@ -4209,6 +4410,13 @@ def build_parser():
     sp.add_argument("--group", help="брать только из секции (название или Q-id)")
     json_flag(sp)
     sp.set_defaults(fn=cmd_next)
+
+    sp = sub.add_parser("ready", help="готовые к взятию задачи по всем подпроектам "
+                                      "«" + ROOT_PROJECT_TITLE + "»")
+    sp.add_argument("--limit", type=int, default=10,
+                    help="сколько готовых показывать на проект")
+    json_flag(sp)
+    sp.set_defaults(fn=cmd_ready)
 
     sp = sub.add_parser("groups", help="секции проекта")
     sp.add_argument("--create", metavar="НАЗВАНИЕ", help="завести секцию")
