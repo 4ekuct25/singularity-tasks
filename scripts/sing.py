@@ -3270,6 +3270,34 @@ def held_kind(reason):
                 reason)
 
 
+def queue_breakdown(queue):
+    """Состав очереди по ПРОИСХОЖДЕНИЮ карточки — поле `queueBreakdown` у `ready`.
+
+    Другой разрез, чем `held`: `held` объясняет, почему карточку сейчас нельзя
+    взять, а breakdown — откуда она взялась. Предсгенерированные экземпляры
+    серий раздувают сырой счётчик (живой снимок 30.09: 79 = 60 экземпляров
+    еженедельной серии + 18 отдельных + 1 шаблон при готовых 2), и без
+    разбиения «очередь 79» читается как объём работы.
+
+    Классификация — по `references/api.md`: шаблон несёт `recurrence`
+    (проверяется `is not None`: пустой `{}` — тоже шаблон), экземпляр —
+    непустой `recurrenceGeneratorId` (у обычной задачи API отдаёт пустую
+    строку), всё остальное — отдельная карточка. Разбиение покрывает всю
+    очередь, включая готовые: экземпляр с наступившей датой остаётся
+    `seriesInstances` и может быть `ready` одновременно. Инвариант: сумма
+    трёх счётчиков — `len(queue)`.
+    """
+    counts = {"individual": 0, "seriesInstances": 0, "seriesTemplates": 0}
+    for t in queue:
+        if t.get("recurrence") is not None:
+            counts["seriesTemplates"] += 1
+        elif t.get("recurrenceGeneratorId"):
+            counts["seriesInstances"] += 1
+        else:
+            counts["individual"] += 1
+    return counts
+
+
 def ready_board(project, cfg, links):
     """Одна строка сводки `ready`: готовые к взятию и чем занята остальная доска.
 
@@ -3288,7 +3316,10 @@ def ready_board(project, cfg, links):
     row = {"id": pid, "title": project.get("title", ""), "bound": bool(cfg),
            "complete": len(UNDERFILLED) == before, "hasQueue": "todo" in columns,
            "unboundRoles": [r for r in COLUMN_ORDER if r not in columns],
-           "counts": {}, "queue": 0, "held": {}, "nextStart": None,
+           "counts": {}, "queue": 0,
+           "queueBreakdown": {"individual": 0, "seriesInstances": 0,
+                              "seriesTemplates": 0},
+           "held": {}, "nextStart": None,
            "ready": [], "kids": {},
            "todoName": next((x.get("name") for x in statuses
                              if x["id"] == columns.get("todo")), None)}
@@ -3303,6 +3334,7 @@ def ready_board(project, cfg, links):
     reasons, kids = {}, {}
     queue = pool_from(live, cmap, pcfg, columns["todo"], reasons=reasons, children=kids)
     row["queue"] = len(queue)
+    row["queueBreakdown"] = queue_breakdown(queue)
     row["kids"] = kids
     row["ready"] = [t for t in queue if t["id"] not in reasons]
     for r in reasons.values():
@@ -3365,7 +3397,9 @@ def cmd_ready(args):
                 "id": r["id"], "title": r["title"], "bound": r["bound"],
                 "complete": r["complete"], "error": False,
                 "hasQueue": r["hasQueue"], "unboundRoles": r["unboundRoles"],
-                "queue": r["queue"], "readyCount": len(r["ready"]),
+                "queue": r["queue"],
+                "queueBreakdown": r["queueBreakdown"],
+                "readyCount": len(r["ready"]),
                 "held": r["held"], "nextStart": r["nextStart"],
                 "counts": r["counts"],
                 "ready": [task_json(t, role="todo", column_name=r["todoName"],

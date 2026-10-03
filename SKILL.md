@@ -433,8 +433,16 @@ sing.py board --json                       # доска целиком, с бл�
 `show`/`next` добавляют к объекту `note`, `checklist` и `appUrl`; `board` и `groups`
 отдают структуру (колонки, `looseTasks`, `unboundRoles`, `unknownColumns`, секции),
 `list` и `projects` — массив. `ready` — сводка: `total`, `complete`, `archivedSkipped`
-и `projects[]` с `ready` (объекты задач), `queue`, `held`, `nextStart`, `counts`,
-`hasQueue`, `unboundRoles`, `complete`, `error`. Id в отчёте человеку по-прежнему не нужен — ему ссылка.
+и `projects[]` с `ready` (объекты задач), `queue`, `queueBreakdown`, `held`, `nextStart`,
+`counts`, `hasQueue`, `unboundRoles`, `complete`, `error`. `queueBreakdown` — состав
+очереди по происхождению: `individual` (обычные карточки), `seriesInstances`
+(предсгенерированные экземпляры серий, у них непустой `recurrenceGeneratorId`),
+`seriesTemplates` (шаблоны серий, у них `recurrence` — даже пустой `{}`); сумма всегда
+равна `queue`. Это другой разрез, чем `held`: `held` — почему нельзя взять,
+`queueBreakdown` — откуда взялась. Готовый экземпляр серии считается и в `ready`,
+и в `seriesInstances` (даты наступили — брать можно). Сырой `queue` раздувается
+предсгенерированными экземплярами: «очередь 79, готовых 2» — это 60 + 18 + 1, а не
+79 работ. Id в отчёте человеку по-прежнему не нужен — ему ссылка.
 
 **Даты можно писать короткой датой.** `--deadline 2026-10-15` и `--start 2026-10-01` скилл
 сам дополняет до `2026-10-15T12:00:00.000Z` — API берёт только полный ISO-8601 с явной

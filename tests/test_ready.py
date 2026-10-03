@@ -42,6 +42,7 @@ ROOT = "P-root"
 ALPHA, BETA, GAMMA = "P-alpha", "P-beta", "P-gamma"
 OUTSIDE, ARCHIVED = "P-outside", "P-archived"
 UNDER, BROKEN = "P-under", "P-broken"
+DELTA, EPSILON = "P-delta", "P-epsilon"
 
 
 def cols(pid, roles=("TODO", "IN-PROGRESS", "DONE")):
@@ -61,6 +62,8 @@ STATUSES = {
     ARCHIVED: cols(ARCHIVED),
     UNDER: cols(UNDER),
     ROOT: cols(ROOT),
+    DELTA: cols(DELTA),
+    EPSILON: cols(EPSILON),
 }
 
 
@@ -94,6 +97,27 @@ TASKS = [
     task("T-root", ROOT, "задача в самом корне"),
     task("T-arch", ARCHIVED, "в архивном подпроекте"),
     task("T-u", UNDER, "проект с недобором"),
+    # delta: живой снимок 30.09 — очередь, раздутая экземплярами серии:
+    # 79 = 60 экземпляров + 16 отдельных с датой + 2 готовые + 1 шаблон
+    task("T-d-tmpl", DELTA, "шаблон серии", recurrence={"type": "weekly"}),
+    task("T-d-ready-1", DELTA, "готовая отдельная 1"),
+    task("T-d-ready-2", DELTA, "готовая отдельная 2"),
+]
+TASKS += [task(f"T-d-inst-{i:02d}", DELTA, "экземпляр серии",
+               recurrenceGeneratorId="T-d-tmpl",
+               start="2999-01-01T09:00:00.000Z") for i in range(60)]
+TASKS += [task(f"T-d-ind-{i:02d}", DELTA, "отдельная с датой начала",
+               start="2999-01-01T09:00:00.000Z") for i in range(16)]
+# epsilon: границы классификации queueBreakdown
+TASKS += [
+    task("T-e-plain", EPSILON, "обычная (ключа нет)"),
+    task("T-e-gen-empty", EPSILON, "пустой генератор", recurrenceGeneratorId=""),
+    task("T-e-gen-none", EPSILON, "null-генератор", recurrenceGeneratorId=None),
+    task("T-e-tmpl-empty", EPSILON, "шаблон с пустым recurrence", recurrence={}),
+    task("T-e-inst-ready", EPSILON, "экземпляр с наступившей датой",
+         recurrenceGeneratorId="T-e-tmpl-empty", start="2020-01-01T09:00:00.000Z"),
+    task("T-e-inst-wip", EPSILON, "экземпляр в wip",
+         recurrenceGeneratorId="T-e-tmpl-empty"),
 ]
 LINKS = [
     {"id": "L1", "taskId": "T-a-plain", "statusId": f"KS-{ALPHA}-TODO"},
@@ -112,6 +136,8 @@ LINKS = [
     {"id": "L14", "taskId": "T-root", "statusId": f"KS-{ROOT}-TODO"},
     {"id": "L15", "taskId": "T-arch", "statusId": f"KS-{ARCHIVED}-TODO"},
     {"id": "L16", "taskId": "T-u", "statusId": f"KS-{UNDER}-TODO"},
+    # экземпляр в «В работе» — в состав очереди не входит
+    {"id": "L17", "taskId": "T-e-inst-wip", "statusId": f"KS-{EPSILON}-IN-PROGRESS"},
 ]
 BASE_PROJECTS = [
     {"id": ROOT, "title": "ИИ проекты"},
@@ -267,6 +293,47 @@ class ReadyTest(unittest.TestCase):
         a = self.project(self.ready_json(), ALPHA)
         self.assertEqual(a["counts"], {"wip": 1, "review": 1, "blocked": 1})
         self.assertEqual(a["queue"], 8)
+        self.assertEqual(a["queueBreakdown"], {"individual": 7, "seriesInstances": 0,
+                                               "seriesTemplates": 1})
+
+    def test_queue_breakdown_of_series_inflated_queue(self):
+        """Живой снимок 30.09: «очередь 79, готовых 2» — 79 = 60 + 18 + 1, и
+        готовые экземпляры считаются и в ready, и в серии, и в инвариант сходится."""
+        Stub.extra = [{"id": DELTA, "title": "delta", "parent": ROOT}]
+        d = self.project(self.ready_json(), DELTA)
+        self.assertEqual(d["queue"], 79)
+        self.assertEqual(d["queueBreakdown"], {"individual": 18, "seriesInstances": 60,
+                                               "seriesTemplates": 1})
+        self.assertEqual(sum(d["queueBreakdown"].values()), d["queue"])
+        self.assertEqual(d["readyCount"], 2)
+        self.assertEqual(self.ready_ids(self.ready_json(), DELTA),
+                         ["T-d-ready-1", "T-d-ready-2"])
+        self.assertEqual(d["held"], {"с датой начала": 76, "шаблоны серий": 1})
+        self.assertEqual(d["nextStart"], "2999-01-01")
+
+    def test_queue_breakdown_classification_edges(self):
+        """Границы: ключа нет / пустая строка / null — всё individual (по api.md:
+        приложение даёт пустую строку; истина — наличие ключа), пустой
+        recurrence={} — шаблон, экземпляр с наступившей датой — и в ready, и в серии,
+        экземпляр в wip — вне состава очереди."""
+        Stub.extra = [{"id": EPSILON, "title": "epsilon", "parent": ROOT}]
+        e = self.project(self.ready_json(), EPSILON)
+        self.assertEqual(e["queue"], 5)
+        self.assertEqual(e["queueBreakdown"], {"individual": 3, "seriesInstances": 1,
+                                               "seriesTemplates": 1})
+        self.assertEqual(e["readyCount"], 4)
+        self.assertEqual(self.ready_ids(self.ready_json(), EPSILON),
+                         ["T-e-plain", "T-e-gen-empty", "T-e-gen-none", "T-e-inst-ready"])
+        self.assertEqual(e["held"], {"шаблоны серий": 1})
+
+    def test_empty_queue_breakdown_is_zero(self):
+        data = self.ready_json()
+        self.assertEqual(self.project(data, BETA)["queueBreakdown"],
+                         {"individual": 0, "seriesInstances": 0, "seriesTemplates": 0})
+        g = self.project(data, GAMMA)
+        self.assertFalse(g["hasQueue"])
+        self.assertEqual(g["queueBreakdown"],
+                         {"individual": 0, "seriesInstances": 0, "seriesTemplates": 0})
 
     # ------------------------------------------------------------------- область
 

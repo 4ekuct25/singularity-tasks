@@ -585,6 +585,11 @@ sing.py add "Задача" --note "..." --deadline 2026-02-30
 
 Верхний уровень зависит от команды: `list` и `projects` — массив, `show` и `next` — один
 объект (плюс `note`, `checklist`, `appUrl`), `board`, `groups` и `ready` — структура.
+В сводке `ready` у каждого проекта есть `queueBreakdown` — состав очереди по
+происхождению: `individual` / `seriesInstances` (предсгенерированные экземпляры серий)
+/ `seriesTemplates` (шаблоны серий); сумма всегда равна `queue`. Сырой `queue`
+раздувается предсгенерированными экземплярами, и без разбиения «очередь 79, готовых 2»
+читается как 79 работ.
 
 ```bash
 sing.py board --json | python3 -c 'import json,sys
