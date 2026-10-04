@@ -4,6 +4,21 @@
 > (сейчас: `archive/JOURNAL-2026-09.md`, 2026-09-07 … 2026-09-11, 31 запись) —
 > история не потеряна, ищи там. Порядок записей — сверху новые.
 
+## 2026-10-04 — проверка «подхвачено ли»: Antigravity по JSON, OpenCode по debug skill (T-8e177293)
+**Что:** AGENTS.md, абзац «Лежит в каталоге ≠ подхвачено» — рабочие команды с путём копии вместо
+устаревшего описания вывода `agy`. Antigravity: `agy -p "/skills" --output-format json`, поля `path`/
+`model_invocable` лежат в `command.data.skills[]`. OpenCode: `opencode debug skill` — только через файл.
+**Почему:** текстовый `agy -p "/skills"` с 2026-09 печатает лишь «имя<TAB>описание» — без пути копия в
+`.agents/skills` рабочего дерева неотличима от глобальной, а именно от неё предостерегает AGENTS.md.
+**Наблюдения (замер):** локальная копия во временном репо даёт у agy ОДНУ строку с путём
+`<репо>/.agents/skills/...` — она молча перебивает глобальную, дубля в списке нет, отличить можно
+только по пути. `opencode debug skill | …` обрезается ровно на 65536 байтах (3/3 прогона), в файл —
+316 552 байта, JSON валиден. Попутно: у `code-review` в Antigravity `model_invocable: False`.
+**Как проверено:** обе команды из AGENTS.md запущены дословно: agy → `~/.gemini/config/skills/
+singularity-tasks/SKILL.md True`; OpenCode → `~/.agents/skills/singularity-tasks/SKILL.md`; контроль
+с копией в `.agents/skills` временного репо — путь сменился на неё.
+**Откат:** `git revert`; правка только документации.
+
 ## 2026-10-04 — одна общая копия в ~/.agents/skills; агент — по ближайшему процессу-предку (T-9bdf8639)
 **Что:** `tools/install.sh` — цели `agents` (`~/.agents/skills`, его читают Codex/Qwen/OpenCode) +
 `claude` + `antigravity`; прежние копии codex/opencode/qwen — список `LEGACY`: `--check` считает

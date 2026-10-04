@@ -28,10 +28,27 @@ CLI, а не Antigravity.
 (`proc_pidpath`; `ps` в sandbox Codex запрещён).
 
 **Лежит в каталоге ≠ подхвачено.** `install.sh --check` сверяет файлы и про это ничего не
-говорит. У Antigravity факт проверяется командой `agy -p "/skills"` (читает каталоги и
-выходит, модель не дёргается): в списке должна быть строка `singularity-tasks` с путём
-`~/.gemini/config/skills/...` и `model_invocable: true`. Для остальных четырёх аналога пока
-нет — там нужен запуск инструмента и вопрос «какие скиллы доступны».
+говорит. Факт проверяется списком самого инструмента — без модели, с путём к копии:
+
+```bash
+# Antigravity: текстовый `agy -p "/skills"` печатает только «имя<TAB>описание» (с 2026-09),
+# путь и model_invocable есть только в JSON, в command.data.skills[]
+agy -p "/skills" --output-format json </dev/null | python3 -c 'import json,sys
+[print(s["path"], s["model_invocable"]) for s in json.load(sys.stdin)["command"]["data"]["skills"]
+ if s["name"] == "singularity-tasks"]'
+# OpenCode: JSON-массив {name, location, ...}. ТОЛЬКО через файл: в pipe он отдаёт ровно
+# 65536 байт (буфер) и выходит — JSON обрезан (3/3 прогона 2026-10-04, файл — 316 КБ целиком)
+opencode debug skill > /tmp/oc-skills.json && python3 -c 'import json
+[print(s["location"]) for s in json.load(open("/tmp/oc-skills.json")) if s["name"] == "singularity-tasks"]'
+```
+
+Ожидается **ровно одна строка**: у Antigravity — `~/.gemini/config/skills/singularity-tasks/SKILL.md True`,
+у OpenCode — `~/.agents/skills/singularity-tasks/SKILL.md`. Путь в `.agents/skills/` рабочего
+дерева — это локальная копия, перебившая глобальную (строка по-прежнему одна: дубль не
+показывается, его видно только по пути; проверено 2026-10-04 копией во временном репо).
+`model_invocable: False` — модель сама скилл не вызовет. Для Codex и Qwen такой команды нет —
+остаётся вопрос инструменту, и **отрицательный ответ модели не замер**: модель перечисляет
+скиллы не полностью (OpenCode на вопрос назвал 0 из 3 при фактических 3, 2026-10-04).
 
 Antigravity, кроме глобального каталога, сканирует рабочую копию — `.agents/skills/`
 (а также `_agents`, `.agent`, `_agent`) от cwd до корня репозитория. Копию скилла в
