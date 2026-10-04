@@ -4,6 +4,34 @@
 > (сейчас: `archive/JOURNAL-2026-09.md`, 2026-09-07 … 2026-09-11, 31 запись) —
 > история не потеряна, ищи там. Порядок записей — сверху новые.
 
+## 2026-10-04 — одна общая копия в ~/.agents/skills; агент — по ближайшему процессу-предку (T-9bdf8639)
+**Что:** `tools/install.sh` — цели `agents` (`~/.agents/skills`, его читают Codex/Qwen/OpenCode) +
+`claude` + `antigravity`; прежние копии codex/opencode/qwen — список `LEGACY`: `--check` считает
+их расхождением, раскатка убирает с бэкапом в `~/.singularity-tasks-backup/<имя>`.
+`scripts/sing.py`: `AGENT_BY_PROCESS` + `process_ancestors()` (libproc `proc_pidpath`/`proc_pidinfo`
+на macOS, `/proc` на Linux) — первым после явных `--agent`/`$SINGULARITY_AGENT`/`singularity.json`;
+каталог копии и метка сессии — запасные. `whoami` называет предка; порядок его веток выровнен с
+`agent_name()` (раньше `singularity.json` проверялся после догадки по среде и подписывался неверно).
+**Почему:** пользователь свёл все скиллы машины в `~/.agents/skills` (CC Switch → unified). С общей
+копией путь не различает codex/opencode/qwen, а на метке `agent:*` держится защита от гонки.
+Замеры 2026-10-04, почему не env и не `ps`: внутри OpenCode и Qwen, запущенных из сессии Claude, стоят
+`CLAUDECODE` и `AI_AGENT=claude-code…` — окружение наследуется; в sandbox Codex `ps` падает
+`PermissionError`, а `proc_pidpath` работает. Сверяется путь, не имя: Claude CLI назван номером
+версии (`~/.local/share/claude/versions/2.1.283`). Ближайший известный предок выигрывает —
+codex внутри claude это codex.
+**Найдено попутно:** `test_install_dirs_cover_every_deploy_target` ничего не проверял — искал в
+`install.sh` строки с `$HOME`, а цели записаны через `$TARGET_HOME`; множество целей было пустым.
+Теперь разбирается блок `TARGETS=` и есть порог «целей ≥ 3».
+**Как проверено:** `tests/run.py fast` — 353 теста, 0 падений (было 349, +4 новых). Контрольный слом
+(убрана сигнатура codex) — 2/2 новых теста красные; убран маркер antigravity — тест покрытия красный.
+`install.sh` в песочнице (`SINGULARITY_TARGET_HOME`): до — 6 расхождений, после — 0, повтор — «ничего
+не менялось». Живая раскатка: 3 цели + 3 лишние убраны, `--check` = 0. Живые `whoami`: из Claude —
+`claude`, изнутри `codex exec` — `codex` (по предку). Qwen/OpenCode вживую не проверены — их модель
+не ответила за 7 мин («Retrying provider attempt»); распознавание проверено на их реальных цепочках
+процессов, снятых зондом в тот же день (вложенных в Claude): `qwen` и `opencode`.
+**Откат:** `git revert`, затем `tools/install.sh` (вернёт 5 копий); бэкапы прежних — в
+`~/.singularity-tasks-backup/{codex,opencode,qwen}`.
+
 ## 2026-10-04 — реализация: `queueBreakdown` в `ready --json` (T-9695ccf9)
 **Что:** решение (T-096ed9db) доведено до кода. `scripts/sing.py`:
 `queue_breakdown()` + поле `queueBreakdown` в строке проекта `ready --json`

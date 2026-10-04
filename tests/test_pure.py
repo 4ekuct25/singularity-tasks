@@ -14,6 +14,7 @@ import io
 import json
 import os
 import datetime
+import re
 import subprocess
 import shutil
 import sys
@@ -854,6 +855,13 @@ class DetectAgentTest(unittest.TestCase):
         for v in ("SINGULARITY_AGENT", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID"):
             self.addCleanup(os.environ.pop, v, None)
             os.environ.pop(v, None)
+        # Дерево процессов — главный признак, и под тестовым прогоном оно указывает
+        # на того, кто запустил тесты. Запасные пути проверяются без него.
+        self._no_ancestors()
+
+    def _no_ancestors(self, chain=()):
+        self.addCleanup(setattr, sing, "process_ancestors", sing.process_ancestors)
+        sing.process_ancestors = lambda pid=None: list(chain)
 
     def _running_from(self, path):
         sing.__file__ = path
@@ -865,18 +873,73 @@ class DetectAgentTest(unittest.TestCase):
             self.assertEqual(sing.detect_agent(), expected, f"не опознан {marker}")
 
     def test_install_dirs_cover_every_deploy_target(self):
-        """TARGETS в install.sh и таблица здесь обязаны не расходиться:
-        иначе новый инструмент подпишется чужим именем."""
+        """У каждой цели раскатки со СВОЕЙ копией есть распознавание по каталогу:
+        иначе при недоступном дереве процессов инструмент подпишется чужим именем.
+        Общая цель agents — не инструмент: её читают несколько, имя у неё не одно."""
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(sing.__file__))),
                               "tools", "install.sh")
         if not os.path.exists(script):
             self.skipTest("install.sh рядом нет (запуск из установленной копии)")
-        targets = {line.split("|")[0].strip()
-                   for line in open(script, encoding="utf-8")
-                   if line.count("|") == 2 and "$HOME" in line}
+        text = open(script, encoding="utf-8").read()
+        block = re.search(r'^TARGETS="(.*?)"$', text, re.S | re.M).group(1)
+        targets = {line.split("|")[0].strip() for line in block.splitlines() if line.strip()}
+        # Прежнее условие ("$HOME" in line) не совпадало ни с одной строкой —
+        # цели записаны через $TARGET_HOME, — и тест сравнивал пустое множество.
+        self.assertGreaterEqual(len(targets), 3, f"цели не разобраны: {targets}")
+        self.assertIn("agents", targets)
         known = {name for _, name in sing.AGENT_BY_SKILL_DIR}
-        self.assertEqual(targets - known, set(),
+        self.assertEqual(targets - known - {"agents"}, set(),
                          "цель раскатки есть, а распознавания имени для неё нет")
+
+    def test_nearest_known_ancestor_wins(self):
+        """Вложенный запуск: codex из сессии claude — это codex."""
+        chain = ["/bin/zsh",
+                 "/Users/u/.codex/packages/standalone/releases/0.156.1/bin/codex",
+                 "/bin/zsh",
+                 "/Users/u/Library/Application Support/Claude/claude-code/2.1.286/x/"
+                 "claude.app/Contents/MacOS/claude"]
+        self.assertEqual(sing.agent_by_process(chain)[0], "codex")
+        self.assertEqual(sing.agent_by_process(chain[2:])[0], "claude")
+
+    def test_every_agent_signature_is_recognised(self):
+        """Пути сняты с живых процессов 2026-10-04."""
+        cases = {
+            "/Users/u/.local/share/claude/versions/2.1.283": "claude",
+            "/Users/u/Library/Application Support/Claude/claude-code/2.1.286/x/"
+            "claude.app/Contents/MacOS/claude": "claude",
+            "/Users/u/.codex/packages/standalone/releases/0.156.1-aarch64/bin/codex": "codex",
+            "/Users/u/.opencode/bin/opencode": "opencode",
+            "/Users/u/.local/lib/qwen-code/node/bin/node.real": "qwen",
+            "/Applications/Antigravity.app/Contents/Resources/bin/language_server":
+                "antigravity",
+            "/Users/u/.gemini/bin/agy": "antigravity",
+        }
+        for path, expected in cases.items():
+            self.assertEqual(sing.agent_by_process([path])[0], expected, path)
+        for alien in ("/bin/zsh", "/usr/bin/python3", "/Applications/Claude.app/Contents/"
+                      "MacOS/Claude", "/opt/homebrew/bin/node"):
+            self.assertIsNone(sing.agent_by_process([alien])[0], alien)
+
+    def test_process_beats_skill_dir_and_env(self):
+        """Общая копия в ~/.agents и унаследованный CLAUDECODE не должны
+        перебивать того, кто реально запустил скрипт."""
+        self._no_ancestors(["/bin/zsh", "/Users/u/.opencode/bin/opencode"])
+        self._running_from(os.path.join(os.path.expanduser("~"), ".claude", "skills",
+                                        "singularity-tasks", "scripts", "sing.py"))
+        os.environ["CLAUDECODE"] = "1"
+        self.assertEqual(sing.detect_agent(), "opencode")
+
+    def test_real_process_tree_is_readable(self):
+        """Живой smoke: на этой ОС дерево процессов читается без внешних команд."""
+        if sys.platform not in ("darwin", "linux"):
+            self.skipTest("чтение предков реализовано для macOS и Linux")
+        self.addCleanup(setattr, sing, "process_ancestors", sing.process_ancestors)
+        sing.process_ancestors = type(self)._real_ancestors
+        chain = sing.process_ancestors()
+        self.assertTrue(chain, "ни одного предка — libproc//proc не прочитаны")
+        self.assertTrue(all(p.startswith("/") for p in chain), chain)
+
+    _real_ancestors = staticmethod(sing.process_ancestors)
 
     def test_unknown_dir_falls_back_to_session_marker(self):
         self._running_from("/tmp/где-то/sing.py")

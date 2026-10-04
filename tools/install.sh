@@ -16,13 +16,17 @@
 # чтобы предупредить о расхождении в момент start/done. Логика сверки должна
 # оставаться в одном месте, иначе два «одинаковых» ответа разъедутся.
 #
-# Формат SKILL.md общий для всех пяти инструментов, различаются только пути.
-# ВАЖНО, эти каталоги легко перепутать:
-#   ~/.gemini/skills         — Gemini CLI (не Antigravity!)
-#   ~/.gemini/config/skills  — Antigravity
-#   ~/.qwen/skills           — Qwen Code
-# Qwen сканирует ещё и ~/.agents/skills, но ставим только в один каталог: иначе он
-# прочитает скилл дважды и получит два одинаковых описания с теми же триггерами.
+# Формат SKILL.md общий для всех инструментов, различаются только пути.
+# Раскладка (2026-10-04, все скиллы машины сведены в ~/.agents/skills):
+#   ~/.agents/skills         — общий: его сами читают Codex, Qwen Code, OpenCode, Gemini CLI
+#   ~/.claude/skills         — Claude Code (общий каталог не читает)
+#   ~/.gemini/config/skills  — Antigravity (общий каталог не читает; ~/.gemini/skills —
+#                              это Gemini CLI, не Antigravity!)
+# Свои копии у Codex/Qwen/OpenCode теперь ЛИШНИЕ: инструмент прочитал бы скилл дважды
+# (свой каталог + общий) и получил два одинаковых описания с теми же триггерами.
+# --check считает такую копию расхождением, раскатка убирает её с бэкапом (LEGACY).
+# Какой агент запустил sing.py, скрипт узнаёт по дереву процессов, а не по
+# каталогу копии — см. AGENT_BY_PROCESS в scripts/sing.py.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -42,11 +46,16 @@ BACKUP_ROOT="${SINGULARITY_BACKUP_ROOT:-$TARGET_HOME/.singularity-tasks-backup}"
 
 # имя|признак установленного инструмента|куда класть скилл
 # bash 3.2 (штатный на macOS) не умеет ассоциативные массивы — держим строкой
-TARGETS="claude|$TARGET_HOME/.claude|$TARGET_HOME/.claude/skills/singularity-tasks
-codex|$TARGET_HOME/.codex|$TARGET_HOME/.codex/skills/singularity-tasks
-opencode|$TARGET_HOME/.config/opencode|$TARGET_HOME/.config/opencode/skills/singularity-tasks
-antigravity|$TARGET_HOME/.gemini/config|$TARGET_HOME/.gemini/config/skills/singularity-tasks
-qwen|$TARGET_HOME/.qwen|$TARGET_HOME/.qwen/skills/singularity-tasks"
+# Признак у agents — сам $TARGET_HOME: общий каталог нужен любому из четырёх
+# читающих его инструментов, и на свежей машине ~/.agents может ещё не быть.
+TARGETS="agents|$TARGET_HOME|$TARGET_HOME/.agents/skills/singularity-tasks
+claude|$TARGET_HOME/.claude|$TARGET_HOME/.claude/skills/singularity-tasks
+antigravity|$TARGET_HOME/.gemini/config|$TARGET_HOME/.gemini/config/skills/singularity-tasks"
+
+# Прежние цели: эти инструменты читают ~/.agents/skills, своя копия даёт дубль.
+LEGACY="codex|$TARGET_HOME/.codex/skills/singularity-tasks
+opencode|$TARGET_HOME/.config/opencode/skills/singularity-tasks
+qwen|$TARGET_HOME/.qwen/skills/singularity-tasks"
 
 mode="install"
 only=""
@@ -172,6 +181,39 @@ while IFS='|' read -r name probe dst; do
             ;;
     esac
 done <<< "$TARGETS"
+
+# Лишние копии на прежних местах. Нет копии — нет и строки: это норма, а не цель.
+while IFS='|' read -r name dst; do
+    [[ -z "$name" ]] && continue
+    [[ -n "$only" && "$only" != "$name" ]] && continue
+    any=1
+    [[ -e "$dst" || -L "$dst" ]] || continue
+    case "$mode" in
+        list)
+            printf "· %-12s %-8s %s\n" "$name" "ЛИШНЯЯ" "$dst"
+            ;;
+        check)
+            [[ -n "$quiet" ]] || echo "· $name — лишняя копия $dst: инструмент читает ~/.agents/skills, скилл виден дважды"
+            drift=1
+            drift_names="${drift_names:+$drift_names, }$name"
+            ;;
+        install)
+            echo "· $name — лишняя копия $dst"
+            bak="$BACKUP_ROOT/$name"
+            mkdir -p "$BACKUP_ROOT"
+            rm -rf "$bak"
+            cp -R "$dst" "$bak"
+            echo "    бэкап: $bak"
+            rm -rf "${dst:?}"
+            if [[ -e "$dst" || -L "$dst" ]]; then
+                echo "    ✗ не удалилась" >&2
+                exit 1
+            fi
+            echo "    ✓ убрана"
+            installed=$((installed + 1))
+            ;;
+    esac
+done <<< "$LEGACY"
 
 if [[ $any -eq 0 ]]; then
     echo "Нет подходящих целей${only:+ (--target $only)}." >&2

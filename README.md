@@ -13,18 +13,19 @@
 
 Формат SKILL.md общий, поэтому один и тот же скилл работает в пяти инструментах:
 
-| Инструмент | Куда ставится |
+| Инструмент | Откуда читает скилл |
 |---|---|
-| Claude Code | `~/.claude/skills/singularity-tasks/` |
-| Codex CLI | `~/.codex/skills/singularity-tasks/` |
-| OpenCode | `~/.config/opencode/skills/singularity-tasks/` |
-| Antigravity | `~/.gemini/config/skills/singularity-tasks/` |
-| Qwen Code | `~/.qwen/skills/singularity-tasks/` |
+| Codex CLI, OpenCode, Qwen Code | общий `~/.agents/skills/singularity-tasks/` |
+| Claude Code | `~/.claude/skills/singularity-tasks/` (общий каталог не читает) |
+| Antigravity | `~/.gemini/config/skills/singularity-tasks/` (общий каталог не читает) |
 
-⚠️ Каталоги легко перепутать: `~/.gemini/skills/` — это **Gemini CLI**, Antigravity читает
-`~/.gemini/config/skills/`, а Qwen Code — `~/.qwen/skills/`. Qwen сканирует ещё и общий
-`~/.agents/skills/`, но копия ставится только в один каталог: из двух он прочитал бы скилл
-дважды и показал два одинаковых описания с теми же триггерами.
+⚠️ Своих копий в `~/.codex/skills/`, `~/.config/opencode/skills/`, `~/.qwen/skills/` быть
+не должно: эти инструменты читают и свой каталог, и общий, и скилл был бы виден дважды
+с одинаковыми триггерами. `install.sh` такие копии убирает, `--check` считает их
+расхождением. `~/.gemini/skills/` — это **Gemini CLI**, а не Antigravity.
+
+Какой инструмент запустил `sing.py`, скрипт узнаёт по дереву процессов, а не по каталогу
+копии: общая копия у троих одна (подробно — SKILL.md, «Кто взял задачу»).
 
 Раскатка во все установленные инструменты — одной командой из репозитория-эталона:
 
@@ -161,11 +162,9 @@ alias sing='python3 ~/.claude/skills/singularity-tasks/scripts/sing.py'
 
 У тебя установлен скилл singularity-tasks — прочитай его SKILL.md и дальше
 действуй по нему. CLI лежит рядом со скиллом: <каталог>/scripts/sing.py
-  Claude Code  ~/.claude/skills/singularity-tasks/
-  Codex CLI    ~/.codex/skills/singularity-tasks/
-  OpenCode     ~/.config/opencode/skills/singularity-tasks/
-  Antigravity  ~/.gemini/config/skills/singularity-tasks/
-  Qwen Code    ~/.qwen/skills/singularity-tasks/
+  Claude Code                 ~/.claude/skills/singularity-tasks/
+  Antigravity                 ~/.gemini/config/skills/singularity-tasks/
+  Codex CLI, OpenCode, Qwen   ~/.agents/skills/singularity-tasks/
 
 Порядок:
 1. sing.py doctor — есть ли токен и видно ли API.

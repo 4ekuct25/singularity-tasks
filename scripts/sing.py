@@ -86,12 +86,12 @@ COLUMN_ORDER_GAP = 50000
 AGENT_TAG_PREFIX = "agent:"
 
 
-# Каждый инструмент запускает СВОЮ копию скилла, и каталоги у них разные —
-# по собственному пути скрипт узнаёт, под кем работает. Это надёжнее переменных
-# окружения: у большинства инструментов «свои» переменные (GEMINI_API_KEY,
-# CODEX_*) — это конфиг, который может быть выставлен где угодно и кем угодно,
-# а не метка «сейчас работаю я». Порядок каталогов совпадает с TARGETS в
-# tools/install.sh: добавляешь инструмент туда — добавь и сюда.
+# Запасной признак — каталог копии, из которой запущен скрипт: когда дерево
+# процессов прочитать не удалось (см. AGENT_BY_PROCESS). Свои копии остались у
+# Claude и Antigravity; codex/opencode/qwen читают общую ~/.agents/skills и
+# здесь оставлены для старых раскладок. Каталог надёжнее переменных окружения:
+# у большинства инструментов «свои» переменные (GEMINI_API_KEY, CODEX_*) — это
+# конфиг, который может быть выставлен где угодно, а не метка «работаю я».
 AGENT_BY_SKILL_DIR = (
     (os.path.join(".claude", "skills", "singularity-tasks"), "claude"),
     (os.path.join(".codex", "skills", "singularity-tasks"), "codex"),
@@ -109,8 +109,84 @@ AGENT_BY_ENV = (
 )
 
 
+# Главный признак — ближайший предок-инструмент в дереве процессов. Копия скилла
+# общая (~/.agents/skills читают Codex, Qwen и OpenCode), поэтому по пути копии
+# этих троих не различить. Переменные окружения не годятся: они НАСЛЕДУЮТСЯ —
+# внутри OpenCode и Qwen, запущенных из сессии Claude, стоят CLAUDECODE и
+# AI_AGENT=claude-code (замер 2026-10-04). Предок однозначен, и ближайший из
+# известных — тот, кто нас запустил: codex внутри claude опознаётся как codex.
+# Сверяется путь к исполняемому файлу, а не имя процесса: бинарник Claude CLI
+# назван номером версии (~/.local/share/claude/versions/2.1.283). Путь берётся
+# через libproc, а не `ps`: sandbox Codex запрещает запуск `ps`
+# (PermissionError), а proc_pidpath там работает.
+AGENT_BY_PROCESS = (
+    (re.compile(r"/claude/versions/[^/]+$|/claude\.app/Contents/MacOS/claude$|/claude$"),
+     "claude"),
+    (re.compile(r"/codex$"), "codex"),
+    (re.compile(r"/opencode$"), "opencode"),
+    (re.compile(r"/qwen-code/"), "qwen"),
+    (re.compile(r"/Antigravity( IDE)?\.app/|/agy$"), "antigravity"),
+)
+PROCESS_DEPTH = 16
+
+
+def _exe_and_parent(pid):
+    """(путь к исполняемому файлу, pid родителя); None там, где узнать не вышло."""
+    if sys.platform == "darwin":
+        import ctypes
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        buf = ctypes.create_string_buffer(4096)
+        n = lib.proc_pidpath(pid, buf, 4096)
+        path = buf.value.decode("utf-8", "replace") if n > 0 else None
+        # PROC_PIDTBSDINFO = 3, struct proc_bsdinfo — 136 байт, pbi_ppid по смещению 16
+        info = ctypes.create_string_buffer(136)
+        n = lib.proc_pidinfo(pid, 3, 0, info, 136)
+        ppid = int.from_bytes(info.raw[16:20], "little") if n > 0 else None
+        return path, ppid
+    try:
+        path = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        path = None
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        ppid = None
+    return path, ppid
+
+
+def process_ancestors(pid=None):
+    """Пути исполняемых файлов предков, от ближайшего. Сбой — пустой список:
+    определение агента не должно ронять команду."""
+    out, seen = [], set()
+    try:
+        pid = os.getppid() if pid is None else pid
+        for _ in range(PROCESS_DEPTH):
+            if not pid or pid <= 1 or pid in seen:
+                break
+            seen.add(pid)
+            path, pid = _exe_and_parent(pid)
+            if path:
+                out.append(path)
+    except Exception:  # noqa: BLE001 — среда без libproc/proc, чужая ОС
+        pass
+    return out
+
+
+def agent_by_process(ancestors=None):
+    """(имя, путь предка) по ближайшему известному предку или (None, None)."""
+    for path in (process_ancestors() if ancestors is None else ancestors):
+        for rx, name in AGENT_BY_PROCESS:
+            if rx.search(path):
+                return name, path
+    return None, None
+
+
 def detect_agent():
     """Под каким инструментом идёт запуск. None — опознать не удалось."""
+    name, _ = agent_by_process()
+    if name:
+        return name
     here = os.path.realpath(__file__)
     for marker, name in AGENT_BY_SKILL_DIR:
         if os.sep + marker + os.sep in here:
@@ -3508,13 +3584,17 @@ def cmd_whoami(args):
     cfg, _ = load_config(required=False)
     who = agent_name(cfg, args.agent)
     print(f"агент: {who}\nтег:   {AGENT_TAG_PREFIX}{who}")
+    # порядок веток обязан совпадать с agent_name(), иначе источник назван не тот
+    by_proc, proc_path = agent_by_process()
     src = ("--agent" if args.agent else
            "$SINGULARITY_AGENT" if os.environ.get("SINGULARITY_AGENT") else
+           "singularity.json" if (cfg or {}).get("agent") else
+           f"определено по процессу-предку ({proc_path})" if by_proc else
            f"определено по каталогу запуска ({os.path.realpath(__file__)})"
            if detect_agent() and any(os.sep + m + os.sep in os.path.realpath(__file__)
                                      for m, _ in AGENT_BY_SKILL_DIR) else
            "определено по метке сессии инструмента" if detect_agent() else
-           "singularity.json" if (cfg or {}).get("agent") else "значение по умолчанию")
+           "значение по умолчанию")
     print(f"откуда: {src}")
 
 

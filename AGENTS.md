@@ -4,21 +4,28 @@
 > текста правил в ней быть не должно: над репозиторием работают пять разных агентов, и
 > правила в двух файлах разъезжаются с первой же правки.
 
-Этот репозиторий — **эталон** скилла `singularity-tasks`. Рабочие копии живут в каталогах
-пяти инструментов и обязаны совпадать с эталоном:
+Этот репозиторий — **эталон** скилла `singularity-tasks`. Рабочих копий три, и они обязаны
+совпадать с эталоном (с 2026-10-04 все скиллы машины сведены в общий `~/.agents/skills`):
 
-| Инструмент | Каталог |
-|---|---|
-| Claude Code | `~/.claude/skills/singularity-tasks/` |
-| Codex CLI | `~/.codex/skills/singularity-tasks/` |
-| OpenCode | `~/.config/opencode/skills/singularity-tasks/` |
-| Antigravity | `~/.gemini/config/skills/singularity-tasks/` |
-| Qwen Code | `~/.qwen/skills/singularity-tasks/` |
+| Цель `install.sh` | Каталог | Кто читает |
+|---|---|---|
+| `agents` | `~/.agents/skills/singularity-tasks/` | Codex CLI, OpenCode, Qwen Code (и Gemini CLI) |
+| `claude` | `~/.claude/skills/singularity-tasks/` | Claude Code — общий каталог не читает |
+| `antigravity` | `~/.gemini/config/skills/singularity-tasks/` | Antigravity — общий каталог не читает |
 
-⚠️ `~/.gemini/skills/` — это Gemini CLI, а не Antigravity. Antigravity читает
-`~/.gemini/config/skills/`, Qwen Code — `~/.qwen/skills/`. Перепутать легко, проверять по
-факту. Qwen сканирует ещё и `~/.agents/skills/`, но ставить в оба каталога нельзя: скилл
-прочитается дважды и будет конкурировать сам с собой за триггеры.
+⚠️ Своих копий у Codex, OpenCode и Qwen (`~/.codex/skills/`, `~/.config/opencode/skills/`,
+`~/.qwen/skills/`) быть не должно: каждый из них читает и свой каталог, и общий — скилл
+прочитается дважды и будет конкурировать сам с собой за триггеры. `install.sh` держит их
+списком `LEGACY`: `--check` считает такую копию расхождением, раскатка убирает с бэкапом.
+OpenCode читает ещё и `~/.claude/skills/` — это выключено переменной
+`OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1` в `~/.zshrc`. `~/.gemini/skills/` — это Gemini
+CLI, а не Antigravity.
+
+**Агент определяется по ближайшему процессу-предку, а не по каталогу копии** —
+`AGENT_BY_PROCESS` в `scripts/sing.py`. Каталог у троих общий, переменные окружения
+наследуются (внутри OpenCode, запущенного из Claude, стоит `CLAUDECODE`). Сигнатура нового
+инструмента снимается с живого процесса: путь к исполняемому файлу ближайшего предка
+(`proc_pidpath`; `ps` в sandbox Codex запрещён).
 
 **Лежит в каталоге ≠ подхвачено.** `install.sh --check` сверяет файлы и про это ничего не
 говорит. У Antigravity факт проверяется командой `agy -p "/skills"` (читает каталоги и
@@ -44,7 +51,9 @@ Antigravity, кроме глобального каталога, сканиру�
   печатается в конце. **Бэкап нельзя класть внутрь каталога скиллов**: любой каталог с
   `SKILL.md` там регистрируется как отдельный скилл, и копия начинает конкурировать с
   оригиналом за те же триггеры.
-- Новый инструмент добавляется строкой в `TARGETS` внутри `tools/install.sh`.
+- Новый инструмент: если он читает `~/.agents/skills` — копия не нужна, нужна только
+  сигнатура в `AGENT_BY_PROCESS` (`scripts/sing.py`); если не читает — ещё и строка в
+  `TARGETS` внутри `tools/install.sh` плюс маркер в `AGENT_BY_SKILL_DIR`.
 
 **Два правила выше держатся механизмом, а не памятью.** Помнить их не надо — и не стоит:
 как правило они уже существовали и не сработали ни разу, потому что правку помнят, а
