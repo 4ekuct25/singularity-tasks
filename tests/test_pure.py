@@ -102,6 +102,61 @@ class NoteDeltaTest(unittest.TestCase):
         self.assertEqual(ops[3], {"insert": "\n", "attributes": {"list": "bullet"}})
         self.assertEqual(ops[4], {"insert": "обычная\n"})
 
+    def test_display_marks_images_and_files_in_place(self):
+        """Картинка из заметки не пропадает молча: на её месте пометка с путём в кэше
+        десктопа, а нет в кэше — с подсказкой. note_to_text при этом не меняется."""
+        ops = [{"insert": "до\n"},
+               {"insert": {"image": {"fileId": "FL-aaaa-1234", "fileName": "shot.png"}}},
+               {"insert": "\n"},
+               {"insert": {"file": {"fileId": "FL-bbbb-5678", "fileName": "doc.pdf"}}},
+               {"insert": {"divider": True}}, {"insert": "после\n"}]
+        with tempfile.TemporaryDirectory() as d:
+            folder = os.path.join(d, "1234", "FL-aaaa-1234")
+            os.makedirs(folder)
+            open(os.path.join(folder, "shot.png"), "wb").close()
+            old, sing.APP_FILES_DIR = sing.APP_FILES_DIR, d
+            try:
+                text = sing.note_to_display(ops)
+                files = sing.note_files(ops)
+            finally:
+                sing.APP_FILES_DIR = old
+        shot = os.path.join(folder, "shot.png")
+        self.assertEqual(text, f"до\n[картинка: shot.png → {shot}]\n"
+                               "[файл: doc.pdf → нет в кэше десктопа — открой карточку в приложении]"
+                               "после\n")
+        self.assertEqual([(f["kind"], f["path"]) for f in files],
+                         [("image", shot), ("file", None)])
+        self.assertEqual(sing.note_to_text(ops), "до\n\nпосле\n")
+
+    def test_display_finds_the_file_when_the_name_drifted(self):
+        """Имя в заметке разошлось с файлом в кэше — в каталоге id лежит один файл."""
+        ops = [{"insert": {"image": {"fileId": "FL-cccc-9999", "fileName": "old.png"}}}]
+        with tempfile.TemporaryDirectory() as d:
+            folder = os.path.join(d, "9999", "FL-cccc-9999")
+            os.makedirs(folder)
+            open(os.path.join(folder, "new.png"), "wb").close()
+            old, sing.APP_FILES_DIR = sing.APP_FILES_DIR, d
+            try:
+                path = sing.note_files(ops)[0]["path"]
+            finally:
+                sing.APP_FILES_DIR = old
+        self.assertEqual(path, os.path.join(folder, "new.png"))
+
+    def test_display_picks_the_named_file_among_several(self):
+        """Файлов в каталоге несколько — берётся тот, что назван в заметке."""
+        ops = [{"insert": {"image": {"fileId": "FL-dddd-0001", "fileName": "b.png"}}}]
+        with tempfile.TemporaryDirectory() as d:
+            folder = os.path.join(d, "0001", "FL-dddd-0001")
+            os.makedirs(folder)
+            for name in ("a.png", "b.png"):
+                open(os.path.join(folder, name), "wb").close()
+            old, sing.APP_FILES_DIR = sing.APP_FILES_DIR, d
+            try:
+                path = sing.note_files(ops)[0]["path"]
+            finally:
+                sing.APP_FILES_DIR = old
+        self.assertEqual(path, os.path.join(folder, "b.png"))
+
     def test_dump_keeps_cyrillic_readable(self):
         self.assertIn("привет", sing.note_dump([{"insert": "привет"}]))
 

@@ -1229,6 +1229,58 @@ def note_to_text(note):
                    if isinstance(op, dict) and isinstance(op.get("insert"), str))
 
 
+# Картинка и файл в заметке — встраиваемый объект `{"image"|"file": {fileId, fileName}}`.
+# note_to_text их выбрасывает (на нём держатся сверки записи), и агент видел на месте
+# скриншота пустую строку. Скачать файл REST-токеном нельзя: ручки для файлов в API нет,
+# приложение берёт их из S3 ключами аккаунта. Остаётся локальный кэш десктопа:
+# files/<4 последних символа id>/<FL-id>/<имя> — замер 2026-10-06, 66 из 66 каталогов;
+# картинки приложение качает само (64 из 65), прочие файлы — только открытые (1 из 11).
+APP_FILES_DIR = os.path.expanduser(
+    "~/Library/Containers/ru.sibirix.singularitydesktop/Data/Library/"
+    "Application Support/SingularityApp/files")
+NOTE_FILE_KINDS = {"image": "картинка", "file": "файл"}
+
+
+def note_embed(ins):
+    """Встроенный файл одной операции: kind, fileId, fileName, путь в кэше (или None)."""
+    if not isinstance(ins, dict):
+        return None
+    for kind in NOTE_FILE_KINDS:
+        obj = ins.get(kind)
+        if not isinstance(obj, dict) or not obj.get("fileId"):
+            continue
+        fid, name = obj["fileId"], obj.get("fileName") or ""
+        folder = os.path.join(APP_FILES_DIR, fid[-4:], fid)
+        path = None
+        if name and os.path.isfile(os.path.join(folder, name)):
+            path = os.path.join(folder, name)
+        elif os.path.isdir(folder):              # имя разошлось — в каталоге один файл
+            found = [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
+            path = os.path.join(folder, found[0]) if len(found) == 1 else None
+        return {"kind": kind, "fileId": fid, "fileName": name, "path": path}
+    return None
+
+
+def note_files(note):
+    """Все встроенные в заметку картинки и файлы, по порядку."""
+    return [f for op in note_ops(note) if isinstance(op, dict)
+            for f in [note_embed(op.get("insert"))] if f]
+
+
+def note_to_display(note):
+    """Заметка для чтения: текст плюс пометка на месте каждой картинки/файла."""
+    parts = []
+    for op in note_ops(note):
+        ins = op.get("insert") if isinstance(op, dict) else None
+        f = note_embed(ins)
+        if isinstance(ins, str):
+            parts.append(ins)
+        elif f:
+            where = f["path"] or "нет в кэше десктопа — открой карточку в приложении"
+            parts.append(f"[{NOTE_FILE_KINDS[f['kind']]}: {f['fileName'] or f['fileId']} → {where}]")
+    return "".join(parts)
+
+
 def note_dump(ops):
     return json.dumps(ops, ensure_ascii=False)
 
@@ -3161,7 +3213,7 @@ def note_json(note, group_title=None, tags=()):
     разбор под каждую команду, от чего `--json` и уходил.
     """
     return task_json(note, tags=tags, group_title=group_title,
-                     note=note_to_text(note.get("note")),
+                     note=note_to_display(note.get("note")), files=note_files(note.get("note")),
                      appUrl=task_link_app(note["id"]))
 
 
@@ -3201,7 +3253,7 @@ def cmd_notes(args):
 
     if args.show:
         n = note_task(args.show, cfg)
-        text = note_to_text(n.get("note")).strip()
+        text = note_to_display(n.get("note")).strip()
         notes_out(args, note_json(n, group_titles(pid).get(n.get("group")))
                   if args.json else None,
                   [f"=== {n['id']}  {n.get('title', '')}", text or "(пусто)",
@@ -3280,7 +3332,7 @@ def cmd_notes(args):
         return
     for n in notes:
         print(f"\n=== {n['id']}  {n.get('title', '')}")
-        body = note_to_text(n.get("note")).strip()
+        body = note_to_display(n.get("note")).strip()
         if body:
             print(body)
 
@@ -3321,12 +3373,12 @@ def cmd_next(args):
             tags=task_tags(t, titles),
             group_title=group_titles(cfg["projectId"]).get(t.get("group")),
             open_children=kids.get(t["id"], 0),
-            note=note_to_text(t.get("note")),
+            note=note_to_display(t.get("note")), files=note_files(t.get("note")),
             checklist=checklist_json(checklist_items(t["id"])),
             appUrl=task_link_app(t["id"])))
         return
     print(brief(t))
-    note = note_to_text(t.get("note"))
+    note = note_to_display(t.get("note"))
     if note:
         print("\n--- заметка ---\n" + note)
     print_checklist(checklist_items(t["id"]))
@@ -3624,7 +3676,7 @@ def cmd_show(args):
             group_title=group_titles(t["projectId"]).get(t.get("group")),
             open_children=kids,
             not_ready=not_ready_reason(t, open_children=kids),
-            note=note_to_text(t.get("note")),
+            note=note_to_display(t.get("note")), files=note_files(t.get("note")),
             checklist=checklist_json(checklist_items(args.id)),
             appUrl=task_link_app(args.id)))
         return
@@ -3633,7 +3685,7 @@ def cmd_show(args):
     print(f"  {task_link(args.id)}\n  {task_link_app(args.id)}")
     print("проект:", t.get("projectId"), "| выполнена:", t.get("checked"))
     print("колонка:", where, ("| теги: " + marks) if marks else "| тегов нет")
-    note = note_to_text(t.get("note"))
+    note = note_to_display(t.get("note"))
     if note:
         print("\n--- заметка ---\n" + note)
     # Чек-лист `show` не показывал вовсе, хотя `next` показывал: карточка,
