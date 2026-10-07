@@ -1672,6 +1672,16 @@ def task_link_app(task_id):
     return TASK_LINK_APP.format(task_id)
 
 
+def task_head(task_id, task):
+    """Первая строка отчёта команды — название карточки, а не её id.
+
+    Агент пересказывает человеку первую строку вывода, и «T-9a8d0419 закрыта»
+    ему ничего не говорит: открыть карточку по id нечем. Поэтому строка
+    начинается с названия, а ссылка (id в ней есть) — следом.
+    """
+    return f"«{task.get('title') or task_id}»"
+
+
 def prio_of(t):
     """0 = высокий, поэтому `or 1` тут нельзя — ноль ложный."""
     p = t.get("priority")
@@ -3713,8 +3723,9 @@ def cmd_start(args):
         request("PATCH", f"/task/{args.id}",
                 body={"note": note_append(fresh.get("note"), args.plan,
                                           label=f"ПЛАН ({AGENT_TAG_PREFIX}{who})")})
-    print(f"{args.id}: {res} (в работе), тег {AGENT_TAG_PREFIX}{who}"
-          + (", план записан" if args.plan else ", без плана"))
+    print(f"{task_head(args.id, task)} — {res} (в работе), тег {AGENT_TAG_PREFIX}{who}"
+          + (", план записан" if args.plan else ", без плана")
+          + f"\n  {task_link(args.id)}")
     if args.plan:
         warn_wall(args.plan, "план")
 
@@ -3737,8 +3748,9 @@ def cmd_release(args):
     tag_id = find_tag(AGENT_TAG_PREFIX + who)
     dropped = drop_task_tag(args.id, tag_id) if tag_id else False
     move_to_column(args.id, col_id(cfg, "todo"), project_id=cfg["projectId"])
-    print(f"{args.id}: возвращена в очередь"
-          + (f", тег {AGENT_TAG_PREFIX}{who} снят" if dropped else ""))
+    print(f"{task_head(args.id, task)} — возвращена в очередь"
+          + (f", тег {AGENT_TAG_PREFIX}{who} снят" if dropped else "")
+          + f"\n  {task_link(args.id)}")
 
 
 def cmd_report(args):
@@ -3747,7 +3759,7 @@ def cmd_report(args):
     request("PATCH", f"/task/{args.id}",
             body={"note": note_append(t.get("note"), args.text)})
     mark_agent(args.id, cfg, getattr(args, "agent", None))
-    print(f"{args.id}: отчёт дописан в заметку")
+    print(f"{task_head(args.id, t)} — отчёт дописан в заметку\n  {task_link(args.id)}")
     warn_wall(args.text, "запись")
 
 
@@ -3785,7 +3797,8 @@ def cmd_done(args):
     move_to_column(args.id, col_id(cfg, role), project_id=cfg["projectId"])
     if not args.review:
         request("POST", f"/task/{args.id}/complete")
-    print(f"{args.id}: {'отправлена на проверку' if args.review else 'закрыта'}\n"
+    print(f"{task_head(args.id, task)} — "
+          f"{'отправлена на проверку' if args.review else 'закрыта'}\n"
           f"  {task_link(args.id)}")
     if args.report:
         warn_wall(args.report, "результат")
@@ -3798,7 +3811,7 @@ def cmd_block(args):
             body={"note": note_append(t.get("note"), args.reason, label="БЛОКЕР")})
     mark_agent(args.id, cfg, getattr(args, "agent", None))
     move_to_column(args.id, col_id(cfg, "blocked"), project_id=cfg["projectId"])
-    print(f"{args.id}: заблокирована, причина записана в заметку\n"
+    print(f"{task_head(args.id, t)} — заблокирована, причина записана в заметку\n"
           f"  {task_link(args.id)}")
     warn_wall(args.reason, "причина блокировки")
 
@@ -3958,7 +3971,10 @@ def cmd_add(args):
         fix = " ".join(f"--{k} '{body[k]}'" for k in dropped)
         print(f"  ⚠ трекер не взял {', '.join(FIELD_TITLES[k] for k in dropped)} — "
               f"дописать: sing.py set {tid} {fix}")
+    # id первым — по нему агент берёт задачу дальше (`start`); человеку — ссылка
     print(f"{tid}: создана в колонке '{args.column}' — {args.title}")
+    if not cfg.get("adhoc"):
+        print(f"  {task_link(tid)}")
     later = starts_later(t) if body.get("start") else None
     if later:
         # Задача создана «на будущее» — сказать это сразу. Иначе агент, заведя
@@ -3985,9 +4001,9 @@ def cmd_move(args):
     отметку выполнения, то есть чинит не то.
     """
     cfg, _ = load_config()
-    assert_task_allowed(args.id, cfg)
+    task = assert_task_allowed(args.id, cfg)
     res = move_to_column(args.id, col_id(cfg, args.column), project_id=cfg["projectId"])
-    print(f"{args.id}: {res} — {args.column}")
+    print(f"{task_head(args.id, task)} — {res} — {args.column}\n  {task_link(args.id)}")
 
 
 def rename_task(task_id, new_title, task=None):

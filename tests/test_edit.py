@@ -825,3 +825,30 @@ class DupCheckTest(EditBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HumanFacingOutputTest(EditBase):
+    """«T-9a8d0419 закрыта» — агент пересказал первую строку вывода, а открыть
+    карточку по id человеку нечем (T-815fe8a7). Первая строка — название,
+    следом ссылка."""
+
+    def assert_human_facing(self, out, title, tid):
+        first = out.splitlines()[0]
+        self.assertTrue(first.startswith(f"«{title}»"),
+                        f"первая строка начинается не с названия: {first!r}")
+        self.assertNotIn(tid, first, "голый id в строке, которую пересказывают человеку")
+        self.assertIn(f"https://web.singularity-app.com/#/?&id={tid}", out,
+                      "ссылки на карточку нет")
+
+    def test_move_names_the_task_and_links_it(self):
+        r = self.cli("move", "T-loose", "wip")
+        self.assert_human_facing(r.stdout, "вне секций", "T-loose")
+
+    def test_report_names_the_task_and_links_it(self):
+        r = self.cli("report", "T-loose", "промежуточный итог")
+        self.assert_human_facing(r.stdout, "вне секций", "T-loose")
+
+    def test_add_prints_the_link(self):
+        r = self.cli("add", "zz: ссылка в выводе", "--note", "постановка")
+        tid = r.stdout.split(":")[0].strip()
+        self.assertIn(f"https://web.singularity-app.com/#/?&id={tid}", r.stdout)
