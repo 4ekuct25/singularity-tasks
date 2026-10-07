@@ -1901,6 +1901,20 @@ def warn_start_after_deadline(task, out=None):
               f"sing.py set {task.get('id')} --start {hit[1]} --deadline {hit[0]}",
               file=out or sys.stdout)
 
+def warn_review_start(task, out=None):
+    """Дата старта на карточке «На проверке» ничего не отложит: `next` берёт только
+    из очереди. Наблюдали в multihop (T-cf9a667a): карточку отправили на проверку
+    со стартом 10.10, на который была назначена следующая работа, — 10.10 её никто
+    бы не подхватил."""
+    later = starts_later(task)
+    if later:
+        print(f"  ⚠ дата старта {later} на карточке «На проверке» не сработает: next "
+              "берёт только из очереди и эту карточку не выдаст.\n"
+              "    Работа на эту дату — отдельной карточкой: "
+              f"sing.py add \"...\" --note \"...\" --start {later}",
+              file=out or sys.stdout)
+
+
 # Что сверяется до и после ЛЮБОЙ правки полей (`set_task_fields`): PATCH с лишним
 # полем стирает состояние задачи, и ловится это только снимком. Команды со своим
 # набором дополняют этот — `REGROUP_WATCHED`, `NOTE_WATCHED`.
@@ -3800,6 +3814,8 @@ def cmd_done(args):
     print(f"{task_head(args.id, task)} — "
           f"{'отправлена на проверку' if args.review else 'закрыта'}\n"
           f"  {task_link(args.id)}")
+    if args.review:
+        warn_review_start(task)
     if args.report:
         warn_wall(args.report, "результат")
 
@@ -4187,6 +4203,9 @@ def cmd_set(args):
         print(f"  начало {later}: до этого дня очередь задачу не выдаст, "
               "на доске она видна с пометкой" if later
               else "  дата старта не в будущем — для очереди задача обычная")
+        if (later and cfg and cfg.get("columns", {}).get("review")
+                and task_column(args.id, cfg["projectId"]) == col_id(cfg, "review")):
+            warn_review_start(fresh)
     warn_start_after_deadline(fresh)
     print(f"  {task_link(args.id)}")
 

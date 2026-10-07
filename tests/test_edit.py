@@ -852,3 +852,29 @@ class HumanFacingOutputTest(EditBase):
         r = self.cli("add", "zz: ссылка в выводе", "--note", "постановка")
         tid = r.stdout.split(":")[0].strip()
         self.assertIn(f"https://web.singularity-app.com/#/?&id={tid}", r.stdout)
+
+
+class ReviewStartTest(EditBase):
+    """Дата старта на карточке «На проверке» ничего не откладывает: next берёт
+    только из очереди (T-53681da4, найдено в multihop на T-cf9a667a)."""
+
+    future = (datetime.date.today() + datetime.timedelta(days=10)).isoformat()
+
+    def test_review_with_future_start_warns(self):
+        STATE["tasks"]["T-in-a"]["start"] = f"{self.future}T12:00:00.000Z"
+        r = self.cli("done", "T-in-a", "--review", "--report", "на проверку")
+        self.assertIn("не сработает", r.stdout)
+        self.assertIn(f"--start {self.future}", r.stdout)
+
+    def test_review_without_start_is_silent(self):
+        r = self.cli("done", "T-in-a", "--review", "--report", "на проверку")
+        self.assertNotIn("не сработает", r.stdout)
+
+    def test_set_start_on_review_card_warns(self):
+        STATE["links"]["T-in-a"] = COLS["review"]
+        r = self.cli("set", "T-in-a", "--start", self.future)
+        self.assertIn("не сработает", r.stdout)
+
+    def test_set_start_in_queue_is_silent(self):
+        r = self.cli("set", "T-loose", "--start", self.future)
+        self.assertNotIn("не сработает", r.stdout)
