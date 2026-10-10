@@ -736,7 +736,19 @@ class AgentNameTest(unittest.TestCase):
             self.assertEqual(sing.agent_name({"agent": "from-cfg"}), "from-env")
         with support.env(SINGULARITY_AGENT=None):
             self.assertEqual(sing.agent_name({"agent": "from-cfg"}), "from-cfg")
-            self.assertEqual(sing.agent_name(None), "claude")
+            # detect_agent() смотрит в дерево процессов и путь копии скилла —
+            # в тесте это заглушка: иначе «дефолт»-ветка была бы агентом
+            # сессии-хоста, и fast краснел в qwen-сессии (10-10: «qwen» !=
+            # «claude»), а в терминале зелёный — вердикт зависел от места прогона.
+            real = sing.detect_agent
+            try:
+                sing.detect_agent = lambda: None
+                self.assertEqual(sing.agent_name(None), "claude")
+                sing.detect_agent = lambda: "detected"
+                self.assertEqual(sing.agent_name(None), "detected",
+                                 "детект стоит между config и дефолтом")
+            finally:
+                sing.detect_agent = real
 
 
 class ConfigLookupTest(unittest.TestCase):

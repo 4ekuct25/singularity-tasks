@@ -4,6 +4,19 @@
 > (сейчас: `archive/JOURNAL-2026-09.md`, 2026-09-07 … 2026-09-11, 31 запись) —
 > история не потеряна, ищи там. Порядок записей — сверху новые.
 
+## 2026-10-10 — AgentNameTest: fast не зависит от сессии-хоста (T-0084ecf5)
+**Что:** `tests/test_pure.py` — `AgentNameTest.test_precedence_flag_env_config_default`:
+`sing.detect_agent` заглушен (None → дефолт «claude»; «detected» → место в цепочке
+между config и дефолтом). Production `agent_name`/`detect_agent` не тронуты.
+**Почему:** детект по процессу-предку (T-9bdf8639) сделал «дефолт»-ветку равной
+агенту сессии-хоста: в qwen-сессии fast давал 1 красный («qwen» != «claude»),
+в терминале — зелёный; вердикт зависал от места прогона. Найдено 10-10 (свит
+sing.py unarchive, T-cea0aba5: 366/367 с этим единственным сбоем).
+**Как проверено:** fast в qwen-сессии — 367/367 (до — 366/367; тот же тест на
+main без правки — красный). Ассерты покрывают цепочку flag > env > config >
+detect > default: «detected» краснеет, если детект выведут из цепочки.
+**Откат:** `git revert` коммита.
+
 ## 2026-10-10 — sing.py unarchive: сабкоманда восстановления карты из дневника (T-cea0aba5)
 **Что:** `scripts/sing.py` — новая сабкоманда `unarchive <T-id>`:
 `POST /v2/task/{id}/unarchive` + перечитывание (fail-closed: сервер ответил, но
