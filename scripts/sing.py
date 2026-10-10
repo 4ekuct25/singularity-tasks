@@ -3832,6 +3832,34 @@ def cmd_block(args):
     warn_wall(args.reason, "причина блокировки")
 
 
+def cmd_unarchive(args):
+    """Восстановить карту из дневника: journalDate=null, checked=0.
+
+    Приложение уносит карту в дневник при отметке «выполнена» и прячет её из
+    представления проекта, тогда как `board` продолжает показывать её в колонке
+    — ложная «открыта» (инцидент 10-10, карта T-0e305f51). Единственный штатный
+    путь вернуть живую карту — эта команда; без переписывания полей (PATCH не
+    шлёт), канбан-связка не трогается.
+    """
+    cfg, _ = load_config()
+    t = assert_task_allowed(args.id, cfg)
+    if not t.get("journalDate"):
+        print(f"{task_head(args.id, t)} — и так не в дневнике (journalDate пуст), "
+              f"нечего делать\n  {task_link(args.id)}")
+        return
+    had_mark = int(t.get("checked") or 0) == 1
+    request("POST", f"/task/{args.id}/unarchive")
+    fresh = request("GET", f"/task/{args.id}")
+    if fresh.get("journalDate") or int(fresh.get("checked") or 0) != 0:
+        die(f"{args.id}: сервер ответил, но состояние не изменилось "
+            f"(journalDate={fresh.get('journalDate')!r}, "
+            f"checked={fresh.get('checked')!r}).\n"
+            f"  Повторить: sing.py unarchive {args.id}")
+    tail = ", отметка «выполнена» снята" if had_mark else ""
+    print(f"{task_head(args.id, t)} — восстановлена из дневника{tail}"
+          f"\n  {task_link(args.id)}")
+
+
 def same_title(a, b):
     """Сравнение заголовков «на глаз»: без HTML, регистра и лишних пробелов.
 
@@ -4694,6 +4722,12 @@ def build_parser():
     sp.add_argument("reason")
     sp.add_argument("--agent")
     sp.set_defaults(fn=cmd_block)
+
+    sp = sub.add_parser("unarchive",
+                        help="восстановить карту из дневника: снять journalDate "
+                             "и отметку «выполнена»")
+    sp.add_argument("id")
+    sp.set_defaults(fn=cmd_unarchive)
 
     sp = sub.add_parser("add", help="создать задачу/подзадачу")
     sp.add_argument("title")

@@ -860,5 +860,33 @@ class AdHocProjectTest(LiveBase):
         self.assertIn("unrecognized arguments", p.stderr)
 
 
+class UnarchiveLiveTest(LiveBase):
+    """`unarchive` на живом трекере: полный круг archive → unarchive сверяется
+    перечитыванием полей, а не кодом ответа (инцидент 10-10: единственный путь
+    восстановить живую карту, унесённую в дневник)."""
+
+    def test_archive_then_unarchive_roundtrip(self):
+        tid = self.make_task("zz: архив — разархив")
+        self.sing.request("POST", f"/task/{tid}/archive")
+        saved = self.sing.request("GET", f"/task/{tid}")
+        self.assertTrue(saved.get("journalDate"), "archive не записал journalDate")
+        self.assertEqual(self.checked(tid), 1)
+        out = self.cli("unarchive", tid).stdout
+        self.assertIn("восстановлена из дневника", out)
+        self.assertIn("отметка «выполнена» снята", out)
+        saved = self.sing.request("GET", f"/task/{tid}")
+        self.assertFalse(saved.get("journalDate"))
+        self.assertEqual(self.checked(tid), 0)
+        # канбан-связка цела: карта вернулась в колонку, из которой ушла
+        self.assertEqual(self.column_of(tid), "todo")
+
+    def test_unarchive_outside_journal_is_a_noop(self):
+        tid = self.make_task("zz: вне дневника")
+        out = self.cli("unarchive", tid).stdout
+        self.assertIn("и так не в дневнике", out)
+        self.assertFalse(
+            self.sing.request("GET", f"/task/{tid}").get("journalDate"))
+
+
 if __name__ == "__main__":
     unittest.main()

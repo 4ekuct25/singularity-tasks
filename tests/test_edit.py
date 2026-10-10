@@ -90,6 +90,13 @@ def reset_state():
                         "projectId": OUTSIDE, "group": "Q-fake-outside",
                         "checked": 0, "complete": 0, "priority": 1, "parent": "",
                         "note": NOTE, "tags": [], "journalDate": None},
+            "T-jour": {"id": "T-jour", "title": "в дневнике", "projectId": PROJ,
+                       "group": FAKE, "checked": 1, "complete": 0, "priority": 1,
+                       "parent": "", "note": NOTE, "tags": [],
+                       "journalDate": "2026-10-10T12:00:00.000Z"},
+            "T-plain": {"id": "T-plain", "title": "вне дневника", "projectId": PROJ,
+                        "group": FAKE, "checked": 0, "complete": 0, "priority": 1,
+                        "parent": "", "note": NOTE, "tags": [], "journalDate": None},
         },
         "links": {"T-loose": "KS-todo", "T-in-a": "KS-wip"},
         "patches": [],          # тела всех PATCH /task — по ним видно, что ушло
@@ -97,6 +104,7 @@ def reset_state():
         "move_column": False,   # сервер утаскивает карточку в другую колонку
         "ignore_write": False,  # сервер отвечает 200, не применив поле
         "drop_isnote": False,   # сервер теряет признак заметки
+        "ignore_unarchive": False,  # сервер отвечает 201, не сняв journalDate
         "next_id": 1,
     })
 
@@ -221,6 +229,17 @@ class TrackerStub(BaseHTTPRequestHandler):
             # заводит вторую, а переставляет существующую.
             STATE["links"][body["taskId"]] = body["statusId"]
             return self._send({"id": f"KTS-{body['taskId']}", **body})
+        if path.startswith("/task/") and path.endswith("/unarchive"):
+            # Живой сервер (замер 10-10): 201, снимает journalDate и checked,
+            # канбан-связку не трогает.
+            tid = path[len("/task/"):-len("/unarchive")]
+            task = STATE["tasks"].get(tid)
+            if not task:
+                return self._send({"error": "нет задачи"}, 404)
+            if not STATE["ignore_unarchive"]:
+                task["journalDate"] = None
+                task["checked"] = 0
+            return self._send(task, 201)
         self._send({"error": "нет такого пути"}, 404)
 
     def do_DELETE(self):
@@ -515,9 +534,10 @@ class NotesTest(EditBase):
 
     def test_append_without_edit_is_refused(self):
         """Молча проигнорированный флаг — это правка, которая «прошла», но никуда."""
+        before = len(STATE["tasks"])
         p = self.cli("notes", "--add", "Раз", "--append", "--text", "два", code=1)
         self.assertIn("--append", p.stderr)
-        self.assertEqual(len(STATE["tasks"]), 4, "заметка всё-таки создалась")
+        self.assertEqual(len(STATE["tasks"]), before, "заметка всё-таки создалась")
 
     def test_json_of_the_listing_and_of_one_note(self):
         items = json.loads(self.cli("notes", "--json").stdout)
@@ -878,3 +898,44 @@ class ReviewStartTest(EditBase):
     def test_set_start_in_queue_is_silent(self):
         r = self.cli("set", "T-loose", "--start", self.future)
         self.assertNotIn("не сработает", r.stdout)
+
+
+class UnarchiveTest(EditBase):
+    """`unarchive` — единственный штатный путь вернуть карту из дневника:
+    отметка «выполнена» вне «Готово» уносит её в journalDate и прячет из
+    представления проекта, а `board` продолжает показывать — ложная «открыта»
+    (инцидент 10-10, карта T-0e305f51)."""
+
+    def test_journaled_task_is_restored(self):
+        r = self.cli("unarchive", "T-jour")
+        task = STATE["tasks"]["T-jour"]
+        self.assertIsNone(task["journalDate"],
+                          "journalDate не снят, а команда отчиталась успехом")
+        self.assertEqual(task["checked"], 0)
+        self.assertEqual(STATE["patches"], [],
+                         "unarchive не правит поля — PATCH не должен уйти")
+        first = r.stdout.splitlines()[0]
+        self.assertTrue(first.startswith("«в дневнике»"),
+                        f"первая строка начинается не с названия: {first!r}")
+        self.assertIn("восстановлена из дневника", r.stdout)
+        self.assertIn("отметка «выполнена» снята", r.stdout)
+        self.assertIn("https://web.singularity-app.com/#/?&id=T-jour", r.stdout)
+
+    def test_not_in_journal_is_a_noop(self):
+        r = self.cli("unarchive", "T-plain")
+        self.assertIn("и так не в дневнике", r.stdout)
+        self.assertNotIn("восстановлена", r.stdout)
+        self.assertEqual(STATE["patches"], [])
+
+    def test_refuses_when_server_does_not_apply(self):
+        """Сервер ответил 201, состояние не изменилось — команда обязана упасть,
+        а не рапортовать успехом (образец: ignore_write у regroup)."""
+        STATE["ignore_unarchive"] = True
+        p = self.cli("unarchive", "T-jour", code=1)
+        self.assertIn("состояние не изменилось", p.stderr)
+        self.assertEqual(STATE["tasks"]["T-jour"]["journalDate"],
+                         "2026-10-10T12:00:00.000Z")
+
+    def test_outside_project_is_refused(self):
+        p = self.cli("unarchive", "T-alien", code=1)
+        self.assertIn("ЗАПРЕЩЕНО", p.stderr)
