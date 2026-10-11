@@ -444,6 +444,18 @@ class CycleTest(LiveBase):
         self.assertEqual(self.checked(tid), 1)
         self.assertIn(f"РЕЗУЛЬТАТ (agent:{AGENT})", self.note_of(tid))
 
+    def test_board_and_list_lines_carry_the_web_link(self):
+        """Живой вывод: строка задачи в board/list кончается веб-ссылкой на
+        карточку — по ней человек открывает задачу из саммари агента
+        (10-10, «Ждут от вас» голыми T-id)."""
+        tid = self.make_task("zz: ссылка в строке")
+        for argv in (("board",), ("list",)):
+            out = self.cli(*argv).stdout
+            line = next(s for s in out.splitlines() if tid in s)
+            self.assertTrue(
+                line.endswith("https://web.singularity-app.com/#/?&id=" + tid),
+                f"{argv[0]}: строка задачи без ссылки\n{out}")
+
     def test_start_demands_a_plan(self):
         tid = self.make_task("zz: старт без плана")
         p = self.cli("start", tid, expect=1)

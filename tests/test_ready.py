@@ -378,6 +378,18 @@ class ReadyTest(unittest.TestCase):
 
     # ------------------------------------------------------------ цена и формат
 
+    def test_ready_human_lines_carry_the_web_link(self):
+        """Готовые — это то, что агент перескажет человеку. Без ссылки в строке
+        саммари опять были бы голые T-id (10-10, «Ждут от вас»)."""
+        ids = self.ready_ids(self.ready_json(), ALPHA)
+        self.assertTrue(ids, "готовых нет — проверять нечего")
+        out = self.run_sing("ready").stdout
+        for tid in ids:
+            line = next(s for s in out.splitlines() if tid in s)
+            self.assertTrue(
+                line.endswith("https://web.singularity-app.com/#/?&id=" + tid),
+                f"{tid}: строка готовой задачи без ссылки\n{out}")
+
     def test_links_are_fetched_once_not_per_project(self):
         self.ready_json()
         self.assertEqual(Stub.hits.get("/kanban-task-status"), 1, Stub.hits)

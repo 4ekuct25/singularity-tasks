@@ -4,6 +4,29 @@
 > (сейчас: `archive/JOURNAL-2026-09.md`, 2026-09-07 … 2026-09-11, 31 запись) —
 > история не потеряна, ищи там. Порядок записей — сверху новые.
 
+## 2026-10-11 — Ссылка на карточку в строках читающих команд (T-ad62e461)
+**Что:** `scripts/sing.py` — `brief()` (строка задачи в `board`/`ready`/`list`)
+дописывает веб-ссылку `task_link(id)` в конец строки; `next` и `show` теряют
+дублирующую строку со ссылкой (у `show` остаётся десктоп-схема, id теперь из
+API-ответа, а не из аргумента). `SKILL.md` — правило «человеку — название и
+ссылка»: читающие команды тоже печатают ссылку сами. `references/api.md` —
+раздел «Ссылка на карточку». Тесты: `test_brief_line_carries_the_web_link`
+(test_pure), `test_task_line_in_human_output_carries_the_web_link` +
+`test_next_and_show_print_the_link_exactly_once` (test_json),
+`test_ready_human_lines_carry_the_web_link` (test_ready),
+`test_board_and_list_lines_carry_the_web_link` (test_live).
+**Почему:** 10-10 (сессия qwen): саммари «Ждут от вас» агент пересказал
+голыми T-id (у двух пунктов id не было вовсе) — человек нечем открывал
+карточки. Правило в SKILL.md было, но держалось моделью: перевод id→ссылку
+делала не команда, а агент, и именно там срыв. Правила колонок держатся
+механизмом (T-815fe8a7 так же для команд, меняющих задачу) — довели до
+читающих: строка сама несёт ссылку, пересказать список без неё невозможно.
+**Как проверено:** fast — 371/371 (было 367); live — 44/44, черновик
+удалён. Контрольный красный: `SING_UNDER_TEST=/tmp/sing-old.py` (sing.py с
+b354fa3) — оба новых теста на вывод краснеют. Live-вывод `list --column
+blocked` и `ready`: строки заканчиваются кликабельной ссылкой.
+**Откат:** `git revert` коммита.
+
 ## 2026-10-10 — AgentNameTest: fast не зависит от сессии-хоста (T-0084ecf5)
 **Что:** `tests/test_pure.py` — `AgentNameTest.test_precedence_flag_env_config_default`:
 `sing.detect_agent` заглушен (None → дефолт «claude»; «detected» → место в цепочке

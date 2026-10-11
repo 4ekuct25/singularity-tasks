@@ -443,6 +443,13 @@ class PriorityTest(unittest.TestCase):
         self.assertIn("ex.md", line)
         self.assertNotIn("<a", line)
 
+    def test_brief_line_carries_the_web_link(self):
+        """Ссылка — в самой строке задачи: вывод читающих команд пересказывают
+        в саммари человеку, и перевод id→ссылка, который делала модель, — ровно
+        то, что срывалось (10-10, саммари «Ждут от вас» голыми T-id)."""
+        line = sing.brief({"id": "T-1", "title": "x"})
+        self.assertTrue(line.endswith(sing.task_link("T-1")), line)
+
 
 class QueueOrderTest(unittest.TestCase):
     """Порядок очереди: приоритет → дедлайн → возраст. Сетей не трогаем —

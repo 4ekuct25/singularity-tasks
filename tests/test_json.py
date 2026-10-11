@@ -376,6 +376,28 @@ class JsonOutputTest(unittest.TestCase):
         self.assertIn("[отложена]", r.stdout)
         self.assertIn("#agent:zz-one", r.stdout)
 
+    def test_task_line_in_human_output_carries_the_web_link(self):
+        """Человеку — название и ссылка (SKILL.md): вывод читающих команд агент
+        пересказывает в саммари, и строка задачи сама несёт ссылку на карточку —
+        список без ссылок стать невозможен (10-10, «Ждут от вас» голыми T-id)."""
+        link = "https://web.singularity-app.com/#/?&id=T-plain"
+        for argv in (("list",), ("board",), ("next",), ("show", "T-plain")):
+            out = self.run_sing(*argv).stdout
+            line = next(s for s in out.splitlines() if "T-plain" in s)
+            self.assertTrue(line.endswith(link),
+                            f"{argv[0]}: строка задачи без ссылки\n{out}")
+
+    def test_next_and_show_print_the_link_exactly_once(self):
+        """brief() уже несёт ссылку в строке — отдельная строка-дубль (формат
+        до 10-10) не должна вернуться; десктоп-схема у show остаётся одна."""
+        for argv in (("next",), ("show", "T-plain")):
+            out = self.run_sing(*argv).stdout
+            self.assertEqual(out.count("web.singularity-app.com"), 1,
+                             f"{argv[0]}: веб-ссылка распечатана не один раз\n{out}")
+        out = self.run_sing("show", "T-plain").stdout
+        self.assertEqual(out.count("singularityapp://"), 1,
+                         "десктоп-схема у show потерялась")
+
 
 if __name__ == "__main__":
     unittest.main()
