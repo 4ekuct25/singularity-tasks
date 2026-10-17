@@ -20,6 +20,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import support  # noqa: E402
@@ -1471,8 +1472,17 @@ class TaskLinkTest(unittest.TestCase):
                          "https://web.singularity-app.com/#/?&id=T-abc")
 
     def test_app_scheme_link_is_still_available(self):
-        self.assertEqual(sing.task_link_app("T-abc"),
-                         "singularityapp://?&page=any&id=T-abc")
+        here = os.path.dirname(os.path.abspath(__file__))
+        with mock.patch.dict(os.environ, {"SINGULARITY_APP_PATHS": here}):
+            self.assertEqual(sing.task_link_app("T-abc"),
+                             "singularityapp://?&page=any&id=T-abc")
+
+    def test_no_app_scheme_link_without_the_app(self):
+        """Регистрация схемы в LaunchServices переживает удаление приложения в
+        Корзину, поэтому критерий — бандл на диске, а не обработчик схемы."""
+        with mock.patch.dict(os.environ,
+                             {"SINGULARITY_APP_PATHS": "/нет/SingularityApp.app"}):
+            self.assertIsNone(sing.task_link_app("T-abc"))
 
     def test_id_goes_into_the_link_as_is(self):
         """Никакого экранирования: id — это [A-Za-z0-9-], и подмена его формы

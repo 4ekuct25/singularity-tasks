@@ -212,11 +212,15 @@ class JsonOutputTest(unittest.TestCase):
         cls.srv.shutdown()
         cls.srv.server_close()
 
-    def run_sing(self, *argv, cwd=None, code=0):
+    def run_sing(self, *argv, cwd=None, code=0, **env_extra):
+        # Десктоп-приложение по умолчанию «установлено»: каталог репо заглушки
+        # существует. Иначе вывод зависел бы от того, стоит ли оно на машине.
+        env_extra.setdefault("SINGULARITY_APP_PATHS", self.repo)
         env = support.clean_env(SINGULARITY_API=self.api,
                                 SINGULARITY_TOKEN="stub",
                                 SINGULARITY_AGENT="zz-one",
-                                SINGULARITY_NO_SYNC_CHECK="1")
+                                SINGULARITY_NO_SYNC_CHECK="1",
+                                **env_extra)
         r = subprocess.run([sys.executable, SING_UNDER_TEST, *argv],
                            cwd=cwd or self.repo, env=env,
                            capture_output=True, text=True, timeout=60)
@@ -397,6 +401,17 @@ class JsonOutputTest(unittest.TestCase):
         out = self.run_sing("show", "T-plain").stdout
         self.assertEqual(out.count("singularityapp://"), 1,
                          "десктоп-схема у show потерялась")
+
+    def test_show_without_desktop_app_prints_only_the_web_link(self):
+        """Приложения нет — схему открыть нечем, macOS на клик отвечает диалогом
+        «no application set to open the URL» (10-17: приложение ушло в Корзину,
+        а регистрация схемы за ним осталась). Остаётся только веб-ссылка."""
+        gone = os.path.join(self.repo, "нет-такого", "SingularityApp.app")
+        out = self.run_sing("show", "T-plain", SINGULARITY_APP_PATHS=gone).stdout
+        self.assertNotIn("singularityapp://", out)
+        self.assertEqual(out.count("web.singularity-app.com"), 1, out)
+        t = self.parsed("show", "T-plain", "--json", SINGULARITY_APP_PATHS=gone)
+        self.assertIsNone(t["appUrl"], "--json отдал схему, которую нечем открыть")
 
 
 if __name__ == "__main__":

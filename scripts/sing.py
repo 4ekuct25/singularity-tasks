@@ -1663,13 +1663,25 @@ def column_map(project_id, statuses=None, links=None):
 TASK_LINK_WEB = "https://web.singularity-app.com/#/?&id={}"
 TASK_LINK_APP = "singularityapp://?&page=any&id={}"
 
+# Где ищется десктоп-приложение. Критерий — бандл на диске, а не обработчик
+# схемы в LaunchServices: регистрация переживает удаление приложения в Корзину
+# (10-17), и по ней схема выглядела бы рабочей, а клик давал диалог macOS
+# «no application set to open the URL». Переменная — для тестов.
+APP_PATHS = "/Applications/SingularityApp.app" + os.pathsep + "~/Applications/SingularityApp.app"
+
+
+def app_installed():
+    paths = os.environ.get("SINGULARITY_APP_PATHS", APP_PATHS).split(os.pathsep)
+    return any(os.path.isdir(os.path.expanduser(p)) for p in paths if p)
+
 
 def task_link(task_id):
     return TASK_LINK_WEB.format(task_id)
 
 
 def task_link_app(task_id):
-    return TASK_LINK_APP.format(task_id)
+    """Схема — только если приложение стоит: иначе открыть её нечем."""
+    return TASK_LINK_APP.format(task_id) if app_installed() else None
 
 
 def task_head(task_id, task):
@@ -3711,9 +3723,11 @@ def cmd_show(args):
 
     print(brief(t))
     # Веб-ссылка уже в строке задачи (brief); остаётся только десктоп-схема —
-    # её печатает один `show`. id берём из API, а не из аргумента: он обязан
-    # совпасть со ссылкой в строке выше.
-    print(f"  {task_link_app(t['id'])}")
+    # её печатает один `show`, и только когда приложение установлено. id берём
+    # из API, а не из аргумента: он обязан совпасть со ссылкой в строке выше.
+    app = task_link_app(t["id"])
+    if app:
+        print(f"  {app}")
     print("проект:", t.get("projectId"), "| выполнена:", t.get("checked"))
     print("колонка:", where, ("| теги: " + marks) if marks else "| тегов нет")
     note = note_to_display(t.get("note"))
