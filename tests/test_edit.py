@@ -99,6 +99,10 @@ def reset_state():
                         "parent": "", "note": NOTE, "tags": [], "journalDate": None},
         },
         "links": {"T-loose": "KS-todo", "T-in-a": "KS-wip"},
+        # справочник тегов: по умолчанию один (тег проверяемого агента),
+        # тесты докидывают чужие — id тега в заглушке совпадает с именем,
+        # если не задано явно
+        "tag_defs": [{"id": "TG-a", "title": "agent:zz-one"}],
         "patches": [],          # тела всех PATCH /task — по ним видно, что ушло
         "drop_note": False,     # сервер «теряет» заметку на любом PATCH
         "move_column": False,   # сервер утаскивает карточку в другую колонку
@@ -166,7 +170,7 @@ class TrackerStub(BaseHTTPRequestHandler):
                      if not q.get("taskId") or tid == q["taskId"][0]]
             return self._page("kanbanTaskStatuses", items, q)
         if path == "/tag":
-            return self._page("tags", [{"id": "TG-a", "title": "agent:zz-one"}], q)
+            return self._page("tags", STATE["tag_defs"], q)
         if path == "/checklist-item":
             return self._page("checklistItems", [], q)
         self._send({"error": f"нет такого пути: {path}"}, 404)
@@ -239,6 +243,16 @@ class TrackerStub(BaseHTTPRequestHandler):
             if not STATE["ignore_unarchive"]:
                 task["journalDate"] = None
                 task["checked"] = 0
+            return self._send(task, 201)
+        if path.startswith("/task/") and path.endswith("/complete"):
+            # Симметрично /unarchive: 201, ставит отметку «выполнена» (checked) —
+            # живой `done` так завершает карту (live-цикл сверяет checked == 1).
+            tid = path[len("/task/"):-len("/complete")]
+            task = STATE["tasks"].get(tid)
+            if not task:
+                return self._send({"error": "нет задачи"}, 404)
+            if not STATE["ignore_write"]:
+                task["checked"] = 1
             return self._send(task, 201)
         self._send({"error": "нет такого пути"}, 404)
 
@@ -939,3 +953,73 @@ class UnarchiveTest(EditBase):
     def test_outside_project_is_refused(self):
         p = self.cli("unarchive", "T-alien", code=1)
         self.assertIn("ЗАПРЕЩЕНО", p.stderr)
+
+
+class QueueAgentTagTest(EditBase):
+    """Карта очереди (колонка «Новые», todo) не несёт agent-тегов.
+
+    `report` навешивал метку держателя на любую карту, которой касался, —
+    и cron-мониторинг размечал очередь: 10-20, setup-qwencode, 95 из 104 карт
+    «Новых» несли agent:claude/agent:qwen (T-27272b82). Доска рендерит тег
+    как держателя (@имя слева от карты), и размеченная карта очереди выглядит
+    занятой. `set` тегов не трогал и не трогает: set_task_fields пишет только
+    названные поля, остальные стережёт и отказывается при чужой правке.
+
+    Контрольный красный (обязателен — проверка, которая не краснеет,
+    не проверка):
+
+        git show 9bd9421:scripts/sing.py > /tmp/sing-old.py
+        SING_UNDER_TEST=/tmp/sing-old.py python3 -m unittest \
+            tests.test_edit.QueueAgentTagTest
+
+    Краснеют ровно два теста про очередь; «занятая карта помечается» и
+    «тег остаётся после done» зелёные и на старом коде — они стерегут,
+    чтобы правка не ушла дальше очереди.
+
+    Запуск: tests/run.py fast
+    """
+
+    def queue_task(self, tid="T-queue", tags=()):
+        STATE["tasks"][tid] = {"id": tid, "title": "test: карта очереди",
+                               "projectId": PROJ, "group": FAKE,
+                               "checked": 0, "complete": 0, "priority": 1,
+                               "parent": "", "note": NOTE,
+                               "tags": list(tags), "journalDate": None}
+        STATE["links"][tid] = COLS["todo"]
+
+    def test_report_on_a_queue_card_adds_no_agent_tag(self):
+        """Свежая карта очереди остаётся без метки: на доске у неё нет
+        держателя, и очередь не выглядит занятой."""
+        self.queue_task()
+        self.cli("report", "T-queue", "промежуточный итог")
+        self.assertEqual(STATE["tasks"]["T-queue"]["tags"], [],
+                         "report навесил agent-тег на карту очереди")
+
+    def test_report_on_a_queue_card_leaves_a_foreign_mark_alone(self):
+        """Не вешать — не значит снимать. На момент report карта в очереди
+        может быть в окне между claim и переносом `start` (захват идёт ДО
+        колонки, см. claim_task): снять «оставшуюся» метку — значит затереть
+        свежий чужой захват и отдать задачу двоим."""
+        STATE["tag_defs"].append({"id": "TG-x", "title": "agent:zz-other"})
+        self.queue_task(tags=["TG-x"])
+        self.cli("report", "T-queue", "промежуточный итог")
+        self.assertEqual(STATE["tasks"]["T-queue"]["tags"], ["TG-x"],
+                         "report тронул чужую метку на карте очереди")
+
+    def test_report_on_a_working_card_still_marks(self):
+        """Занятая задача помечается как раньше: на метке держится list --mine."""
+        self.cli("report", "T-in-a", "промежуточный итог")
+        self.assertEqual(STATE["tasks"]["T-in-a"]["tags"], ["TG-a"],
+                         "report не пометил задачу в «В работе»")
+
+    def test_done_keeps_the_agent_tag(self):
+        """След «кто сделал» на «Готово» сохранён: done из очереди вешает тег,
+        и перенос в «Готово» его не сбрасывает."""
+        self.queue_task("T-queuedone")
+        STATE["tasks"]["T-queuedone"]["note"] = json.dumps(
+            [{"insert": "ПЛАН (agent:zz-one)\n- шаг один\n"}], ensure_ascii=False)
+        self.cli("done", "T-queuedone", "--report", "готово, проверено")
+        self.assertEqual(STATE["links"]["T-queuedone"], COLS["done"],
+                         "карта не в «Готово»")
+        self.assertEqual(STATE["tasks"]["T-queuedone"]["tags"], ["TG-a"],
+                         "след «кто сделал» не на закрытой карте")

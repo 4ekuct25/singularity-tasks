@@ -235,10 +235,47 @@ def mark_agent(task_id, cfg=None, override=None):
 
     Вешается на КАЖДОЙ команде, меняющей задачу, а не только в `start`: иначе
     задача, закрытая напрямую через `done`, остаётся без следа о том, кто её сделал.
+    Исключение — `report` по карте в очереди: он идёт через `mark_agent_off_queue`
+    и метку не вешает (очередь не должна выглядеть занятой).
     """
     who = agent_name(cfg, override)
     add_task_tag(task_id, ensure_tag(AGENT_TAG_PREFIX + who))
     return who
+
+
+def task_in_queue(task_id, task, cfg=None):
+    """Лежит ли задача в очереди — колонке todo СВОЕГО проекта.
+
+    Колонка — по канбан-связке с доской проекта (см. board_links), не по полю
+    задачи: в самом объекте задачи колонки нет. Id очереди — из привязки; у
+    `report` привязки может не быть (он работает и без неё), тогда раскладка
+    берётся с фактической доски проекта. На доске нет роли todo — очереди нет,
+    и «в очереди» задача быть не может.
+    """
+    pid = (task or {}).get("projectId") or task_project(task_id)
+    columns = (cfg or {}).get("columns") or {}
+    if not columns.get("todo"):
+        columns = project_columns(pid)
+    todo = columns.get("todo")
+    return bool(todo) and task_column(task_id, pid) == todo
+
+
+def mark_agent_off_queue(task_id, task, cfg=None, override=None):
+    """report: agent-метка — только если карта уже вне очереди.
+
+    Карта в колонке «Новые» (todo) не несёт agent-тегов: доска рендерит тег
+    как держателя (@имя слева от карты), и размеченная карта очереди выглядит
+    занятой (10-20, setup-qwencode: 95 из 104 карт «Новых» несли
+    agent:claude/agent:qwen, навешенные `report` cron-мониторинга).
+    Метку на такой карте НЕ снимаем: `start` вешает её ДО переноса в «В работе»
+    (см. claim_task), и в этом окне тег на карте очереди — свежий захват, а не
+    остаток; снять его — значит затереть чужой claim и отдать задачу двоим.
+    done/block метку не теряют: к их моменту карта уже вне очереди, и след
+    «кто сделал» на «Готово» сохранён. `set` тегов не вешал и не вешает.
+    """
+    if task_in_queue(task_id, task, cfg):
+        return None
+    return mark_agent(task_id, cfg, override)
 
 
 CLAIM_SETTLE = 1.5    # сколько ждать встречный захват, прежде чем считать задачу своей
@@ -3793,7 +3830,7 @@ def cmd_report(args):
     t = assert_task_allowed(args.id, cfg)
     request("PATCH", f"/task/{args.id}",
             body={"note": note_append(t.get("note"), args.text)})
-    mark_agent(args.id, cfg, getattr(args, "agent", None))
+    mark_agent_off_queue(args.id, t, cfg, getattr(args, "agent", None))
     print(f"{task_head(args.id, t)} — отчёт дописан в заметку\n  {task_link(args.id)}")
     warn_wall(args.text, "запись")
 
