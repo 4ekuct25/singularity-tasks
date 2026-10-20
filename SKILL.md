@@ -23,7 +23,7 @@ python3 /Users/s.panchenko/Projects/singularityapp/scripts/sing.py <cmd>
 `sing.py done T-... --report "..."`; `sing.py` в них — сокращение канонического вызова
 выше, с нужной командой и аргументами. Команда набирается по канону: интерпретатор
 `python3`, скрипт — абсолютным путём, без тильды. Голого `sing.py` в PATH нет;
-копии скилла (`~/.agents/skills/singularityapp/scripts/...` и аналоги в
+копии скилла (`~/.agents/skills/singularity-tasks/scripts/...` и аналоги в
 `~/.claude/skills/`, `~/.gemini/config/skills/`) канонической формой не являются.
 
 ## Доска — первое действие
