@@ -719,11 +719,30 @@ class MoveToColumnTest(unittest.TestCase):
         """Сервер отвечает 200, связка не меняется. Это обязано быть отказом."""
         self._columns("KS-OLD")          # колонка не меняется никогда
         self._links({"id": "KTS-1"})
+        # Колонка есть в списке проекта: это режим «перенос не применяется»,
+        # а не «колонка отсутствует на сервере» — своя диагностика.
+        self.addCleanup(setattr, sing, "project_statuses", sing.project_statuses)
+        sing.project_statuses = lambda pid: [{"id": "KS-T"}]
         with quiet() as err, self.assertRaises(SystemExit):
             sing.move_to_column("T-1", "KS-T")
         self.assertIn("перенос не применился", err.getvalue())
+        self.assertNotIn("отсутствует в списке колонок проекта", err.getvalue())
         self.assertEqual(len(self.calls), sing.NET_RETRIES,
                          "повторов не столько, сколько объявлено NET_RETRIES")
+
+    def test_missing_column_in_project_list_names_the_repair(self):
+        """Целевой колонки нет в списке проекта: не окно и не троттлинг —
+        диагностика называет механизм и ремонт, а не «повторите позже»."""
+        self._columns("KS-OLD")
+        self._links({"id": "KTS-1"})
+        self.addCleanup(setattr, sing, "project_statuses", sing.project_statuses)
+        sing.project_statuses = lambda pid: []
+        with quiet() as err, self.assertRaises(SystemExit):
+            sing.move_to_column("T-1", "KS-T")
+        self.assertIn("перенос не применился", err.getvalue())
+        self.assertIn("отсутствует в списке колонок проекта", err.getvalue())
+        self.assertIn("не троттлинг", err.getvalue())
+        self.assertIn("SingularityApp", err.getvalue())
 
     def test_non_fatal_returns_none_so_caller_can_name_the_task(self):
         """`add` обязан назвать уже созданный T-id, иначе сироту не найти."""

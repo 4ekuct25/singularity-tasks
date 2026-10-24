@@ -1508,6 +1508,22 @@ def move_to_column(task_id, status_id, fatal=True, project_id=None):
     actual = task_column(task_id, project_id)
     if not fatal:
         return None
+    if status_id not in {s["id"] for s in project_statuses(project_id)
+                         if not s.get("removed")}:
+        # Целевой колонки нет в live-списке проекта: сервер не отдаёт её, и
+        # PATCH/POST связки отвечают 400 «Kanban status not found» (soft=True
+        # глотает его — отсюда «перенос не применился»). Другой класс отказа,
+        # чем сетевое окно и троттлинг: повторами не лечится. Механизм из
+        # инцидента 10-23: все колонки проекта отсутствуют в облаке
+        # (GET /kanban-status?projectId= пуст, все id — 404); ремонт —
+        # синхронизация приложения, не ожидание.
+        die(f"{task_id}: перенос не применился за {NET_RETRIES} попытки — "
+            f"колонка осталась {actual}. Целевая колонка отсутствует в списке "
+            f"колонок проекта (сервер не отдаёт её: 400 «Kanban status not "
+            f"found») — это не троттлинг и не сетевое окно, повторять "
+            f"бесполезно. Вероятно, колонки проекта пропали из облака: "
+            f"проверить sing.py doctor; ремонт — синхронизация приложения, "
+            f"открыть проект в приложении SingularityApp.")
     die(f"{task_id}: перенос не применился за {NET_RETRIES} попытки — колонка "
         f"осталась {actual}. Состояние трекера не изменилось так, как ожидалось.\n"
         f"  починить вручную: sing.py move {task_id} <роль>")
