@@ -219,6 +219,79 @@ class WallWarningTest(unittest.TestCase):
             sing.warn_wall("коротко")
         self.assertEqual("", out.getvalue())
 
+    def test_warning_labeled_not_a_refusal(self):
+        """Подсказка на хвосте вывода add прочитана как ОТКАЗ (27.10, T-12a7842d):
+        агент повторил команду и почти завёл дубль. Пометки «предупреждение»
+        и «команда выполнена» обязательны — без них текст по форме
+        неотличим от die-отказа."""
+        msg = sing.wall_warning(self.WALL, "постановка")
+        self.assertIn("предупреждение", msg)
+        self.assertIn("не отказ", msg)
+        self.assertIn("выполнена", msg)
+
+
+class AddCreatedFirstTest(unittest.TestCase):
+    """Вывод add однозначен (T-12a7842d): строка «создана в колонке» — первая
+    в выводе после создания, а предупреждения (поле не взято, стена в заметке) —
+    после неё. Предупреждение на первом месте читается как отказ, и агент
+    повторяет команду: 27.10 так чуть не появился дубль.
+
+    Сетевые вызовы подменены в процессе (command_config, board_tasks, request,
+    move_to_column) — остальное в cmd_add чистые функции, сеть и токен не нужны.
+    """
+
+    TID = "T-12345678-1234-5678-1234-123456789abc"
+    WALL = "факт про замер, " * 40
+
+    def _run_add(self, priority=None):
+        cfg = {"projectId": "P-1", "columns": {"todo": "KS-P-1-TODO"}}
+        args = argparse.Namespace(
+            title="zz-тест вывода", note=self.WALL, column="todo",
+            priority=priority, deadline=None, start=None,
+            parent=None, group=None, new_group=False,
+            dup_ok=False, no_note=False)
+
+        def fake_request(method, path, query=None, body=None, soft=False):
+            self.assertEqual((method, path), ("POST", "/task"))
+            # ответа без priority: prio_of отдаст 1, и запрошенный 0
+            # сочтётся «не применён» — путь предупреждения «трекер не взял»
+            return {"id": self.TID, "title": "zz-тест вывода"}
+
+        with mock.patch.object(sing, "command_config",
+                               return_value=(cfg, None)), \
+                mock.patch.object(sing, "board_tasks", return_value=[]), \
+                mock.patch.object(sing, "request", side_effect=fake_request), \
+                mock.patch.object(sing, "move_to_column",
+                                  return_value="KS-P-1-TODO"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            sing.cmd_add(args)
+        return out.getvalue()
+
+    def test_created_line_is_first_with_wall_note(self):
+        text = self._run_add()
+        first = text.splitlines()[0]
+        self.assertTrue(
+            first.startswith(f"{self.TID}: создана в колонке 'todo'"),
+            f"первая строка не о создании: {first!r}")
+        created = text.index("создана в колонке")
+        self.assertLess(created, text.index("стена"))
+        self.assertNotIn("⚠", text[:created],
+                         "предупреждение до строки успеха читается как отказ")
+
+    def test_dropped_field_warning_stays_after_created_line(self):
+        text = self._run_add(priority=0)
+        self.assertIn("трекер не взял", text)
+        created = text.index("создана в колонке")
+        dropped = text.index("трекер не взял")
+        wall = text.index("стена")
+        first = text.splitlines()[0]
+        self.assertTrue(
+            first.startswith(f"{self.TID}: создана в колонке 'todo'"),
+            f"первая строка не о создании: {first!r}")
+        self.assertLess(created, dropped,
+                        "предупреждение о поле раньше строки успеха")
+        self.assertLess(dropped, wall)
+
 
 class BareTaskIdTest(unittest.TestCase):
     """Голый id задачи в тексте для человека: полный UUID получает ссылку в
