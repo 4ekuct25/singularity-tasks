@@ -1330,7 +1330,11 @@ def note_dump(ops):
 # Блочный атрибут в Quill вешается на "\n", а не на текст строки — отсюда две разные
 # ветки ниже. Перепутать легко, и приложение тогда покажет абзац без списка.
 def _body_ops(text):
-    """Текст в операции: строки, начинающиеся с «- » или «* », становятся списком."""
+    """Текст в операцию: строки, начинающиеся с «- » или «* », становятся списком.
+
+    Голый полный id задачи получает ссылку (linkify_bare_task_ids): карточку
+    читает человек, и голый id открыть нечем."""
+    text = linkify_bare_task_ids(text)[0]
     ops = []
     for line in text.split("\n"):
         stripped = line.lstrip()
@@ -1384,6 +1388,84 @@ def warn_wall(text, what="запись"):
     msg = wall_warning(text, what)
     if msg:
         print(msg)
+
+
+# Голый id задачи в тексте для человека — id без ссылки, и открыть его нечем.
+# Тот же паттерн, что «стена»: правило есть, а вспоминается уже после того, как
+# id уехал в карточку. Механизм: полный UUID без ссылки получает ссылку в
+# единой точке, где текст становится заметкой (linkify в _body_ops); короткому
+# префиксу — только предупреждение: ссылку из него не построить.
+TASK_ID_FULL_RE = re.compile(
+    r"(?<![\w-])T-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}")
+TASK_ID_SHORT_RE = re.compile(r"(?<![\w-])T-[0-9a-f]{8}(?![0-9a-f-])")
+_URL_SPAN_RE = re.compile(r"https?://\S+")
+LINKED_HOST = "web.singularity-app.com"
+
+
+def _bare_id_occurrences(text):
+    """(вид, старт, конец, id) по каждому id в тексте без ссылки.
+
+    Вид — «full» (ссылку можно дописать) или «short» (нельзя — только
+    предупреждение). Id не считается голым, если он внутри URL (это и есть
+    ссылка, ?&id=…) или за ним вплотную (через пробел и/или скобку) идёт
+    ссылка на LINKED_HOST — агент уже поставил ссылку рядом.
+    """
+    text = text or ""
+    spans = [(m.start(), m.end()) for m in _URL_SPAN_RE.finditer(text)]
+
+    def has_link(s, e):
+        if any(u <= s and e <= v for u, v in spans):
+            return True
+        m = re.match(r"\s*\(?\s*(https?://\S*)", text[e:])
+        return bool(m and LINKED_HOST in m.group(1))
+
+    for rx, kind in ((TASK_ID_FULL_RE, "full"), (TASK_ID_SHORT_RE, "short")):
+        for m in rx.finditer(text):
+            if not has_link(*m.span()):
+                yield (kind, m.start(), m.end(), m.group(0))
+
+
+def bare_task_ids(text):
+    """(полные, короткие) — голые id задач в тексте. См. _bare_id_occurrences."""
+    full = [t for k, _, _, t in _bare_id_occurrences(text) if k == "full"]
+    short = [t for k, _, _, t in _bare_id_occurrences(text) if k == "short"]
+    return tuple(full), tuple(short)
+
+
+def linkify_bare_task_ids(text):
+    """За каждым голым полным id дописать ссылку: T-… (https://web.…&id=T-…).
+
+    Возвращает (новый текст, сколько переписано). Короткие префиксы не
+    переписываются — ссылку из них не построить, про них предупреждает
+    warn_bare_ids.
+    """
+    text = text or ""
+    out, pos, n = [], 0, 0
+    for kind, s, e, tid in _bare_id_occurrences(text):
+        if kind != "full":
+            continue
+        out.append(text[pos:s])
+        out.append(f"{tid} ({task_link(tid)})")
+        pos = e
+        n += 1
+    out.append(text[pos:])
+    return "".join(out), n
+
+
+def warn_bare_ids(text, what="запись"):
+    """Напечатать предупреждение о голых id задач. Никогда не роняет команду.
+
+    Полные UUID уже спасены (linkify_bare_task_ids в точке, где текст
+    становится заметкой), поэтому предупреждение — агенту: писать ссылки
+    сразу и про короткие префиксы, которые механизм не чинит.
+    """
+    full, short = bare_task_ids(text)
+    if full:
+        print(f"⚠ {what}: {len(full)} id задач без ссылки — текст заметки "
+              "дополнен ссылками. Пиши со ссылкой сразу.")
+    for tid in short:
+        print(f"⚠ {what}: короткий id {tid} — ссылку из него не построить, "
+              "человеку нечем открыть. Полный UUID — в строке board/list.")
 
 
 def note_append(note, text, label=None):
@@ -3395,6 +3477,7 @@ def cmd_notes(args):
                   [f"{args.edit}: заметка {'дополнена' if args.append else 'переписана'}"
                    f" — было {was} символов, стало {len(text)}",
                    f"  {task_link(args.edit)}"])
+        warn_bare_ids(args.text, "заметка")
         return
 
     if args.add:
@@ -3413,6 +3496,7 @@ def cmd_notes(args):
                   if args.json else None,
                   [f"{n['id']}: заметка создана — {args.add}",
                    f"  {task_link(n['id'])}"])
+        warn_bare_ids(args.text or "", "заметка")
         return
 
     notes = project_notes(pid)
@@ -3816,6 +3900,7 @@ def cmd_start(args):
           + f"\n  {task_link(args.id)}")
     if args.plan:
         warn_wall(args.plan, "план")
+        warn_bare_ids(args.plan, "план")
 
 
 def cmd_release(args):
@@ -3839,6 +3924,8 @@ def cmd_release(args):
     print(f"{task_head(args.id, task)} — возвращена в очередь"
           + (f", тег {AGENT_TAG_PREFIX}{who} снят" if dropped else "")
           + f"\n  {task_link(args.id)}")
+    if args.report:
+        warn_bare_ids(args.report, "возврат в очередь")
 
 
 def cmd_report(args):
@@ -3849,6 +3936,7 @@ def cmd_report(args):
     mark_agent_off_queue(args.id, t, cfg, getattr(args, "agent", None))
     print(f"{task_head(args.id, t)} — отчёт дописан в заметку\n  {task_link(args.id)}")
     warn_wall(args.text, "запись")
+    warn_bare_ids(args.text, "запись")
 
 
 def cmd_done(args):
@@ -3892,6 +3980,7 @@ def cmd_done(args):
         warn_review_start(task)
     if args.report:
         warn_wall(args.report, "результат")
+        warn_bare_ids(args.report, "результат")
 
 
 def cmd_block(args):
@@ -3904,6 +3993,7 @@ def cmd_block(args):
     print(f"{task_head(args.id, t)} — заблокирована, причина записана в заметку\n"
           f"  {task_link(args.id)}")
     warn_wall(args.reason, "причина блокировки")
+    warn_bare_ids(args.reason, "причина блокировки")
 
 
 def cmd_unarchive(args):
@@ -4109,6 +4199,7 @@ def cmd_add(args):
               f"  {task_link(tid)}")
     if args.note:
         warn_wall(args.note, "постановка")
+        warn_bare_ids(args.note, "постановка")
 
 
 def cmd_move(args):

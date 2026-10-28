@@ -1023,3 +1023,32 @@ class QueueAgentTagTest(EditBase):
                          "карта не в «Готово»")
         self.assertEqual(STATE["tasks"]["T-queuedone"]["tags"], ["TG-a"],
                          "след «кто сделал» не на закрытой карте")
+
+
+class BareIdLinkTest(EditBase):
+    """Голый id задачи в тексте, уходящем в заметку: полный UUID получает
+    ссылку в точке, где текст становится заметкой, короткому — предупреждение.
+    Механизм, а не память модели (T-87f44fac)."""
+
+    FULL = "T-12345678-1234-5678-1234-56789abcdef0"
+    LINK = f"https://web.singularity-app.com/#/?&id={FULL}"
+
+    def test_report_note_carries_the_link(self):
+        r = self.cli("report", "T-in-a",
+                     f"дубль карточки {self.FULL} — работа продолжается там")
+        note = STATE["tasks"]["T-in-a"]["note"]
+        self.assertIn(self.LINK, note, "голый id уехал в заметку без ссылки")
+        self.assertIn("без ссылки", r.stdout)
+
+    def test_short_prefix_warns_but_is_not_rewritten(self):
+        r = self.cli("report", "T-in-a", "дубль T-12345678")
+        note = STATE["tasks"]["T-in-a"]["note"]
+        self.assertIn("T-12345678", note)
+        self.assertNotIn(self.LINK, note)
+        self.assertIn("короткий", r.stdout)
+
+    def test_id_already_linked_is_not_touched(self):
+        self.cli("report", "T-in-a", f"карточка {self.FULL} ({self.LINK})")
+        note = STATE["tasks"]["T-in-a"]["note"]
+        self.assertEqual(note.count(self.LINK), 1,
+                         "механизм дописал ссылку второй раз")

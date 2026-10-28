@@ -444,6 +444,19 @@ class CycleTest(LiveBase):
         self.assertEqual(self.checked(tid), 1)
         self.assertIn(f"РЕЗУЛЬТАТ (agent:{AGENT})", self.note_of(tid))
 
+    def test_bare_task_id_in_done_report_gets_a_link(self):
+        """Живой путь: голый id задачи в --report не доезжает до карточки
+        без ссылки — механизм дописывает её в точке, где текст становится
+        заметкой, и предупреждает в stdout (T-87f44fac)."""
+        tid = self.make_task("zz: голый id в отчёте")
+        twin = self.make_task("zz: дубль для отчёта")
+        self.cli("start", tid, "--plan", "проверяю ссылку к id в отчёте")
+        out = self.cli("done", tid, "--report",
+                       f"дубль карточки {twin} — работа продолжается там").stdout
+        self.assertIn(f"https://web.singularity-app.com/#/?&id={twin}",
+                      self.note_of(tid), "голый id уехал в карточку без ссылки")
+        self.assertIn("без ссылки", out)
+
     def test_board_and_list_lines_carry_the_web_link(self):
         """Живой вывод: строка задачи в board/list кончается веб-ссылкой на
         карточку — по ней человек открывает задачу из саммари агента

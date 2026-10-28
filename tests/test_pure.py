@@ -220,6 +220,74 @@ class WallWarningTest(unittest.TestCase):
         self.assertEqual("", out.getvalue())
 
 
+class BareTaskIdTest(unittest.TestCase):
+    """Голый id задачи в тексте для человека: полный UUID получает ссылку в
+    точке, где текст становится заметкой, короткому — предупреждение.
+    Механизм, а не память модели: карточку прочтёт человек, и открыть голый
+    id нечем (T-87f44fac, инцидент — голый T-... в блоке РЕЗУЛЬТАТ)."""
+
+    FULL = "T-12345678-1234-5678-1234-56789abcdef0"
+    FULL2 = "T-abcdef12-abcd-1234-abcd-123456789abc"
+    LINK = f"https://web.singularity-app.com/#/?&id={FULL}"
+
+    def test_bare_full_id_gets_a_link(self):
+        new, n = sing.linkify_bare_task_ids(
+            f"дубль карточки {self.FULL} — работа продолжается там")
+        self.assertEqual(n, 1)
+        self.assertIn(f"{self.FULL} ({self.LINK})", new)
+
+    def test_two_bare_ids_both_get_links(self):
+        new, n = sing.linkify_bare_task_ids(f"{self.FULL} и {self.FULL2}")
+        self.assertEqual(n, 2)
+        self.assertIn(f"({sing.task_link(self.FULL2)})", new)
+
+    def test_id_inside_url_is_untouched(self):
+        self.assertEqual(sing.linkify_bare_task_ids(self.LINK), (self.LINK, 0))
+
+    def test_id_followed_by_task_url_is_untouched(self):
+        text = f"{self.FULL} {self.LINK}"
+        self.assertEqual(sing.linkify_bare_task_ids(text), (text, 0))
+
+    def test_id_followed_by_parenthesized_task_url_is_untouched(self):
+        text = f"{self.FULL} ({self.LINK})"
+        self.assertEqual(sing.linkify_bare_task_ids(text), (text, 0))
+
+    def test_other_url_next_to_id_is_not_its_link(self):
+        text = f"{self.FULL} см. https://example.com/x"
+        new, n = sing.linkify_bare_task_ids(text)
+        self.assertEqual(n, 1)
+        self.assertIn(f"({self.LINK})", new)
+
+    def test_short_prefix_is_not_rewritten(self):
+        text = "дубль T-12345678"
+        self.assertEqual(sing.linkify_bare_task_ids(text), (text, 0))
+        full, short = sing.bare_task_ids(text)
+        self.assertEqual(full, ())
+        self.assertEqual(short, ("T-12345678",))
+
+    def test_note_append_carries_the_link(self):
+        dump = sing.note_append(None, f"дубль {self.FULL}")
+        self.assertIn(self.LINK, dump)
+
+    def test_warn_prints_for_bare_full(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sing.warn_bare_ids(f"дубль {self.FULL}")
+        self.assertIn("без ссылки", out.getvalue())
+
+    def test_warn_prints_for_short_prefix(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sing.warn_bare_ids("дубль T-12345678")
+        self.assertIn("короткий", out.getvalue())
+
+    def test_warn_is_silent_when_everything_is_linked(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sing.warn_bare_ids(f"{self.FULL} ({self.LINK})")
+        self.assertEqual("", out.getvalue())
+
+
 # --------------------------------------------------------------------- заголовки
 
 
