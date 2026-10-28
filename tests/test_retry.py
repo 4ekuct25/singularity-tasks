@@ -178,6 +178,24 @@ class RetryPolicyTest(unittest.TestCase):
                                  f"{method} повторён после 5xx — можно создать дубль")
                 self.assertEqual(r["outcome"], "exit 1")
 
+    def test_5xx_on_non_get_says_it_might_have_applied(self):
+        """5xx у не-GET: запрос мог примениться на сервере. Ошибка обязана
+        велеть перечитать состояние, а не слепой повтор (повторный
+        POST /task — дубль): на живой сессии голый «PATCH /task -> HTTP 500»
+        не сказал агенту, что изменение могло пройти."""
+        for method in ("POST", "PATCH", "DELETE"):
+            with self.subTest(method=method):
+                r = self.call([E500] * 9, method=method, body={"title": "x"})
+                self.assertIn("могло примениться", r["stderr"])
+                self.assertIn("перечитай состояние", r["stderr"])
+        # Контрольные отрицания: подсказка не нужна на GET (повтор безопасен,
+        # состояние не меняется) и на 429 (сервер отказался ОБСЛУЖИТЬ запрос,
+        # то есть не выполнял его).
+        self.assertNotIn("могло примениться", self.call([E500] * 9)["stderr"])
+        r = self.call([ra(0.05)] * 9, method="POST", body={"title": "x"})
+        self.assertEqual(r["outcome"], "exit 1")
+        self.assertNotIn("могло примениться", r["stderr"])
+
     def test_4xx_is_never_retried(self):
         r = self.call([(404, {}, {"error": "no such task"})] * 9)
         self.assertEqual(r["attempts"], 1)

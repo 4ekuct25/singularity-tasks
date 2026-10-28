@@ -918,7 +918,15 @@ def request(method, path, query=None, body=None, soft=False):
                 die("401 Unauthorized: токен недействителен или ему не хватает прав.")
             spent = (f" (попыток: {attempt}, ждали {waited:.1f} с)"
                      if attempt > 1 else "")
-            die(f"{method} {path} -> HTTP {e.code}{spent}: {detail}")
+            # 5xx у не-GET: запрос мог примениться на сервере до сбоя. Голый отказ
+            # толкает агента повторить команду, а повторный POST /task — это дубль,
+            # поэтому сообщение велит сначала перечитать состояние. 429 подсказки
+            # не получает: сервер отказался ОБСЛУЖИТЬ запрос, то есть не выполнял его.
+            hint = ""
+            if not idempotent and e.code in HTTP_RETRY_5XX:
+                hint = ("\n  5xx: изменение могло примениться. Перед повтором "
+                        "перечитай состояние (board/show). Слепой повтор запрещён.")
+            die(f"{method} {path} -> HTTP {e.code}{spent}: {detail}{hint}")
         except (urllib.error.URLError, TimeoutError,
                 http.client.HTTPException) as e:
             # URLError покрывает только установку соединения и отправку запроса:
