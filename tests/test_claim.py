@@ -47,6 +47,12 @@ TASK = "T-stub-0001"
 MINE = "agent:zz-taker"
 FOREIGN = "agent:zz-holder"
 
+# Привязка проекта: роли колонок для проверки «мёртвая метка — не захват».
+# Доску не поднимаем — колонку задачи задаёт сам тест patch-ем task_column.
+CFG = {"columns": {"todo": "KS-todo", "wip": "KS-wip",
+                   "review": "KS-review", "done": "KS-done",
+                   "blocked": "KS-blocked"}}
+
 
 class LaggingStub(BaseHTTPRequestHandler):
     """Трекер, у которого запись доезжает не сразу. Состояние — в `STATE`."""
@@ -173,6 +179,12 @@ class ClaimAgainstLagTest(unittest.TestCase):
                 self.addCleanup(setattr, self.sing, name,
                                 getattr(self.sing, name))
                 setattr(self.sing, name, value)
+        # Колонку задачи задаёт тест (self.column): доску в заглушке не
+        # поднимаем — claim-решение читает только роль колонки.
+        self.column = None
+        orig = self.sing.task_column
+        self.sing.task_column = lambda task_id, pid=None: self.column
+        self.addCleanup(setattr, self.sing, "task_column", orig)
 
     def claim(self):
         """Перехват под своим именем. Возвращает (код выхода|None, stderr)."""
@@ -187,6 +199,18 @@ class ClaimAgainstLagTest(unittest.TestCase):
 
     def visible(self):
         return list(STATE["committed"])
+
+    def claim_cfg(self, column, take_over=False):
+        """Захват по привязке: колонку карты задаёт `column`, take_over явно."""
+        self.column = column
+        err = io.StringIO()
+        try:
+            with redirect_stderr(err):
+                self.sing.claim_task(TASK, CFG, override="zz-taker",
+                                     take_over=take_over)
+            return None, err.getvalue()
+        except SystemExit as e:
+            return e.code, err.getvalue()
 
     # ---------------------------------------------------------------- тесты
     def test_take_over_survives_a_lagging_queue(self):
@@ -246,6 +270,55 @@ class ClaimAgainstLagTest(unittest.TestCase):
         code, err = self.claim()
         self.assertIsNone(code, err)
         self.assertEqual(self.visible(), [MINE])
+
+    # --- мёртвая метка завершившейся сессии (T-3ef6b167) -------------------
+    def test_stale_mark_in_review_does_not_block(self):
+        """Карта в «На проверке» с чужой меткой берётся без --take-over.
+
+        Метка завершившейся сессии — не захват: держатель только в wip (и в
+        окне claim в todo). Ровно сценарий T-3ef6b167: сабагент закрыл карту
+        done --review и завершился, метка осталась, следующий start упирался
+        в «Две сессии над одной задачей».
+        """
+        reset([FOREIGN], lag_all=0)
+        code, err = self.claim_cfg(CFG["columns"]["review"])
+        self.assertIsNone(code, f"отказ по карте из «На проверке»: {err}")
+        self.assertEqual(self.visible(), [MINE],
+                         "своя метка не стала держателем")
+
+    def test_stale_mark_in_done_does_not_block(self):
+        """Карта в «Готово» с чужой меткой — то же: след, не захват."""
+        reset([FOREIGN], lag_all=0)
+        code, err = self.claim_cfg(CFG["columns"]["done"])
+        self.assertIsNone(code, f"отказ по карте из «Готово»: {err}")
+        self.assertEqual(self.visible(), [MINE])
+
+    def test_held_mark_in_wip_still_refused(self):
+        """Карта в «В работе» с чужой меткой — отказ сохранён.
+
+        Граница карты: защита от двух живых сессий на карте в wip не
+        ослабляется. Отказ не трогает чужую метку (она остаётся держателем).
+        """
+        reset([FOREIGN], lag_all=0)
+        code, err = self.claim_cfg(CFG["columns"]["wip"])
+        self.assertEqual(code, 1,
+                         "взял карту в wip с чужой меткой без --take-over")
+        self.assertIn("уже занята", err)
+        self.assertEqual(self.visible(), [FOREIGN], "отказ тронул чужую метку")
+
+    def test_held_mark_in_todo_still_refused(self):
+        """Карта в очереди с чужой меткой — отказ: окно claim, не мёртвый след.
+
+        Метку вешают ДО переноса в wip, поэтому размеченная todo-карта может
+        быть свежим захватом, а не остатком; пропустить такой отказ — отдать
+        задачу двоим.
+        """
+        reset([FOREIGN], lag_all=0)
+        code, err = self.claim_cfg(CFG["columns"]["todo"])
+        self.assertEqual(code, 1,
+                         "взял карту из todo с чужой меткой без --take-over")
+        self.assertIn("уже занята", err)
+        self.assertEqual(self.visible(), [FOREIGN])
 
 
 if __name__ == "__main__":

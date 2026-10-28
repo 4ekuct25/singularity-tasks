@@ -299,17 +299,36 @@ def claim_task(task_id, cfg, override=None, take_over=False):
     считал задачу своей, а доска показывала первого.
 
     Захват идёт ДО переноса колонки: проигравший не должен успеть подвинуть доску.
+
+    Чужая метка — не всегда живой захват. Держатель — только карта в wip (и в
+    todo в окне claim, когда метку вешают ДО переноса колонки). На карте в
+    review/done чужой agent-тег — след сессии, что отправила её на проверку /
+    закрыла: сессия над картой больше не работает. Такой след не блокирует
+    новый start — иначе каждая карта завершившегося сабагента требовала бы
+    ручной --take-over (карта T-3ef6b167: трижды за сессию на setup-qwencode).
     """
     who = agent_name(cfg, override)
     my_title = AGENT_TAG_PREFIX + who
     task = request("GET", f"/task/{task_id}")
     foreign = [(tid, t) for tid, t in agent_tags_on(task) if t != my_title]
     if foreign and not take_over:
-        die(f"{task_id}: задача уже занята — {', '.join(t for _, t in foreign)}.\n"
-            "  Две сессии над одной задачей — это потерянный контекст, а не "
-            "параллельная работа.\n"
-            f"  Взять всё равно (снимет чужие метки): sing.py start {task_id} "
-            "--take-over ...")
+        # Чужая метка блокирует только живой захват: карта в wip, либо в todo
+        # в окне claim (метку вешают до переноса колонки). На review/done
+        # метка — мёртвый след завершившейся сессии, не захват: отказываться
+        # не за что, перехват идёт без --take-over.
+        cols = (cfg or {}).get("columns") or {}
+        stale = {c for c in (cols.get("review"), cols.get("done")) if c}
+        col = task_column(task_id, task.get("projectId")) if stale else None
+        if col not in stale:
+            role = next((r for r, c in cols.items() if c == col), col)
+            where = f"  Карта в колонке {role}.\n" if col else ""
+            die(f"{task_id}: задача уже занята — "
+                f"{', '.join(t for _, t in foreign)}.\n"
+                f"{where}"
+                "  Две сессии над одной задачей — это потерянный контекст, а не "
+                "параллельная работа.\n"
+                f"  Взять всё равно (снимет чужие метки): sing.py start {task_id} "
+                "--take-over ...")
     # ⚠ Снять чужое и поставить своё — ОДНИМ PATCH, а не двумя.
     # Двумя было так: `tags=[]`, потом `tags=[мой]`. Между ними задача висит
     # вообще без agent-метки, то есть выглядит свободной; а если второй PATCH
