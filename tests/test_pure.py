@@ -474,6 +474,103 @@ class FuzzyAddDupTest(unittest.TestCase):
             self._run_add(board, "обновить  тесты")
 
 
+class ResolveTaskIdTest(unittest.TestCase):
+    """Короткий префикс id задачи: разрешение среди задач привязанного проекта.
+
+    Сервер на коротком id отвечает 404, неотличимым от сбоя API, поэтому
+    main() разрешает префикс в полный UUID до диспетчеризации (T-22e9cfc2).
+    Полный UUID ходит как есть — без доп. запроса.
+    """
+
+    TASKS = [
+        {"id": "T-dc271f60-aaaa-bbbb-cccc-000000000001", "title": "alpha"},
+        {"id": "T-dc271f61-aaaa-bbbb-cccc-000000000002", "title": "alpha 2"},
+        {"id": "T-22e9cfc2-e466-4a9e-98a7-3eae9a5fe34a", "title": "beta"},
+        {"id": "T-11111111-2222-3333-4444-555555555555", "title": "удалена",
+         "removed": True},
+    ]
+    _UNSET = object()
+
+    def _resolve(self, ref, tasks=None, cfg=_UNSET):
+        """resolve_task_id с замещённой границей: привязка + листинг проекта."""
+        if tasks is None:
+            tasks = self.TASKS
+        if cfg is self._UNSET:
+            cfg = {"projectId": "P-1"}
+
+        def fake_paged(path, key, query=None, **kw):
+            return [dict(t) for t in tasks] if path == "/task" else []
+
+        with mock.patch.object(sing, "load_config",
+                               return_value=(cfg, None)), \
+                mock.patch.object(sing, "paged",
+                                  side_effect=fake_paged) as paged_p, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                result = sing.resolve_task_id(ref)
+            except SystemExit as e:
+                result = e
+        return result, err.getvalue(), paged_p
+
+    def test_full_uuid_passes_through_without_fetch(self):
+        full = "T-dc271f60-aaaa-bbbb-cccc-000000000001"
+        result, _err, paged_p = self._resolve(full)
+        self.assertEqual(result, full)
+        paged_p.assert_not_called()   # полного id не требует доп. запроса
+
+    def test_unique_prefix_resolves_to_full_id(self):
+        result, err, _p = self._resolve("T-dc271f60")
+        self.assertEqual(result, "T-dc271f60-aaaa-bbbb-cccc-000000000001")
+        self.assertIn("разрешено как T-dc271f60-aaaa-bbbb-cccc-000000000001",
+                      err)
+
+    def test_ambiguous_prefix_refuses_with_candidates(self):
+        result, err, _p = self._resolve("T-dc271f")
+        self.assertIsInstance(result, SystemExit)
+        self.assertEqual(result.code, 1)
+        # оба кандидата названы полными id — по ним и выбирают
+        self.assertIn("T-dc271f60-aaaa-bbbb-cccc-000000000001", err)
+        self.assertIn("T-dc271f61-aaaa-bbbb-cccc-000000000002", err)
+        self.assertIn("sing.py list", err)
+
+    def test_no_match_refuses_with_hint(self):
+        result, err, _p = self._resolve("T-zzzzzzzz")
+        self.assertIsInstance(result, SystemExit)
+        self.assertIn("не найдена", err)
+        self.assertIn("sing.py list", err)
+
+    def test_removed_task_is_not_a_candidate(self):
+        # удалённая задача с уникальным префиксом — не кандидат, а «не найдена»
+        result, err, _p = self._resolve("T-11111111")
+        self.assertIsInstance(result, SystemExit)
+        self.assertIn("не найдена", err)
+
+    def test_no_binding_refuses_before_fetch(self):
+        result, err, paged_p = self._resolve("T-dc271f60", cfg=None)
+        self.assertIsInstance(result, SystemExit)
+        self.assertIn("не привязан", err)
+        paged_p.assert_not_called()
+
+    def test_main_resolves_short_id_before_dispatch(self):
+        """Хук в main(): короткая id доходит до команды уже полной UUID."""
+        full = "T-dc271f60-aaaa-bbbb-cccc-000000000001"
+
+        def fake_paged(path, key, query=None, **kw):
+            return [dict(t) for t in self.TASKS] if path == "/task" else []
+
+        with mock.patch.object(sing, "load_config",
+                               return_value=({"projectId": "P-1"}, None)), \
+                mock.patch.object(sing, "paged", side_effect=fake_paged), \
+                mock.patch.object(sys, "argv",
+                                  ["sing.py", "show", "T-dc271f60"]), \
+                mock.patch.object(sing, "cmd_show") as show_p, \
+                mock.patch.object(sing, "warn_if_skill_drifted"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            sing.main()
+        show_p.assert_called_once()
+        self.assertEqual(show_p.call_args[0][0].id, full)
+
+
 class BareTaskIdTest(unittest.TestCase):
     """Голый id задачи в тексте для человека: полный UUID получает ссылку в
     точке, где текст становится заметкой, короткому — предупреждение.

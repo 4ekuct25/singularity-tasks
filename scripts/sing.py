@@ -1782,6 +1782,51 @@ def rebind_role_links(role, old_id, new_id):
           f"{old_id} на {new_id} ({', '.join(how)}; сверено перечитыванием)")
 
 
+# Полный id задачи — T- + UUID (36 символов). Короткий префикс — то, как id
+# цитируют в заголовках и отчётах — сервер не понимает (404, неотличимый от
+# сбоя), поэтому разрешается заранее, в main(), а не на лету (см.
+# resolve_task_id). Остальные формы (KTS-/Q-/P- и т.п.) сюда не ходят: команды
+# принимают только id задачи.
+FULL_TASK_ID = re.compile(
+    r"^T-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def resolve_task_id(ref):
+    """Короткий префикс id задачи разрешить среди задач привязанного проекта.
+
+    Полный UUID (T- + 36 символов) ходит как есть — без доп. запроса. Короткий
+    префикс матчится по задачам проекта из привязки: одно совпадение — оно,
+    несколько — отказ со списком кандидатов, ноль — отказ с подсказкой взять
+    полный id из list. Область — только привязанный проект (AGENTS.md §3):
+    коротким id не достучаться до задачи другого проекта, а репозиторий
+    без привязки короткой id не разрешит вовсе.
+    """
+    if FULL_TASK_ID.match(ref):
+        return ref
+    cfg, _ = load_config(required=False)
+    project_id = (cfg or {}).get("projectId")
+    if not project_id:
+        die(f"{ref}: короткий id разрешается только среди задач привязанного "
+            "проекта, а репозиторий не привязан.\n"
+            "  привязка: sing.py init --project \"<название>\" · "
+            "полный id: sing.py list")
+    low = ref.casefold()
+    hits = [t for t in board_tasks(project_id)
+            if (t.get("id") or "").casefold().startswith(low)]
+    if not hits:
+        die(f"{ref}: задача не найдена среди задач привязанного проекта.\n"
+            "  нужен полный id — sing.py list")
+    if len(hits) > 1:
+        lines = "\n".join(f"    {t['id']}  {t.get('title', '')}" for t in hits)
+        die(f"{ref}: префиксу подходит {len(hits)} задач:\n{lines}\n"
+            "  уточни префикс или возьми полный id — sing.py list")
+    full = hits[0]["id"]
+    print(f"{ref}: разрешено как {full}  {hits[0].get('title', '')}",
+          file=sys.stderr)
+    return full
+
+
 def assert_task_allowed(task_id, cfg=None, fallback=False):
     """Задача обязана лежать в проекте, разрешённом ограничением области.
 
@@ -5480,6 +5525,13 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    # Короткие префиксы id задачи (как их цитируют в заголовках и отчётах)
+    # разрешить до диспетчеризации: каждая команда получит полный UUID, и
+    # дальше он ходит в API как есть. Полной id разрешение не видно вовсе —
+    # ни доп. запроса, ни вывода.
+    for attr in ("id", "parent"):
+        if getattr(args, attr, None):
+            setattr(args, attr, resolve_task_id(getattr(args, attr)))
     args.fn(args)
     warn_if_skill_drifted(args.cmd)
 

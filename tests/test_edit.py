@@ -44,6 +44,9 @@ SING_UNDER_TEST = os.environ.get("SING_UNDER_TEST") or support.SING
 ROOT = "P-root"
 PROJ = "P-zz"
 OUTSIDE = "P-outside"
+# Чужая задача адресуется ПОЛНЫМ UUID: короткий префикс разрешается только
+# среди задач привязанного проекта (T-22e9cfc2), до чужого он не доходит.
+ALIEN = "T-0badc0de-1234-5678-9abc-def012345678"
 COLS = {"todo": "KS-todo", "wip": "KS-wip", "review": "KS-review",
         "done": "KS-done", "blocked": "KS-blocked"}
 COL_NAMES = {"KS-todo": "К работе", "KS-wip": "В работе", "KS-review": "На проверке",
@@ -86,10 +89,10 @@ def reset_state():
                        "note": json.dumps([{"insert": "прод через ansible\n"}],
                                           ensure_ascii=False),
                        "tags": [], "journalDate": None},
-            "T-alien": {"id": "T-alien", "title": "в чужом проекте",
-                        "projectId": OUTSIDE, "group": "Q-fake-outside",
-                        "checked": 0, "complete": 0, "priority": 1, "parent": "",
-                        "note": NOTE, "tags": [], "journalDate": None},
+            ALIEN: {"id": ALIEN, "title": "в чужом проекте",
+                    "projectId": OUTSIDE, "group": "Q-fake-outside",
+                    "checked": 0, "complete": 0, "priority": 1, "parent": "",
+                    "note": NOTE, "tags": [], "journalDate": None},
             "T-jour": {"id": "T-jour", "title": "в дневнике", "projectId": PROJ,
                        "group": FAKE, "checked": 1, "complete": 0, "priority": 1,
                        "parent": "", "note": NOTE, "tags": [],
@@ -388,7 +391,9 @@ class RegroupTest(EditBase):
         self.assertIn("ровно одно", p.stderr)
 
     def test_task_outside_the_allowed_scope_is_refused(self):
-        p = self.cli("regroup", "T-alien", "Раздел A", cwd=self.unbound, code=1)
+        # Чужая задача — полным UUID: короткий префикс до неё не доходит
+        # (разрешается только среди привязанного проекта, T-22e9cfc2).
+        p = self.cli("regroup", ALIEN, "Раздел A", cwd=self.unbound, code=1)
         self.assertIn("ЗАПРЕЩЕНО", p.stderr)
         self.assertEqual(STATE["patches"], [])
 
@@ -705,7 +710,8 @@ class NoteEditTest(EditBase):
         self.assertEqual(STATE["patches"], [])
 
     def test_out_of_scope_task_is_refused(self):
-        p = self.cli("note-edit", "T-alien", "старая строка", "новая строка",
+        # Чужая задача — полным UUID: короткий префикс до неё не доходит.
+        p = self.cli("note-edit", ALIEN, "старая строка", "новая строка",
                      cwd=self.unbound, code=1)
         self.assertIn("ЗАПРЕЩЕНО", p.stderr)
         self.assertEqual(STATE["patches"], [])
@@ -1111,7 +1117,8 @@ class UnarchiveTest(EditBase):
                          "2026-10-10T12:00:00.000Z")
 
     def test_outside_project_is_refused(self):
-        p = self.cli("unarchive", "T-alien", code=1)
+        # Чужая задача — полным UUID: короткий префикс до неё не доходит.
+        p = self.cli("unarchive", ALIEN, code=1)
         self.assertIn("ЗАПРЕЩЕНО", p.stderr)
 
 
