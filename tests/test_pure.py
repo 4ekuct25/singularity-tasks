@@ -162,6 +162,63 @@ class NoteDeltaTest(unittest.TestCase):
         self.assertIn("привет", sing.note_dump([{"insert": "привет"}]))
 
 
+class NoteReplaceTest(unittest.TestCase):
+    """note_replace — ядро `note-edit`: замена ОДНОГО вхождения в ops Quill-delta.
+
+    Гейт «ровно 1 вхождение» держится здесь: замена по первому вхождению при двух
+    и больше угадывала бы, какую строку человек имел в виду (T-d22670bd).
+    """
+
+    def test_single_op_replacement(self):
+        ops = [{"insert": "одна строка\n"}, {"insert": "две строки\n"}]
+        out = sing.note_replace(ops, "одна", "три")
+        self.assertEqual(out, [{"insert": "три строка\n"}, {"insert": "две строки\n"}])
+
+    def test_not_found_returns_none(self):
+        self.assertIsNone(sing.note_replace([{"insert": "текст\n"}], "нет", "x"))
+
+    def test_two_occurrences_return_none(self):
+        ops = [{"insert": "дубль\n"}, {"insert": "дубль\n"}]
+        self.assertIsNone(sing.note_replace(ops, "дубль", "x"))
+
+    def test_spanning_ops_keeps_the_tail(self):
+        ops = [{"insert": "пре "}, {"insert": "жирное", "attributes": {"bold": True}},
+               {"insert": " пост\n"}]
+        out = sing.note_replace(ops, "пре жирное", "новое")
+        self.assertEqual(out, [{"insert": "новое"}, {"insert": " пост\n"}],
+                         "оп, где вхождение заканчивается, обязан сохранить хвост")
+
+    def test_spanning_ops_middle_dropped(self):
+        ops = [{"insert": "а"}, {"insert": "б"}, {"insert": "в"}, {"insert": "г\n"}]
+        out = sing.note_replace(ops, "бв", "X")
+        self.assertEqual(out, [{"insert": "а"}, {"insert": "X"}, {"insert": "г\n"}])
+
+    def test_match_at_text_boundaries(self):
+        ops = [{"insert": "начало\n"}, {"insert": "конец\n"}]
+        self.assertEqual(sing.note_replace(ops, "начало", "Н1"),
+                         [{"insert": "Н1\n"}, {"insert": "конец\n"}])
+        self.assertEqual(sing.note_replace(ops, "конец", "К2"),
+                         [{"insert": "начало\n"}, {"insert": "К2\n"}])
+
+    def test_deletion_with_empty_new(self):
+        ops = [{"insert": "лишнее слово тут\n"}]
+        out = sing.note_replace(ops, "лишнее ", "")
+        self.assertEqual(out, [{"insert": "слово тут\n"}])
+
+    def test_attributes_of_the_start_op_survive(self):
+        ops = [{"insert": "жирная строка\n", "attributes": {"bold": True}}]
+        out = sing.note_replace(ops, "жирная", "новая")
+        self.assertEqual(out, [{"insert": "новая строка\n",
+                                "attributes": {"bold": True}}])
+
+    def test_embeds_stay_untouched(self):
+        img = {"insert": {"image": {"fileId": "FL-aaaa-1234", "fileName": "a.png"}}}
+        ops = [{"insert": "до\n"}, img, {"insert": "после\n"}]
+        out = sing.note_replace(ops, "после", "после-то")
+        self.assertEqual(out[1], img, "встроенная картинка уехала")
+        self.assertEqual(sing.note_to_text(out), "до\nпосле-то\n")
+
+
 class WallWarningTest(unittest.TestCase):
     """Стена в карточке: длинный абзац без единой строки списка.
 

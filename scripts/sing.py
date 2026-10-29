@@ -1520,6 +1520,72 @@ def note_append(note, text, label=None):
     return note_dump(ops)
 
 
+def note_replace(ops, old, new):
+    """Новые ops, в которых ОДНО вхождение old заменено на new. Иначе None.
+
+    Поиск идёт по тексту заметки — той же склейке строковых insert, что печатает
+    note_to_text и видит человек в карточке. Вхождение может заходить на несколько
+    ops (строка, разбитая форматированием): затронутые ops пересобираются — первый
+    несёт префикс + новый текст (атрибуты сохраняет), последний — суффикс, средние
+    выбрасываются. Всё остальное — включая встроенные картинки/файлы и атрибуты —
+    остаётся побайтово.
+
+    Возвращает None, если old встречается не ровно 1 раз: замена «по первому
+    вхождению» при двух и больше угадывала бы, какую строку человек имел в виду.
+    """
+    text = note_to_text(ops)
+    if text.count(old) != 1:
+        return None
+    start, end = text.index(old), text.index(old) + len(old)
+    out, pos = [], 0
+    for op in ops:
+        ins = op.get("insert") if isinstance(op, dict) else None
+        if not isinstance(ins, str):
+            out.append(op)                        # встройка/файл: текста нет, как есть
+            continue
+        seg_start, seg_end = pos, pos + len(ins)
+        pos = seg_end
+        if seg_end <= start or seg_start >= end:
+            out.append(op)                        # вне вхождения
+            continue
+        attrs = {k: v for k, v in op.items() if k != "insert"}
+        starts_here = seg_start <= start < seg_end
+        ends_here = seg_start < end <= seg_end
+        prefix = ins[:start - seg_start] if starts_here else ""
+        suffix = ins[end - seg_start:] if ends_here else ""
+        if starts_here:
+            merged = prefix + new + (suffix if ends_here else "")
+            if merged:
+                out.append(_note_op(merged, attrs))
+        elif suffix:
+            out.append(_note_op(suffix, attrs))
+    return out
+
+
+def _note_op(insert, attrs):
+    """Оп Quill-delta: insert первым (порядок ключей — как в ops приложения)."""
+    op = {"insert": insert}
+    op.update(attrs)
+    return op
+
+
+def write_note_backup(task_id, note):
+    """Сырая заметка до переписи — в файл, путь которого печатает команда.
+
+    Откат переписи — повторная запись этого файла (содержимое — ровно то, что
+    сервер отдавал до PATCH, в той же форме). Каталог переопределяется
+    SINGULARITY_NOTE_BACKUP_DIR (тесты; по умолчанию ~/.singularity-note-backups).
+    """
+    directory = os.environ.get("SINGULARITY_NOTE_BACKUP_DIR") \
+        or os.path.expanduser("~/.singularity-note-backups")
+    os.makedirs(directory, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    path = os.path.join(directory, f"{task_id}-{stamp}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(note if isinstance(note, str) else json.dumps(note, ensure_ascii=False))
+    return path
+
+
 # --------------------------------------------------------------------------- канбан
 
 
@@ -4030,6 +4096,72 @@ def cmd_block(args):
     warn_bare_ids(args.reason, "причина блокировки")
 
 
+def cmd_note_edit(args):
+    """Переписать строку/блок заметки задачи in-place, без rm+re-add.
+
+    report/done/block только дописывают, а rm+re-add теряет T-id, agent-теги
+    и историю отчётов. Здесь — замена ОДНОГО вхождения пары OLD NEW (пары можно
+    несколько, применяются последовательно), бэкап заметки в файл, PATCH только
+    заметки и подтверждение перечитыванием. Колонка, теги и канбан-связка не
+    трогаются — команда падает, если что-то из них поехало.
+    """
+    cfg, _ = load_config(required=False)
+    task = assert_task_allowed(args.id, cfg)
+    raw = args.pairs
+    if len(raw) < 2 or len(raw) % 2 != 0:
+        die(f"{args.id}: нужны пары OLD NEW — минимум одна, число парных аргументов "
+            "чётное.\n"
+            f"  sing.py note-edit {args.id} \"старый текст\" \"новый текст\"")
+    pairs = list(zip(raw[0::2], raw[1::2]))
+
+    ops = note_ops(task.get("note"))
+    new_ops = ops
+    for old, new in pairs:
+        if not old:
+            die(f"{args.id}: OLD пустой — искать нечего.\n"
+                f"  sing.py note-edit {args.id} \"старый текст\" \"новый текст\"")
+        if old == new:
+            die(f"{args.id}: OLD и NEW одинаковые — заметка не изменится, "
+                "правки не будет.")
+        result = note_replace(new_ops, old, new)
+        if result is None:
+            count = note_to_text(new_ops).count(old)
+            if count == 0:
+                die(f"{args.id}: старый текст не найден в заметке — изменять "
+                    "нечего, запись не отправлялась.\n"
+                    f"  что сейчас в заметке: sing.py show {args.id}")
+            die(f"{args.id}: старый текст встречается в {count} местах — "
+                "нельзя понять, какую строку менять. Сделай OLD длиннее, "
+                "чтобы встречался ровно один раз.")
+        new_ops = result
+
+    # Запись, которая ничего не меняет, обязана падать, а не рапортовать
+    # успехом (та же логика, что в `notes --edit`): «текст равен ожидаемому»
+    # верно и до запроса, а сервер на повторную запись отвечает 200.
+    if note_to_text(new_ops) == note_to_text(task.get("note")):
+        die(f"{args.id}: заметка не изменится — старые и новые тексты дают "
+            "тот же текст, запись не отправлялась.")
+
+    backup_path = write_note_backup(args.id, task.get("note"))
+    col_before = task_column(args.id, task.get("projectId"))
+    _, fresh = set_task_fields(args.id, {"note": note_dump(new_ops)}, task,
+                               watched=NOTE_WATCHED)
+    # Колонка — не поле задачи, а отдельная связка: снимком до/после изнутри
+    # set_task_fields её не поймать (см. cmd_regroup).
+    col_after = task_column(args.id, task.get("projectId"))
+    if col_before != col_after:
+        die(f"{args.id}: перепись заметки задел(а) доску — колонка была "
+            f"{col_before}, стала {col_after}.\n"
+            "  Меняться должна только заметка: проверь задачу в трекере.")
+
+    was = len(note_to_text(task.get("note")))
+    now = len(note_to_text(fresh.get("note")))
+    print(f"{args.id}: заметка переписана на месте — "
+          f"{len(pairs)} замен(а), было {was} символов, стало {now}")
+    print(f"  бэкап: {backup_path}")
+    print(f"  {task_link(args.id)}")
+
+
 def cmd_unarchive(args):
     """Восстановить карту из дневника: journalDate=null, checked=0.
 
@@ -5015,6 +5147,15 @@ def build_parser():
     sp.add_argument("reason")
     sp.add_argument("--agent")
     sp.set_defaults(fn=cmd_block)
+
+    sp = sub.add_parser("note-edit",
+                        help="переписать строку/блок заметки задачи in-place "
+                             "(без rm+re-add)")
+    sp.add_argument("id")
+    sp.add_argument("pairs", nargs="*", metavar="ПАРА",
+                    help="пары OLD NEW: заменить одно вхождение OLD на NEW; "
+                         "пары применяются последовательно")
+    sp.set_defaults(fn=cmd_note_edit)
 
     sp = sub.add_parser("unarchive",
                         help="восстановить карту из дневника: снять journalDate "

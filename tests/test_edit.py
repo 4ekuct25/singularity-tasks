@@ -294,11 +294,12 @@ class EditBase(unittest.TestCase):
     def setUp(self):
         reset_state()
 
-    def cli(self, *argv, cwd=None, code=0):
+    def cli(self, *argv, cwd=None, code=0, extra_env=None):
         env = support.clean_env(SINGULARITY_API=self.api,
                                 SINGULARITY_TOKEN="stub",
                                 SINGULARITY_AGENT="zz-one",
-                                SINGULARITY_NO_SYNC_CHECK="1")
+                                SINGULARITY_NO_SYNC_CHECK="1",
+                                **(extra_env or {}))
         r = subprocess.run([sys.executable, SING_UNDER_TEST, *argv],
                            cwd=cwd or self.repo, env=env,
                            capture_output=True, text=True, timeout=60)
@@ -569,6 +570,165 @@ class NotesTest(EditBase):
         out = json.loads(r.stdout)
         self.assertIn("новый текст", out["note"])
         self.assertIn("переписана", r.stderr, "человеку не осталось ни строки")
+
+
+class NoteEditTest(EditBase):
+    """`note-edit`: переписать строку/блок заметки ЗАДАЧИ in-place, без rm+re-add
+    (T-d22670bd). report/done/block только дописывают, а rm+re-add теряет T-id,
+    agent-теги и историю отчётов. Критерий карты: строка переписана, остальная
+    заметка побайтно неизменна; несуществующий старый текст — отказ без изменения.
+
+    Контрольный красный (обязателен):
+
+        git show <base>:scripts/sing.py > /tmp/sing-old.py
+        SING_UNDER_TEST=/tmp/sing-old.py python3 -m unittest tests.test_edit.NoteEditTest
+    """
+
+    # Несколько форматов подряд: обычный абзац, разрыв на форматирование,
+    # буллит. После замены одной строки всё остальное обязано остаться побайтово.
+    NOTE_OPS = [
+        {"insert": "постановка задачи\n"},
+        {"insert": "старая строка\n"},
+        {"insert": "контекст: "},
+        {"insert": "жирный кусок", "attributes": {"bold": True}},
+        {"insert": "\n"},
+        {"insert": "буллитная строка"},
+        {"insert": "\n", "attributes": {"list": "bullet"}},
+    ]
+
+    def setUp(self):
+        super().setUp()
+        self.backup_dir = tempfile.mkdtemp(prefix="zz-note-backup-")
+        self.addCleanup(shutil.rmtree, self.backup_dir, True)
+        STATE["tasks"]["T-loose"]["note"] = json.dumps(
+            [dict(op) for op in self.NOTE_OPS], ensure_ascii=False)
+
+    def cli(self, *argv, cwd=None, code=0):
+        return super().cli(*argv, cwd=cwd, code=code,
+                           extra_env={"SINGULARITY_NOTE_BACKUP_DIR": self.backup_dir})
+
+    def stored_ops(self, tid="T-loose"):
+        ops = json.loads(STATE["tasks"][tid]["note"])
+        self.assertIsInstance(ops, list,
+                              "заметка записана не голым массивом операций — "
+                              "приложение покажет сырой JSON вместо текста")
+        return ops
+
+    def stored_text(self, tid="T-loose"):
+        return "".join(op.get("insert", "") for op in self.stored_ops(tid)
+                       if isinstance(op.get("insert"), str))
+
+    def backup_files(self):
+        return sorted(os.listdir(self.backup_dir))
+
+    # ------------------------------------------------------------------ успех
+    def test_replaces_a_line_and_the_rest_is_byte_identical(self):
+        self.cli("note-edit", "T-loose", "старая строка", "новая строка")
+        stored = self.stored_ops()
+        expected = [dict(op) for op in self.NOTE_OPS]
+        expected[1]["insert"] = "новая строка\n"
+        self.assertEqual(stored, expected,
+                         "остаток заметки изменился — переписывать была только строка")
+        self.assertEqual(STATE["patches"],
+                         [{"note": json.dumps(expected, ensure_ascii=False)}],
+                         "PATCH унёс не только заметку")
+
+    def test_backup_file_holds_the_raw_original_note(self):
+        original = STATE["tasks"]["T-loose"]["note"]
+        r = self.cli("note-edit", "T-loose", "старая строка", "новая строка")
+        files = self.backup_files()
+        self.assertEqual(len(files), 1, "на одну перепись — ровно один файл бэкапа")
+        with open(os.path.join(self.backup_dir, files[0]), encoding="utf-8") as f:
+            self.assertEqual(f.read(), original,
+                             "бэкап не совпадает с исходной заметкой побайтово")
+        self.assertIn(files[0], r.stdout, "человеку не сказали, где бэкап")
+
+    def test_everything_but_the_edited_line_survives(self):
+        before = dict(STATE["tasks"]["T-loose"])
+        self.cli("note-edit", "T-loose", "старая строка", "новая строка")
+        after = STATE["tasks"]["T-loose"]
+        for key in ("title", "tags", "parent", "checked", "complete",
+                    "journalDate", "projectId", "group", "priority"):
+            self.assertEqual(after[key], before[key], f"поле {key} уехало")
+        self.assertEqual(STATE["links"]["T-loose"], "KS-todo",
+                         "перепись заметки сдвинула карточку по доске")
+
+    def test_old_text_spanning_ops_is_replaced(self):
+        STATE["tasks"]["T-loose"]["note"] = json.dumps(
+            [{"insert": "пре "}, {"insert": "жирное", "attributes": {"bold": True}},
+             {"insert": " пост"}], ensure_ascii=False)
+        self.cli("note-edit", "T-loose", "пре жирное", "новое слово")
+        self.assertEqual(self.stored_text(), "новое слово пост",
+                         "замена, задевшая несколько ops, потеряла текст")
+
+    def test_multiple_pairs_apply_in_order(self):
+        self.cli("note-edit", "T-loose", "старая строка", "средняя строка",
+                 "буллитная строка", "переписанный буллит")
+        text = self.stored_text()
+        self.assertIn("средняя строка\n", text)
+        self.assertIn("переписанный буллит\n", text)
+        self.assertNotIn("старая строка", text)
+        # буллит остался буллитом: заменён только текст, \n с атрибутом цел
+        self.assertIn({"insert": "\n", "attributes": {"list": "bullet"}},
+                      self.stored_ops())
+
+    # --------------------------------------------------------------- отказы
+    def test_missing_old_text_is_refused_without_any_write(self):
+        original = STATE["tasks"]["T-loose"]["note"]
+        p = self.cli("note-edit", "T-loose", "нет такой строки", "что угодно", code=1)
+        self.assertIn("не найден", p.stderr)
+        self.assertEqual(STATE["patches"], [], "отказ всё-таки что-то записал")
+        self.assertEqual(STATE["tasks"]["T-loose"]["note"], original)
+        self.assertEqual(self.backup_files(), [],
+                         "отказ, не сделавший ничего, оставил файл бэкапа")
+
+    def test_ambiguous_old_text_is_refused_without_any_write(self):
+        STATE["tasks"]["T-loose"]["note"] = json.dumps(
+            [{"insert": "дубль\n"}, {"insert": "дубль\n"}], ensure_ascii=False)
+        p = self.cli("note-edit", "T-loose", "дубль", "уникально", code=1)
+        self.assertIn("встречается в 2 местах", p.stderr)
+        self.assertEqual(STATE["patches"], [], "отказ всё-таки что-то записал")
+
+    def test_identical_old_and_new_is_refused(self):
+        p = self.cli("note-edit", "T-loose", "старая строка", "старая строка", code=1)
+        self.assertIn("одинаковые", p.stderr)
+        self.assertEqual(STATE["patches"], [])
+
+    def test_odd_pairs_are_refused(self):
+        p = self.cli("note-edit", "T-loose", "старая строка", code=1)
+        self.assertIn("пары OLD NEW", p.stderr)
+        self.assertEqual(STATE["patches"], [])
+
+    def test_empty_old_is_refused(self):
+        p = self.cli("note-edit", "T-loose", "", "новая строка", code=1)
+        self.assertIn("пустой", p.stderr)
+        self.assertEqual(STATE["patches"], [])
+
+    def test_out_of_scope_task_is_refused(self):
+        p = self.cli("note-edit", "T-alien", "старая строка", "новая строка",
+                     cwd=self.unbound, code=1)
+        self.assertIn("ЗАПРЕЩЕНО", p.stderr)
+        self.assertEqual(STATE["patches"], [])
+
+    # --------------------------------------------- сервер ответил 200, не сделав
+    def test_silent_refusal_of_the_server_is_caught(self):
+        STATE["ignore_write"] = True
+        p = self.cli("note-edit", "T-loose", "старая строка", "новая строка", code=1)
+        self.assertIn("не применилась", p.stderr)
+        self.assertIn("старая строка", self.stored_text())
+
+    def test_a_lost_note_is_caught(self):
+        STATE["drop_note"] = True
+        p = self.cli("note-edit", "T-loose", "старая строка", "новая строка", code=1)
+        self.assertIn("не применилась", p.stderr)
+
+    def test_a_dragged_column_is_caught(self):
+        """Колонка — не поле задачи, а отдельная связка: снимком до/после изнутри
+        set_task_fields её не поймать (см. test_a_card_dragged_across_the_board_is_caught)."""
+        STATE["move_column"] = True
+        p = self.cli("note-edit", "T-loose", "старая строка", "новая строка", code=1)
+        self.assertIn("задел(а) доску", p.stderr)
+        self.assertIn("колонка", p.stderr)
 
 
 class StartDateTest(EditBase):
