@@ -741,6 +741,60 @@ class BoardLayoutTest(unittest.TestCase):
         self.assertEqual([t["id"] for t in shown], ["T-4", "T-3"], "показаны не свежие")
 
 
+class ClosedInQueueTest(unittest.TestCase):
+    """Закрытая задача со связкой на колонку очереди (todo/wip) — аномалия,
+    а не содержимое: очередь её не выдаёт (pool_from по открытым), и счётчик
+    «Новые» обязан равняться очереди (T-50a3e7d1; живой случай 20.09 —
+    экземпляр серии закрыт и в дневнике, связка на TODO)."""
+
+    def _cfg(self, **columns):
+        return {"projectId": "P-x", "columns": columns}
+
+    def test_closed_on_todo_leaves_the_column_and_is_reported(self):
+        by_col = {"KS-T": [{"id": "T-open", "checked": 0},
+                           {"id": "T-closed", "checked": 1}]}
+        cfg = self._cfg(todo="KS-T", wip="KS-W", done="KS-D")
+        _, anomalies = sing.split_closed_in_queue(by_col, cfg)
+        self.assertEqual([t["id"] for t in by_col["KS-T"]], ["T-open"],
+                         "счётчик «Новые» обязан равняться очереди")
+        self.assertEqual([(r, c, t["id"]) for r, c, t in anomalies],
+                         [("todo", "KS-T", "T-closed")])
+
+    def test_journal_date_counts_as_closed_even_without_checked(self):
+        by_col = {"KS-W": [{"id": "T-j", "journalDate": "2026-09-01T00:00:00.000Z"}]}
+        cfg = self._cfg(todo="KS-T", wip="KS-W")
+        by, anomalies = sing.split_closed_in_queue(by_col, cfg)
+        self.assertEqual(by["KS-W"], [])
+        self.assertEqual([(r, t["id"]) for r, _c, t in anomalies],
+                         [("wip", "T-j")])
+
+    def test_closed_in_done_is_not_touched(self):
+        """Граница карты: закрытые в «Готово» остаются в колонке — доска
+        показывает сделанное, иначе агент заводит работу заново."""
+        by_col = {"KS-D": [{"id": "T-done", "checked": 1,
+                            "journalDate": "2026-09-01T00:00:00.000Z"}]}
+        cfg = self._cfg(todo="KS-T", done="KS-D")
+        by, anomalies = sing.split_closed_in_queue(by_col, cfg)
+        self.assertEqual(anomalies, [])
+        self.assertEqual([t["id"] for t in by["KS-D"]], ["T-done"])
+
+    def test_unbound_queue_role_keeps_its_column_intact(self):
+        """Роль без колонки в привязке: про её колонку доска не знает ничего —
+        выносить задачи оттуда не имеешь права (как и в board_layout)."""
+        by_col = {"KS-T": [{"id": "T-closed", "checked": 1}]}
+        cfg = self._cfg(done="KS-D")   # todo не в привязке
+        by, anomalies = sing.split_closed_in_queue(by_col, cfg)
+        self.assertEqual(anomalies, [])
+        self.assertEqual([t["id"] for t in by["KS-T"]], ["T-closed"])
+
+    def test_task_closed_matches_the_board_loose_criterion(self):
+        """Один признак закрытости на доску: то же, что в `loose` у cmd_board."""
+        self.assertTrue(sing.task_closed({"checked": 1}))
+        self.assertTrue(sing.task_closed({"journalDate": "2026-09-01"}))
+        self.assertFalse(sing.task_closed({"checked": 0}))
+        self.assertFalse(sing.task_closed({}))
+
+
 # --------------------------------------------------------------------- приоритет
 
 

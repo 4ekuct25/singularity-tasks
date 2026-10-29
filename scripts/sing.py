@@ -64,6 +64,11 @@ DEFAULT_COLUMNS = {
 }
 COLUMN_ORDER = ["todo", "wip", "review", "done", "blocked"]
 
+# Роль, в которой закрытая задача — аномалия, а не содержимое: очередь
+# (next/ready) её не выдаёт, а счётчик колонки доска показывала (T-50a3e7d1).
+# «Готово» не в списке: закрытые там положены, и их доска продолжает показывать.
+QUEUE_ROLES = ("todo", "wip")
+
 # Системные колонки проекта имеют детерминированный id KS-<projectId>-<SUFFIX>
 # и материализуются сервером лениво — в свежесозданном проекте GET их ещё не
 # отдаёт. Переиспользуем их, иначе на доске появятся дубли.
@@ -3248,6 +3253,40 @@ def board_layout(cfg, by_col, statuses, limit):
     return layout
 
 
+def task_closed(task):
+    """Закрыта (checked=1) или унесена в дневник (journalDate): приложение её
+    из активных списков унесло, и очередь её не выдаёт. Тот же признак, что в
+    `loose` у `cmd_board` и в `effective_column`."""
+    return int(task.get("checked") or 0) == 1 or bool(task.get("journalDate"))
+
+
+def split_closed_in_queue(by_col, cfg):
+    """Закрытые задачи в колонках очереди (QUEUE_ROLES) — аномалия, не содержимое.
+
+    Очередь такие задачи не считает — `pool_from` идёт по открытым, — а счётчик
+    колонки на доске их считал: «Новые — 1» при пустой очереди (T-50a3e7d1;
+    живой случай 20.09 — экземпляр серии закрыт и в дневнике, связка на TODO).
+    Выносит их из колонок в список аномалий [(роль, id колонки, задача)],
+    который доска печатает предупреждением с командой починки.
+
+    Закрытые в «Готово» не трогает: там они положены. Роль без колонки в
+    привязке не трогает: про её колонку доска не знает ничего. Мутит `by_col`
+    на месте и возвращает его с аномалиями.
+    """
+    anomalies = []
+    for role in QUEUE_ROLES:
+        cid = (cfg.get("columns") or {}).get(role)
+        if not cid or cid not in by_col:
+            continue
+        kept, gone = [], []
+        for t in by_col[cid]:
+            (gone if task_closed(t) else kept).append(t)
+        if gone:
+            by_col[cid] = kept
+            anomalies.extend((role, cid, t) for t in gone)
+    return by_col, anomalies
+
+
 def cmd_board(args):
     cfg, _ = command_config(args)
     statuses = {s["id"]: s["name"] for s in project_statuses(cfg["projectId"])}
@@ -3256,6 +3295,12 @@ def cmd_board(args):
     by_col = {}
     for t in tasks:
         by_col.setdefault(effective_column(t, cmap, cfg), []).append(t)
+    # Закрытая задача со связкой на колонку очереди — аномалия, а не содержимое:
+    # очередь её не выдаёт (pool_from по открытым), и счётчик «Новые» обязан
+    # равняться очереди (T-50a3e7d1). Выносим её из колонок — ниже напечатается
+    # предупреждением с командой починки.
+    by_col, closed_queue = split_closed_in_queue(by_col, cfg)
+    closed_tasks = [t for _role, _cid, t in closed_queue]
 
     # Раскладку считаем до печати: и теги, и ширина колонки держателя должны
     # опираться на то, что реально попадёт на экран, а не на весь проект —
@@ -3267,7 +3312,8 @@ def cmd_board(args):
              if int(t.get("checked") or 0) == 0 and not t.get("journalDate")]
     known = set((cfg.get("columns") or {}).values())
     extra = {cid: name for cid, name in statuses.items() if cid not in known}
-    titles = tag_titles([t for *_, shown in layout for t in shown] + loose)
+    titles = tag_titles([t for *_, shown in layout for t in shown]
+                        + loose + closed_tasks)
 
     # Счёт подзадач нужен обоим выводам: человеческий помечает «пока брать
     # нельзя» ровно тем же текстом, что машинный кладёт в notReady.
@@ -3301,6 +3347,15 @@ def cmd_board(args):
                          "tasks": [one(t, role, statuses.get(cid)) for t in shown]}
                         for role, cid, name, items, shown in layout],
             "looseTasks": [one(t, None, None) for t in loose],
+            # Та же форма объекта, что и в колонках, но notReady=None: причина
+            # «пока брать нельзя» у закрытой задачи бессмысленна (то же правило,
+            # что в `list`). Счётчики колонок эти задачи уже не содержат.
+            "closedInQueue": [task_json(t, role=role, column_name=statuses.get(cid),
+                                        tags=task_tags(t, titles),
+                                        group_title=gnames.get(t.get("group")),
+                                        open_children=kids.get(t["id"], 0),
+                                        not_ready=None)
+                               for role, cid, t in closed_queue],
             "unboundRoles": [role for role, cid, *_ in layout if not cid],
             "unknownColumns": [{"id": cid, "name": name,
                                 "count": len(by_col.get(cid, []))}
@@ -3309,8 +3364,8 @@ def cmd_board(args):
         })
         return
 
-    holders = board_holders([t for *_, shown in layout for t in shown] + loose,
-                            titles)
+    holders = board_holders([t for *_, shown in layout for t in shown]
+                            + loose + closed_tasks, titles)
     pad = board_pad(holders)
 
     # Чужую доску обязательно называть чужой: без пометки агент принимает её за
@@ -3341,6 +3396,15 @@ def cmd_board(args):
         print(f"\n⚠ ВНЕ КОЛОНОК — {len(loose)}: задача есть, на доске её не видно."
               "\n  почини: sing.py move <id> <роль>")
         for t in loose:
+            print(pad(holders.get(t["id"])) + brief(t))
+    if closed_queue:
+        # Закрытая задача, чья связка осталась на колонке очереди: очередь её не
+        # выдаёт, счётчик колонки её больше не считает — остаются факт и починка
+        # (T-50a3e7d1). Образец блока — «ВНЕ КОЛОНОК» выше.
+        print(f"\n⚠ ЗАКРЫТЫЕ В ОЧЕРЕДИ — {len(closed_queue)}: задача закрыта, а связка "
+              "осталась на колонке очереди."
+              "\n  почини: sing.py move <id> done")
+        for _role, _cid, t in closed_queue:
             print(pad(holders.get(t["id"])) + brief(t))
     if extra:
         print(f"\n⚠ КОЛОНКИ МИМО ПРИВЯЗКИ — {len(extra)}: доска шире, чем знает скилл."

@@ -71,6 +71,9 @@ TASKS = [
     # без связки вовсе — так приходит задача, заведённая в приложении: при полной
     # привязке она видна в «Новые», при неполной оказывается вне колонок
     task("T-orphan", "заведена в приложении, связки нет"),
+    # закрыта, а связка осталась на «К работе»: аномалия, счётчик «Новые» её
+    # не считает, доска печатает блок с командой починки (T-50a3e7d1)
+    task("T-closed-todo", "закрыта, связка осталась в очереди", checked=1),
     task("T-done", "закрытая и унесённая в дневник", checked=1,
          journalDate="2026-09-01T10:00:00.000Z"),
     task("T-note", "это заметка проекта, а не задача", isNote=True),
@@ -84,6 +87,7 @@ LINKS = [
     {"id": "KTS-6", "taskId": "T-recur", "statusId": "KS-todo"},
     {"id": "KTS-7", "taskId": "T-side", "statusId": "KS-side"},
     {"id": "KTS-8", "taskId": "T-done", "statusId": "KS-done"},
+    {"id": "KTS-10", "taskId": "T-closed-todo", "statusId": "KS-todo"},
     # связка с системной доской «Сегодня» — её показывать нельзя ни там, ни там
     {"id": "KTS-9", "taskId": "T-plain", "statusId": "KS-P-TODAY-TODO"},
 ]
@@ -346,6 +350,37 @@ class JsonOutputTest(unittest.TestCase):
         for t in board["looseTasks"]:
             self.assertIsNone(t["column"])
             self.assertEqual(CORE_KEYS - set(t), set())
+
+    # --------------------------------------------- закрытая в колонке очереди
+    def test_closed_task_in_queue_is_out_of_the_counter_and_flagged(self):
+        """T-50a3e7d1: закрытая задача со связкой на todo не в счётчике «Новые»
+        и есть отдельным полем JSON — счётчик обязан равняться очереди."""
+        board = self.parsed("board", "--json")
+        todo = next(c for c in board["columns"] if c["role"] == "todo")
+        self.assertNotIn("T-closed-todo", [t["id"] for t in todo["tasks"]],
+                         "закрытая задача всё ещё в колонке очереди")
+        self.assertEqual(todo["count"], len(todo["tasks"]),
+                         "счётчик и список колонки разъехались")
+        closed = self.by_id(board["closedInQueue"])
+        self.assertIn("T-closed-todo", closed, "аномалия не показана в JSON")
+        self.assertTrue(closed["T-closed-todo"]["done"])
+        self.assertEqual(closed["T-closed-todo"]["column"], "todo")
+        self.assertIsNone(closed["T-closed-todo"]["notReady"])
+
+    def test_closed_task_in_queue_is_printed_with_the_repair_command(self):
+        r = self.run_sing("board")
+        self.assertIn("ЗАКРЫТЫЕ В ОЧЕРЕДИ", r.stdout, "предупреждение не напечатано")
+        self.assertIn("T-closed-todo", r.stdout)
+        self.assertIn("move", r.stdout)
+        self.assertIn("done", r.stdout, "команда починки без цели done")
+
+    def test_closed_task_in_done_stays_in_its_column(self):
+        """Граница карты: закрытые в «Готово» не трогать — доска показывает
+        сделанное, иначе агент заводит работу заново."""
+        board = self.parsed("board", "--json")
+        done_col = next(c for c in board["columns"] if c["role"] == "done")
+        self.assertIn("T-done", [t["id"] for t in done_col["tasks"]])
+        self.assertNotIn("T-done", [t["id"] for t in board["closedInQueue"]])
 
     def test_groups_json(self):
         out = self.parsed("groups", "--json")
