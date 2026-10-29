@@ -68,6 +68,10 @@ TASKS = [
     task("T-child", "подзадача", parent="T-parent"),
     task("T-recur", "шаблон серии", recurrence={"type": "daily"}),
     task("T-side", "в колонке мимо привязки"),
+    # связка есть, а колонка, на которую она смотрит, исчезла из трекера
+    # (инцидент 10-23): в «Новые» не попадает и ни в одну очередь не встаёт —
+    # доска показывает отдельным блоком (T-ec4c39e1)
+    task("T-deadlink", "связка на несуществующую колонку"),
     # без связки вовсе — так приходит задача, заведённая в приложении: при полной
     # привязке она видна в «Новые», при неполной оказывается вне колонок
     task("T-orphan", "заведена в приложении, связки нет"),
@@ -90,6 +94,9 @@ LINKS = [
     {"id": "KTS-10", "taskId": "T-closed-todo", "statusId": "KS-todo"},
     # связка с системной доской «Сегодня» — её показывать нельзя ни там, ни там
     {"id": "KTS-9", "taskId": "T-plain", "statusId": "KS-P-TODAY-TODO"},
+    # мёртвая колонка: KS-dead отсутствует в COL_NAMES (не жива в трекере);
+    # id — детерминированный KTS-<taskId>, ровно то, что у канбан-связки
+    {"id": "KTS-T-deadlink", "taskId": "T-deadlink", "statusId": "KS-dead"},
 ]
 CHECKLIST = [
     {"id": "CH-1", "parent": "T-plain", "title": "первый пункт", "done": True,
@@ -381,6 +388,47 @@ class JsonOutputTest(unittest.TestCase):
         done_col = next(c for c in board["columns"] if c["role"] == "done")
         self.assertIn("T-done", [t["id"] for t in done_col["tasks"]])
         self.assertNotIn("T-done", [t["id"] for t in board["closedInQueue"]])
+
+    # ------------------------------------ связка на исчезнувшую колонку
+    def test_dead_column_task_is_out_of_new_and_flagged_in_json(self):
+        """T-ec4c39e1: связка есть, а колонка исчезла из трекера — задача не в
+        «Новые» (не в колонке todo и не в её счётчике), а в deadColumnTasks;
+        id пропавшей колонки — поле deadColumn, роли у задачи нет."""
+        board = self.parsed("board", "--json")
+        todo = next(c for c in board["columns"] if c["role"] == "todo")
+        self.assertNotIn("T-deadlink", [t["id"] for t in todo["tasks"]],
+                         "задача с мёртвой связкой попала в «Новые»")
+        self.assertEqual(todo["count"], len(todo["tasks"]),
+                         "счётчик и список колонки разъехались")
+        dead = self.by_id(board["deadColumnTasks"])
+        self.assertIn("T-deadlink", dead, "мёртвая связка не показана в JSON")
+        self.assertEqual(dead["T-deadlink"]["deadColumn"], "KS-dead")
+        self.assertIsNone(dead["T-deadlink"]["column"])
+        self.assertIsNone(dead["T-deadlink"]["notReady"])
+        self.assertEqual(CORE_KEYS - set(dead["T-deadlink"]), set())
+
+    def test_task_without_any_link_stays_in_new(self):
+        """Граница карты: «связки нет» (задача из приложения) — не мёртвая
+        связка; в «Новые» она лежит и до, и после фикса."""
+        board = self.parsed("board", "--json")
+        todo = next(c for c in board["columns"] if c["role"] == "todo")
+        self.assertIn("T-orphan", [t["id"] for t in todo["tasks"]],
+                      "задача из приложения перестала быть в «Новые»")
+        self.assertNotIn("T-orphan", [t["id"] for t in board["deadColumnTasks"]],
+                         "задачу без связки сочли мёртвой связкой")
+
+    def test_list_queue_does_not_yield_the_dead_column_task(self):
+        """list/next — та же очередь, что видит board: мёртвая связка из
+        «Новые» исключена (T-ec4c39e1)."""
+        self.assertNotIn(
+            "T-deadlink", [t["id"] for t in self.parsed("list", "--json")])
+
+    def test_dead_column_task_is_printed_with_the_repair_command(self):
+        r = self.run_sing("board")
+        self.assertIn("СВЯЗКИ НА МЁРТВЫЕ КОЛОНКИ", r.stdout,
+                      "предупреждение не напечатано")
+        self.assertIn("T-deadlink", r.stdout)
+        self.assertIn("move", r.stdout, "команда починки не названа")
 
     def test_groups_json(self):
         out = self.parsed("groups", "--json")

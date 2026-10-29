@@ -1959,6 +1959,29 @@ def column_map(project_id, statuses=None, links=None):
             if not link.get("removed") and link.get("statusId") in mine}
 
 
+def dead_board_links(links, own_status_ids):
+    """{taskId: statusId} — канбан-связки, чья колонка исчезла из трекера.
+
+    Другой случай, чем «связки нет»: задача из приложения вообще не имеет
+    канбан-связки и легитимно лежит в «Новые» (см. effective_column). Здесь
+    связка ЕСТЬ, но указывает на колонку, которой больше нет в живых колонках
+    проекта — инцидент 10-23: проект пересоздан в облаке, а связки смотрят на
+    колонки прежнего воплощения. Такие задачи не должны попадать в очередь
+    (T-ec4c39e1, поймано 10-24: заблокированная карта стояла в [todo]).
+
+    Канбан-связка имеет детерминированный id `KTS-<taskId>`; связка системной
+    доски «Сегодня» — `KTS-<taskId>-TODAY`, и она канбан-связкой не является.
+    Удалённые (removed) связки в счёт не идут. Связки чужих проектов в результат
+    попасть могут (эндпоинт общий на аккаунт) — вызывающий смотрит только свои
+    задачи, поэтому это безвредно.
+    """
+    own = set(own_status_ids)
+    return {l["taskId"]: l["statusId"]
+            for l in links
+            if not l.get("removed") and l.get("statusId") not in own
+            and l.get("id") == f"KTS-{l['taskId']}"}
+
+
 # Голый `T-...` человеку бесполезен: открыть его нечем. Форматов два, оба
 # подтверждены — веб-адрес прислал пользователь, схему нашли в бандле приложения
 # (`singularityapp://?&page=any&id=${n}`, зарегистрирована в его Info.plist).
@@ -2573,6 +2596,15 @@ def cmd_doctor(args):
             continue
         mark = "✓" if cid in live else "✗"
         print(f"  {mark} {role:8} -> {live.get(cid, 'КОЛОНКА ПРОПАЛА В ТРЕКЕРЕ')}")
+    # Связки на колонку, исчезнувшую из трекера: такие задачи не в «Новые» и
+    # next их не выдаёт — доска показывает их отдельно (T-ec4c39e1).
+    links = paged("/kanban-task-status", "kanbanTaskStatuses", {})
+    dead = dead_board_links(links, {s["id"] for s in statuses})
+    if dead:
+        print(f"  ⚠ мёртвых связок: {len(dead)} — канбан-связка смотрит на колонку, "
+              "которой больше нет в трекере."
+              "\n     такие задачи не в «Новые» и не выдаются next; доска их помечает."
+              "\n     починить: sing.py move <id> <роль>")
     used_ids = set((cfg.get("columns") or {}).values())
     # Проверка по именам ловит «В работе» ×2, но пропускает главный случай: своя
     # «К работе» и системная «Новые» — тот же смысл, разные имена. Поэтому судим
@@ -3289,18 +3321,25 @@ def split_closed_in_queue(by_col, cfg):
 
 def cmd_board(args):
     cfg, _ = command_config(args)
-    statuses = {s["id"]: s["name"] for s in project_statuses(cfg["projectId"])}
-    cmap = column_map(cfg["projectId"])
+    statuses_list = project_statuses(cfg["projectId"])
+    statuses = {s["id"]: s["name"] for s in statuses_list}
+    links = paged("/kanban-task-status", "kanbanTaskStatuses", {})
+    cmap = column_map(cfg["projectId"], statuses=statuses_list, links=links)
+    dead = dead_board_links(links, {s["id"] for s in statuses_list})
     tasks = board_tasks(cfg["projectId"])
     by_col = {}
     for t in tasks:
-        by_col.setdefault(effective_column(t, cmap, cfg), []).append(t)
+        by_col.setdefault(effective_column(t, cmap, cfg, dead), []).append(t)
     # Закрытая задача со связкой на колонку очереди — аномалия, а не содержимое:
     # очередь её не выдаёт (pool_from по открытым), и счётчик «Новые» обязан
     # равняться очереди (T-50a3e7d1). Выносим её из колонок — ниже напечатается
     # предупреждением с командой починки.
     by_col, closed_queue = split_closed_in_queue(by_col, cfg)
     closed_tasks = [t for _role, _cid, t in closed_queue]
+    # Связка есть, а колонка, на которую она смотрит, исчезла из трекера: такие
+    # задачи не в «Новые» и не в очереди — показываем отдельно (T-ec4c39e1,
+    # инцидент 10-23: проект пересоздан в облаке, связки смотрят на старые колонки).
+    dead_tasks = [t for t in tasks if t["id"] in dead]
 
     # Раскладку считаем до печати: и теги, и ширина колонки держателя должны
     # опираться на то, что реально попадёт на экран, а не на весь проект —
@@ -3313,7 +3352,7 @@ def cmd_board(args):
     known = set((cfg.get("columns") or {}).values())
     extra = {cid: name for cid, name in statuses.items() if cid not in known}
     titles = tag_titles([t for *_, shown in layout for t in shown]
-                        + loose + closed_tasks)
+                        + loose + closed_tasks + dead_tasks)
 
     # Счёт подзадач нужен обоим выводам: человеческий помечает «пока брать
     # нельзя» ровно тем же текстом, что машинный кладёт в notReady.
@@ -3356,6 +3395,16 @@ def cmd_board(args):
                                         open_children=kids.get(t["id"], 0),
                                         not_ready=None)
                                for role, cid, t in closed_queue],
+            # Задача, чья связка смотрит на исчезнувшую колонку: к роли не
+            # относится (column=None), id мёртвой колонки — отдельным полем.
+            # В счётчиках колонок эти задачи не участвуют.
+            "deadColumnTasks": [task_json(t, role=None, column_name=None,
+                                          tags=task_tags(t, titles),
+                                          group_title=gnames.get(t.get("group")),
+                                          open_children=kids.get(t["id"], 0),
+                                          not_ready=None,
+                                          deadColumn=dead.get(t["id"]))
+                                 for t in dead_tasks],
             "unboundRoles": [role for role, cid, *_ in layout if not cid],
             "unknownColumns": [{"id": cid, "name": name,
                                 "count": len(by_col.get(cid, []))}
@@ -3365,7 +3414,7 @@ def cmd_board(args):
         return
 
     holders = board_holders([t for *_, shown in layout for t in shown]
-                            + loose + closed_tasks, titles)
+                            + loose + closed_tasks + dead_tasks, titles)
     pad = board_pad(holders)
 
     # Чужую доску обязательно называть чужой: без пометки агент принимает её за
@@ -3405,6 +3454,15 @@ def cmd_board(args):
               "осталась на колонке очереди."
               "\n  почини: sing.py move <id> done")
         for _role, _cid, t in closed_queue:
+            print(pad(holders.get(t["id"])) + brief(t))
+    if dead_tasks:
+        # Связка есть, а колонка, на которую она смотрит, исчезла из трекера
+        # (инцидент 10-23: проект пересоздан в облаке). В «Новые» такие задачи
+        # не попадают и next их не выдаёт — остаются факт и починка (T-ec4c39e1).
+        print(f"\n⚠ СВЯЗКИ НА МЁРТВЫЕ КОЛОНКИ — {len(dead_tasks)}: связка смотрит на "
+              "колонку, которой больше нет в трекере."
+              "\n  задача не в «Новые» и не выдаётся next; почини: sing.py move <id> <роль>")
+        for t in dead_tasks:
             print(pad(holders.get(t["id"])) + brief(t))
     if extra:
         print(f"\n⚠ КОЛОНКИ МИМО ПРИВЯЗКИ — {len(extra)}: доска шире, чем знает скилл."
@@ -3500,7 +3558,7 @@ def not_ready_reason(task, today=None, open_children=0):
     return None
 
 
-def effective_column(task, cmap, cfg):
+def effective_column(task, cmap, cfg, dead=None):
     """Колонка задачи так, как её видит ПРИЛОЖЕНИЕ.
 
     Задача, заведённая в приложении, приходит без `kanban-task-status` — связку
@@ -3509,12 +3567,21 @@ def effective_column(task, cmap, cfg):
     привязанной). Значит и очередь обязана: иначе агент говорит «очередь пуста»
     при непустом проекте, а человек видит свои задачи на доске.
 
+    «Связки нет» и «связка на мёртвую колонку» — разные случаи (T-ec4c39e1):
+    `dead` — карта dead_board_links(): связка есть, а колонка исчезла из
+    трекера. Такой задаче «Новые» не положены — вернём id мёртвой колонки,
+    чтобы ни одна очередь её не забрала, а доска показала её отдельно.
+
     Закрытые и унесённые в дневник исключение: в «Новые» их не показывает и
     приложение.
     """
     linked = cmap.get(task["id"])
     if linked:
         return linked
+    if dead is not None:
+        dead_link = dead.get(task["id"])
+        if dead_link:
+            return dead_link
     if int(task.get("checked") or 0) == 1 or task.get("journalDate"):
         return None
     return (cfg.get("columns") or {}).get("todo")
@@ -3537,15 +3604,20 @@ def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False,
     словаря заполняются из УЖЕ полученной выборки, лишних запросов не будет.
     """
     cid = col_id(cfg, role)
-    cmap = column_map(cfg["projectId"])
+    statuses = project_statuses(cfg["projectId"])
+    links = paged("/kanban-task-status", "kanbanTaskStatuses", {})
+    cmap = column_map(cfg["projectId"], statuses=statuses, links=links)
+    # Связки на мёртвые колонки из очереди исключаются, а не падают в «Новые»
+    # (T-ec4c39e1): без этой карты effective_column принял бы их за «связки нет».
+    dead = dead_board_links(links, {s["id"] for s in statuses})
     source = board_tasks(cfg["projectId"]) if include_done else open_tasks(cfg["projectId"])
     gid = resolve_group(cfg["projectId"], group) if group else None
     return pool_from(source, cmap, cfg, cid, gid=gid, ready_only=ready_only,
-                     reasons=reasons, children=children)
+                     reasons=reasons, children=children, dead=dead)
 
 
 def pool_from(source, cmap, cfg, cid, gid=None, ready_only=False,
-              reasons=None, children=None):
+              reasons=None, children=None, dead=None):
     """Очередь колонки из УЖЕ полученной выборки — без единого запроса.
 
     Вынесено из `_pick_pool`, чтобы «готова к взятию» считалась в одном месте:
@@ -3553,8 +3625,12 @@ def pool_from(source, cmap, cfg, cid, gid=None, ready_only=False,
     фильтр в `ready` однажды разошёлся бы с очередью — а ровно так и ошибался
     ручной обход досок до этой команды: отсеивал отодвинутые, но не закрытые,
     и выдавал задачу из дневника за готовую.
+
+    dead — карта dead_board_links(): задача, чья связка смотрит на исчезнувшую
+    колонку, не встаёт в НИЧЬЮ очередь (T-ec4c39e1); без этого аргумента она
+    бы прошла по ветке effective_column «связки нет» и оказалась в «Новые».
     """
-    pool = [t for t in source if effective_column(t, cmap, cfg) == cid]
+    pool = [t for t in source if effective_column(t, cmap, cfg, dead) == cid]
     if gid:
         pool = [t for t in pool if t.get("group") == gid]
     # «Ждёт подзадачу» считается только по живым подзадачам: унесённая в дневник
@@ -3873,6 +3949,9 @@ def ready_board(project, cfg, links):
     columns = (cfg or {}).get("columns") or project_columns(pid, statuses)
     pcfg = {"projectId": pid, "columns": columns}
     cmap = column_map(pid, statuses=statuses, links=links)
+    # Задача, чья связка смотрит на исчезнувшую колонку, не в очереди — то же
+    # правило, что у next (T-ec4c39e1); связки общие на аккаунт, допзапросов нет.
+    dead = dead_board_links(links, {s["id"] for s in statuses})
     tasks = board_tasks(pid)
     row = {"id": pid, "title": project.get("title", ""), "bound": bool(cfg),
            "complete": len(UNDERFILLED) == before, "hasQueue": "todo" in columns,
@@ -3886,14 +3965,16 @@ def ready_board(project, cfg, links):
                              if x["id"] == columns.get("todo")), None)}
     for role in ("wip", "review", "blocked"):
         if role in columns:
-            row["counts"][role] = sum(1 for t in tasks
-                                      if effective_column(t, cmap, pcfg) == columns[role])
+            row["counts"][role] = sum(
+                1 for t in tasks
+                if effective_column(t, cmap, pcfg, dead) == columns[role])
     if "todo" not in columns:
         return row
     live = [t for t in tasks
             if not t.get("journalDate") and int(t.get("checked") or 0) == 0]
     reasons, kids = {}, {}
-    queue = pool_from(live, cmap, pcfg, columns["todo"], reasons=reasons, children=kids)
+    queue = pool_from(live, cmap, pcfg, columns["todo"], reasons=reasons,
+                      children=kids, dead=dead)
     row["queue"] = len(queue)
     row["queueBreakdown"] = queue_breakdown(queue)
     row["kids"] = kids

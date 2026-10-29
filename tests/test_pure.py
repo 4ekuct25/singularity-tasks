@@ -795,6 +795,67 @@ class ClosedInQueueTest(unittest.TestCase):
         self.assertFalse(sing.task_closed({}))
 
 
+class DeadBoardLinksTest(unittest.TestCase):
+    """T-ec4c39e1: «связки нет» и «связка на мёртвую колонку» — разные случаи.
+
+    Задача из приложения вообще не имеет канбан-связки — легитимно лежит в
+    «Новые». Задача, чья связка смотрит на колонку, исчезнувшую из трекера
+    (инцидент 10-23: проект пересоздан в облаке), в «Новые» не должна падать:
+    ни одна очередь её не берёт, доска показывает отдельно.
+    """
+
+    OWN = {"KS-todo", "KS-wip", "KS-done"}
+
+    def test_only_board_links_to_non_live_statuses(self):
+        links = [
+            # канбан-связка на исчезнувшую колонку — единственная, что найдена
+            {"id": "KTS-T-dead", "taskId": "T-dead", "statusId": "KS-gone"},
+            # связка системной доски «Сегодня» — канбан-связкой не является
+            {"id": "KTS-T-plain-TODAY", "taskId": "T-plain", "statusId": "KS-today"},
+            # связка на живую колонку — не мёртвая
+            {"id": "KTS-T-live", "taskId": "T-live", "statusId": "KS-todo"},
+            # удалённая связка — в счёт не идёт
+            {"id": "KTS-T-rem", "taskId": "T-rem", "statusId": "KS-gone",
+             "removed": True},
+            # чужой id (не KTS-<taskId>) — канбан-связка другого формата
+            {"id": "KTS-42", "taskId": "T-plain", "statusId": "KS-gone"},
+        ]
+        self.assertEqual(sing.dead_board_links(links, self.OWN),
+                         {"T-dead": "KS-gone"})
+
+    def test_effective_column_returns_the_dead_cid_not_todo(self):
+        cfg = {"columns": {"todo": "KS-todo"}}
+        self.assertEqual(sing.effective_column(
+            {"id": "T-dead", "checked": 0}, {}, cfg,
+            dead={"T-dead": "KS-gone"}), "KS-gone")
+
+    def test_no_link_task_still_lands_in_todo(self):
+        """Граница карты: задача приложения без связки — в «Новые» и с пустой
+        картой мёртвых связок, и без аргумента вовсе."""
+        cfg = {"columns": {"todo": "KS-todo"}}
+        t = {"id": "T-app", "checked": 0}
+        self.assertEqual(sing.effective_column(t, {}, cfg, dead={}), "KS-todo")
+        self.assertEqual(sing.effective_column(t, {}, cfg), "KS-todo")
+
+    def test_live_link_wins_over_dead(self):
+        """Колонка задачи жива (она в cmap) — мёртвая карта не спрашивается,
+        задача остаётся в своей колонке."""
+        cfg = {"columns": {"todo": "KS-todo", "wip": "KS-wip"}}
+        self.assertEqual(sing.effective_column(
+            {"id": "T-both", "checked": 0}, {"T-both": "KS-wip"}, cfg,
+            dead={"T-both": "KS-gone"}), "KS-wip")
+
+    def test_pool_from_excludes_dead_and_keeps_orphan_and_live(self):
+        cfg = {"columns": {"todo": "KS-todo"}}
+        cmap = {"T-live": "KS-todo"}
+        source = [{"id": "T-live", "checked": 0},
+                  {"id": "T-app", "checked": 0},
+                  {"id": "T-dead", "checked": 0}]
+        pool = sing.pool_from(source, cmap, cfg, "KS-todo",
+                              dead={"T-dead": "KS-gone"})
+        self.assertEqual([t["id"] for t in pool], ["T-live", "T-app"])
+
+
 # --------------------------------------------------------------------- приоритет
 
 
@@ -830,16 +891,18 @@ class PriorityTest(unittest.TestCase):
 
 class QueueOrderTest(unittest.TestCase):
     """Порядок очереди: приоритет → дедлайн → возраст. Сетей не трогаем —
-    подменяем два сборщика данных."""
+    подменяем сборщики данных на границе сети."""
 
     def setUp(self):
         self.cfg = {"projectId": "P-x", "columns": {"todo": "KS-T"}}
-        self.addCleanup(setattr, sing, "column_map", sing.column_map)
-        self.addCleanup(setattr, sing, "open_tasks", sing.open_tasks)
-        self.addCleanup(setattr, sing, "live_tasks", sing.live_tasks)
+        for name in ("project_statuses", "paged", "open_tasks", "live_tasks"):
+            self.addCleanup(setattr, sing, name, getattr(sing, name))
 
     def _serve(self, tasks):
-        sing.column_map = lambda pid: {t["id"]: "KS-T" for t in tasks}
+        sing.project_statuses = lambda pid: [{"id": "KS-T"}]
+        sing.paged = lambda path, key, query=None, limit=None, page=None: (
+            [{"id": f"KTS-{t['id']}", "taskId": t["id"], "statusId": "KS-T"}
+             for t in tasks])
         sing.open_tasks = lambda pid: tasks
         sing.live_tasks = lambda pid: tasks
 
@@ -876,9 +939,15 @@ class PoolJournalTest(unittest.TestCase):
             {"id": "T-fresh", "checked": 1},
             {"id": "T-journal", "checked": 1, "journalDate": "2026-09-13T23:15:30Z"},
         ]
-        for name in ("column_map", "open_tasks", "live_tasks", "board_tasks"):
+        for name in ("project_statuses", "paged", "open_tasks", "live_tasks",
+                     "board_tasks"):
             self.addCleanup(setattr, sing, name, getattr(sing, name))
-        sing.column_map = lambda pid: {t["id"]: "KS-D" for t in self.tasks}
+        # Связки — на живую колонку KS-D: иначе dead_board_links сочла бы их
+        # мёртвыми, и проверяемое (дневник) смешалось бы с тем, что не проверяем.
+        sing.project_statuses = lambda pid: [{"id": "KS-D"}]
+        sing.paged = lambda path, key, query=None, limit=None, page=None: (
+            [{"id": f"KTS-{t['id']}", "taskId": t["id"], "statusId": "KS-D"}
+             for t in self.tasks])
         sing.board_tasks = lambda pid: list(self.tasks)
         sing.live_tasks = lambda pid: [t for t in self.tasks if not t.get("journalDate")]
         sing.open_tasks = lambda pid: [t for t in sing.live_tasks(pid)
