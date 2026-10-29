@@ -56,7 +56,8 @@ import support  # noqa: E402
 
 GROUPS = {"fast": ["test_pure", "test_retry", "test_claim", "test_json",
                    "test_edit", "test_logs", "test_throttle_fallback",
-                   "test_limits", "test_ready", "test_install"],
+                   "test_limits", "test_ready", "test_install",
+                   "test_fix_split_board"],
           "live": ["test_live"]}
 SWEEP_PREFIX = "zz-selftest-"
 LOG_DIR = os.path.join(HERE, "logs")
