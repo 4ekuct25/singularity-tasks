@@ -1711,6 +1711,72 @@ def move_to_column(task_id, status_id, fatal=True, project_id=None):
         f"  починить вручную: sing.py move {task_id} <роль>")
 
 
+def dead_role_targets(project_id, mapping, old_cfg, live_statuses):
+    """(role, old_id, new_id или None) — роли, чья колонка из СТАРОЙ привязки
+    пропала из трекера, а в новой раскладке для роли колонка есть (уже живёт —
+    new_id, либо будет создана этим прогоном — None, так в сухом прогоне).
+
+    Связка переживает удаление колонки (references/api.md, инцидент 10-24:
+    16 связок на 14 проектах остались на мёртвых id): пока её не перевели,
+    карты роли стоят на мёртвом id и board кладёт их в «Новые». Условие
+    перевода — старый id мёртв: живые колонки и связки на них не трогаем.
+    Привязка другого проекта — другое дело: те чужие колонки и чужие задачи.
+    """
+    if not old_cfg or old_cfg.get("projectId") != project_id:
+        return []
+    live_ids = {s["id"] for s in live_statuses}
+    old_columns = old_cfg.get("columns") or {}
+    return [(role, old_columns[role], mapping.get(role))
+            for role in COLUMN_ORDER
+            if old_columns.get(role) and old_columns[role] not in live_ids]
+
+
+def rebind_role_links(role, old_id, new_id):
+    """Перевести связки мёртвой колонки роли на её новую колонку.
+
+    Живую связку правит PATCH; помеченную removed (колонку снесли штатно,
+    приложением) PATCH не воскрешает (references/api.md) — её связку заводят
+    заново POST-ом, как это делает move_to_column: связка у задачи одна и её
+    id детерминирован (KTS-<taskId>), повтор POST безопасен.
+    После записи — перечитать ВСЕ связки и сверить: у каждой затронутой задачи
+    живая связка на new_id, живых связок на мёртвом id не осталось.
+    """
+    links = paged("/kanban-task-status", "kanbanTaskStatuses", {})
+    stuck_live = [l for l in links
+                  if not l.get("removed") and l.get("statusId") == old_id]
+    stuck_removed = [l for l in links
+                     if l.get("removed") and l.get("statusId") == old_id]
+    if not stuck_live and not stuck_removed:
+        print(f"роль {role}: связок на мёртвой колонке {old_id} нет — "
+              "переводить нечего")
+        return
+    for l in stuck_live:
+        request("PATCH", f"/kanban-task-status/{l['id']}",
+                body={"statusId": new_id})
+    for l in stuck_removed:
+        request("POST", "/kanban-task-status",
+                body={"taskId": l["taskId"], "statusId": new_id})
+    affected = {l["taskId"] for l in stuck_live + stuck_removed}
+    after = paged("/kanban-task-status", "kanbanTaskStatuses", {})
+    by_task = {}
+    for l in after:
+        if not l.get("removed") and l.get("taskId") in affected:
+            by_task.setdefault(l["taskId"], set()).add(l.get("statusId"))
+    bad = [t for t in sorted(affected) if new_id not in by_task.get(t, set())]
+    if bad:
+        die(f"роль {role}: после перевода {len(bad)} задач не на {new_id}: "
+            f"{', '.join(bad)}. Привязка НЕ записана — повтори init, он "
+            f"повторит перевод; вручную: PATCH /kanban-task-status/<id "
+            f'связки> {{"statusId": "{new_id}"}}')
+    how = []
+    if stuck_live:
+        how.append(f"{len(stuck_live)} через PATCH")
+    if stuck_removed:
+        how.append(f"{len(stuck_removed)} заново (POST)")
+    print(f"роль {role}: {len(affected)} задач переведены со мёртвой колонки "
+          f"{old_id} на {new_id} ({', '.join(how)}; сверено перечитыванием)")
+
+
 def assert_task_allowed(task_id, cfg=None, fallback=False):
     """Задача обязана лежать в проекте, разрешённом ограничением области.
 
@@ -2993,6 +3059,13 @@ def cmd_init(args):
     cfg_path = find_config(repo_root)
     if not cfg_path or not cfg_path.startswith(repo_root + os.sep):
         cfg_path = os.path.join(repo_root, CONFIG_LOCATIONS[0])
+    # Старая привязка — единственный источник id пропавших колонок: ниже
+    # save_config её перезапишет, и роль с мёртвой колонкой станет неотличима
+    # от роли, которой колонки никогда не было (инцидент 10-24).
+    old_cfg = None
+    if os.path.exists(cfg_path):
+        with open(cfg_path, encoding="utf-8") as f:
+            old_cfg = json.load(f)
     plan.append(f"ЗАПИСАТЬ {cfg_path}")
     ensure_agents_rule(repo_root, (target or {}).get("title") or args.project,
                        cfg_path, apply=False, plan=plan)
@@ -3003,6 +3076,14 @@ def cmd_init(args):
     tasks_plan, tasks_to_create = plan_default_tasks(
         existing_tasks, is_git, has_logs=has_logs, no_tasks=getattr(args, "no_tasks", False))
     plan.extend(tasks_plan)
+
+    if target:
+        for role, old_id, new_id in dead_role_targets(target["id"], mapping,
+                                                      old_cfg, existing):
+            where = (f"на живую {new_id}" if new_id
+                     else "на колонку, которую init создаст")
+            plan.append(f"ПЕРЕПРИВЯЗАТЬ связки роли {role} со мёртвой колонки "
+                        f"{old_id} {where}")
 
     if not args.apply:
         print("\nПлан (ничего не изменено, добавь --apply):")
@@ -3049,6 +3130,17 @@ def cmd_init(args):
                 + "  Колонки созданы, но привязка НЕ записана — на доске роли идут не по\n"
                   "  порядку todo → wip → review → done → blocked. Проверь проект в\n"
                   "  трекере и повтори init: он двигает колонки повторно.")
+
+    # Связка переживает удаление колонки — без перевода карты пропавших ролей
+    # остались бы на мёртвом id (board положил бы их в «Новые»). До save_config
+    # намеренно: привязку не записали — повторный init повторит перевод (старый
+    # id ещё в привязке, колонка найдётся по имени или в привязке).
+    if target:
+        now = [s for s in project_statuses(target["id"]) if not s.get("removed")]
+        for role, old_id, new_id in dead_role_targets(target["id"], mapping,
+                                                      old_cfg, now):
+            if new_id:
+                rebind_role_links(role, old_id, new_id)
 
     cfg = {
         "projectId": target["id"],

@@ -1568,6 +1568,166 @@ class InitDryRunMatchesApplyTest(unittest.TestCase):
                          "сухой прогон и --apply обязаны говорить одно и то же")
 
 
+class InitRebindDeadRoleTest(unittest.TestCase):
+    """init --apply перевязывает карты пропавшей роли на новую колонку.
+
+    Инцидент 10-24: колонка роли пропала из облака, а связка переживает
+    удаление и остаётся на мёртвом id — карты роли стояли в «Новых», пока
+    их не перевели руками (16 связок на 14 проектах). Теперь init переводит
+    сам: старый id — из привязки до перезаписи, живую связку — PATCH,
+    помеченную removed — заново POST, сверка — перечитыванием
+    (references/api.md, «связка ПЕРЕЖИВАЕТ удаление»).
+    """
+
+    ROOT = {"id": "P-root", "title": sing.ROOT_PROJECT_TITLE, "parent": None}
+    PROJ = {"id": "P-1", "title": "проект", "parent": "P-root"}
+    LIVE = {
+        "KS-P-1-TODO": ("Новые", 0),
+        "KS-P-1-IN-PROGRESS": ("В работе", 50000),
+        "KS-P-1-DONE": ("Готово", 100000),
+    }
+    NEW_IDS = {"На проверке": "KS-NEW-REVIEW", "Заблокировано": "KS-NEW-BLOCKED"}
+
+    def setUp(self):
+        self.repo = os.path.join(tempfile.mkdtemp(), "репо")
+        os.makedirs(os.path.join(self.repo, ".agents"))
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.repo), True)
+        self.cfg_path = os.path.join(self.repo, ".agents", "singularity.json")
+        self._write_binding(self._old_binding())
+        self.statuses = {cid: {"id": cid, "name": name,
+                               "kanbanOrder": order, "removed": False}
+                         for cid, (name, order) in self.LIVE.items()}
+        self.links = {
+            "KTS-T-live": {"id": "KTS-T-live", "taskId": "T-live",
+                           "statusId": "KS-DEAD-REVIEW", "removed": False},
+            "KTS-T-orphan": {"id": "KTS-T-orphan", "taskId": "T-orphan",
+                             "statusId": "KS-DEAD-REVIEW", "removed": True},
+            "KTS-T-wip": {"id": "KTS-T-wip", "taskId": "T-wip",
+                          "statusId": "KS-P-1-IN-PROGRESS", "removed": False},
+        }
+        sing.forget_projects()
+        sing._PROJECTS_CACHE.extend([self.ROOT, self.PROJ])
+        self.addCleanup(sing.forget_projects)
+        board_patch = mock.patch.object(sing, "board_tasks", return_value=[])
+        board_patch.start()
+        self.addCleanup(board_patch.stop)
+
+    def _old_binding(self):
+        return {
+            "projectId": "P-1",
+            "projectTitle": "проект",
+            "columns": {
+                "todo": "KS-P-1-TODO",
+                "wip": "KS-P-1-IN-PROGRESS",
+                "review": "KS-DEAD-REVIEW",
+                "done": "KS-P-1-DONE",
+                "blocked": "KS-DEAD-BLOCKED",
+            },
+            "columnNames": dict(sing.DEFAULT_COLUMNS),
+        }
+
+    def _write_binding(self, cfg):
+        with open(self.cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+
+    def _read_binding(self):
+        with open(self.cfg_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _fake_request(self, method, path, query=None, body=None, soft=False):
+        if method == "GET" and path == "/kanban-status":
+            items = sorted(self.statuses.values(),
+                           key=lambda s: s.get("kanbanOrder") or 0)
+            return {"kanbanStatuses": items, "pagination": {"total": len(items)}}
+        if method == "GET" and path.startswith("/kanban-status/"):
+            return self.statuses.get(path.rsplit("/", 1)[1])
+        if method == "GET" and path == "/kanban-task-status":
+            items = sorted(self.links.values(), key=lambda l: l["id"])
+            return {"kanbanTaskStatuses": items, "pagination": {"total": len(items)}}
+        if method == "PATCH" and path.startswith("/kanban-status/"):
+            self.statuses[path.rsplit("/", 1)[1]]["kanbanOrder"] = body["kanbanOrder"]
+            return {}
+        if method == "POST" and path == "/kanban-status":
+            cid = self.NEW_IDS[body["name"]]
+            self.statuses[cid] = {"id": cid, "name": body["name"],
+                                  "kanbanOrder": body["kanbanOrder"], "removed": False}
+            return {"id": cid}
+        if method == "PATCH" and path.startswith("/kanban-task-status/"):
+            self.links[path.rsplit("/", 1)[1]]["statusId"] = body["statusId"]
+            return {}
+        if method == "POST" and path == "/kanban-task-status":
+            lid = f"KTS-{body['taskId']}"
+            self.links[lid] = {"id": lid, "taskId": body["taskId"],
+                               "statusId": body["statusId"], "removed": False}
+            return {"id": lid}
+        raise AssertionError(f"неожиданный запрос: {method} {path}")
+
+    def _run_init(self, apply):
+        args = argparse.Namespace(project="проект", path=self.repo, apply=apply,
+                                  columns=None, own_columns=False, no_tasks=True)
+        out = io.StringIO()
+        with mock.patch.object(sing, "request", side_effect=self._fake_request), \
+                contextlib.redirect_stdout(out), quiet() as err:
+            sing.cmd_init(args)
+        return out.getvalue(), err.getvalue()
+
+    def test_apply_moves_live_link_on_dead_column_to_new_column(self):
+        out, _ = self._run_init(apply=True)
+        self.assertEqual(self.links["KTS-T-live"]["statusId"], "KS-NEW-REVIEW",
+                         "живая связка мёртвой колонки обязана перевестись PATCH-ем")
+        self.assertEqual(self.links["KTS-T-wip"]["statusId"], "KS-P-1-IN-PROGRESS",
+                         "связка на живой колонке не должна трогаться")
+        cfg = self._read_binding()
+        self.assertEqual(cfg["columns"]["review"], "KS-NEW-REVIEW")
+        self.assertEqual(cfg["columns"]["blocked"], "KS-NEW-BLOCKED")
+        self.assertEqual(cfg["columns"]["todo"], "KS-P-1-TODO",
+                         "живые роли остаются на прежних колонках")
+        self.assertIn("переведены со мёртвой колонки KS-DEAD-REVIEW", out,
+                      "вывод обязан назвать, что переведено и сверено")
+
+    def test_apply_recreates_link_marked_removed(self):
+        self._run_init(apply=True)
+        self.assertEqual(self.links["KTS-T-orphan"]["statusId"], "KS-NEW-REVIEW")
+        self.assertFalse(self.links["KTS-T-orphan"]["removed"],
+                         "removed-связку PATCH не воскрешает — её место живая новая")
+
+    def test_dry_run_promises_rebind_and_touches_nothing(self):
+        out, _ = self._run_init(apply=False)
+        self.assertIn("ПЕРЕПРИВЯЗАТЬ связки роли review", out)
+        self.assertIn("ПЕРЕПРИВЯЗАТЬ связки роли blocked", out)
+        self.assertEqual(self._read_binding()["columns"]["review"], "KS-DEAD-REVIEW",
+                         "сухой прогон обязан остаться сухим")
+        self.assertEqual(self.links["KTS-T-live"]["statusId"], "KS-DEAD-REVIEW")
+        self.assertNotIn("KS-NEW-REVIEW", self.statuses)
+
+    def test_live_old_column_is_not_touched(self):
+        self.statuses["KS-ALIVE-REVIEW"] = {"id": "KS-ALIVE-REVIEW",
+                                            "name": "На проверке",
+                                            "kanbanOrder": 60000, "removed": False}
+        self.statuses["KS-ALIVE-BLOCKED"] = {"id": "KS-ALIVE-BLOCKED",
+                                             "name": "Заблокировано",
+                                             "kanbanOrder": 120000, "removed": False}
+        self.links["KTS-T-alive"] = {"id": "KTS-T-alive", "taskId": "T-alive",
+                                     "statusId": "KS-ALIVE-REVIEW", "removed": False}
+        binding = self._old_binding()
+        binding["columns"]["review"] = "KS-ALIVE-REVIEW"
+        binding["columns"]["blocked"] = "KS-ALIVE-BLOCKED"
+        self._write_binding(binding)
+        out, _ = self._run_init(apply=True)
+        self.assertNotIn("ПЕРЕПРИВЯЗАТЬ", out,
+                         "старая колонка жива — переводить нечего")
+        self.assertEqual(self.links["KTS-T-alive"]["statusId"], "KS-ALIVE-REVIEW")
+
+    def test_other_projects_binding_is_not_touched(self):
+        binding = self._old_binding()
+        binding["projectId"] = "P-other"
+        self._write_binding(binding)
+        out, _ = self._run_init(apply=True)
+        self.assertNotIn("ПЕРЕПРИВЯЗАТЬ", out,
+                         "привязка другого проекта — чужие колонки и чужие задачи")
+        self.assertEqual(self.links["KTS-T-live"]["statusId"], "KS-DEAD-REVIEW")
+
+
 class AgentsRuleTest(unittest.TestCase):
     """После привязки правило «работа по доске» обязано оказаться в правилах
     репозитория: агент, зашедший в него, узнаёт о доске оттуда, а не из промпта."""
