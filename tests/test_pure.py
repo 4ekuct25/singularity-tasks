@@ -293,6 +293,130 @@ class AddCreatedFirstTest(unittest.TestCase):
         self.assertLess(dropped, wall)
 
 
+class FuzzyAddDupTest(unittest.TestCase):
+    """add: близкий дубль открытого заголовка (переформулировка) —
+    предупреждение с названием и полной ссылкой, а не отказ (T-09b1cad9):
+    решение создать — за человеком, ложный отказ блокировал бы легитимную
+    близкую карточку.
+
+    Порог прижат живым замером (setup-qwencode, 2026-10-29) с ДВУХ сторон:
+    максимальный overlap легитимных серий (разные PR/тикет) — 0.79, лежит
+    НИЖЕ порога; близкая переформулировка — 0.875, ВЕРХЕ. Сдвинуть
+    FUZZY_TITLE_THRESHOLD за (0.79, 0.875) — тест краснеет.
+    """
+
+    EXIST = "T-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    LINK = f"https://web.singularity-app.com/#/?&id={EXIST}"
+    TID = "T-12345678-1234-5678-1234-123456789abc"
+
+    SERIES_A = ("Прогнать Windows-ногу PR #14335 на UTM Win-VM "
+                "(head fee106a072) и обновить Tested-on в теле PR")
+    SERIES_B = ("Прогнать Windows-ногу PR #15815 на UTM Win-VM "
+                "(head 4eeed491d8) и обновить Tested-on в теле PR")
+    REPHRASED = ("Довести Windows-ногу PR fix/approval-double-scrollbar "
+                 "на UTM Win-VM и опубликовать issue и PR")
+    REPHRASED2 = ("Докончить Windows-ногу PR fix/approval-double-scrollbar "
+                  "на UTM Win-VM и опубликовать issue и PR")
+
+    def test_threshold_window_pinned_by_live_data(self):
+        """Легитимная серия (разные PR) — ниже порога, близкая
+        переформулировка — выше. Ниже 0.79 предупреждения начнут летать
+        на серии, выше 0.875 перестанут ловить переформулировки."""
+        self.assertLess(sing.fuzzy_title_overlap(self.SERIES_A, self.SERIES_B),
+                        sing.FUZZY_TITLE_THRESHOLD)
+        self.assertGreaterEqual(
+            sing.fuzzy_title_overlap(self.REPHRASED, self.REPHRASED2),
+            sing.FUZZY_TITLE_THRESHOLD)
+
+    def test_overlap_values(self):
+        # то же множество слов в другом порядке — 1.0
+        self.assertEqual(sing.fuzzy_title_overlap(
+            "Довести PR и опубликовать issue",
+            "Опубликовать issue и довести PR"), 1.0)
+        # общих токенов нет
+        self.assertEqual(sing.fuzzy_title_overlap(
+            "Обновить тесты", "Закрыть ветку"), 0.0)
+        # пунктуационный вариант: множества совпали, а точный дубль их
+        # НЕ видит — ровно то, мимо чего проходит same_title
+        self.assertEqual(sing.fuzzy_title_overlap(
+            "опубликовать issue/pr", "опубликовать issue+PR"), 1.0)
+        self.assertFalse(sing.same_title("опубликовать issue/pr",
+                                         "опубликовать issue+PR"))
+
+    def test_fuzzy_twins_skips_closed_and_recurring(self):
+        t_open = {"id": "T-1", "title": self.REPHRASED, "checked": 0}
+        t_done = {"id": "T-2", "title": self.REPHRASED, "checked": 1}
+        t_recur = {"id": "T-3", "title": self.REPHRASED, "checked": 0,
+                   "recurrenceGeneratorId": "R-1"}
+        self.assertEqual(sing.fuzzy_twins([t_open, t_done, t_recur],
+                                          self.REPHRASED2), [t_open])
+
+    def _run_add(self, board, title, dup_ok=False):
+        cfg = {"projectId": "P-1", "columns": {"todo": "KS-P-1-TODO"}}
+        args = argparse.Namespace(
+            title=title, note="коротко", column="todo",
+            priority=None, deadline=None, start=None,
+            parent=None, group=None, new_group=False,
+            dup_ok=dup_ok, no_note=False)
+
+        def fake_request(method, path, query=None, body=None, soft=False):
+            # GET — только на пути отказа точного двойника (column_map берёт
+            # колонки для пометки); на успехе add GET не шлёт вовсе
+            if method == "GET":
+                return {}
+            self.assertEqual((method, path), ("POST", "/task"))
+            return {"id": self.TID, "title": title}
+
+        with mock.patch.object(sing, "command_config",
+                               return_value=(cfg, None)), \
+                mock.patch.object(sing, "board_tasks", return_value=board), \
+                mock.patch.object(sing, "request", side_effect=fake_request), \
+                mock.patch.object(sing, "move_to_column",
+                                  return_value="KS-P-1-TODO"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            sing.cmd_add(args)
+        return out.getvalue()
+
+    def test_warning_with_name_and_link_before_creation(self):
+        board = [{"id": self.EXIST, "title": self.REPHRASED, "checked": 0}]
+        text = self._run_add(board, self.REPHRASED2)
+        created = text.index("создана в колонке")
+        warn = text.index("похожая уже открыта")
+        self.assertLess(warn, created,
+                        "предупреждение после строки успеха читается как отказ")
+        # название и полная ссылка на существующую карточку
+        self.assertIn("Довести Windows-ногу PR", text[:created])
+        self.assertIn(self.LINK, text[:created])
+        # строка успеха сразу за предупреждением и после неё — без «⚠»:
+        # предсозданные предупреждения легальны (как у закрытого двойника),
+        # постсозданные — читаются как отказ
+        line_start = text.rfind("\n", 0, created) + 1
+        self.assertEqual(text[line_start:created], f"{self.TID}: ")
+        self.assertNotIn("⚠", text[line_start:])
+
+    def test_series_pair_not_warned(self):
+        """Легитимная серия (другой PR, другой head) — предупреждения нет:
+        порог подобран, чтобы на сериях не срабатывать."""
+        board = [{"id": self.EXIST, "title": self.SERIES_A, "checked": 0}]
+        text = self._run_add(board, self.SERIES_B)
+        self.assertNotIn("похожая уже открыта", text)
+        self.assertIn(f"{self.TID}: создана в колонке 'todo'", text)
+
+    def test_dup_ok_suppresses_fuzzy_warning(self):
+        """--dup-ok гасит ВСЮ проверку, включая fuzzy: это обещано в самом
+        тексте предупреждения."""
+        board = [{"id": self.EXIST, "title": self.REPHRASED, "checked": 0}]
+        text = self._run_add(board, self.REPHRASED2, dup_ok=True)
+        self.assertNotIn("похожая уже открыта", text)
+        self.assertIn(f"{self.TID}: создана в колонке 'todo'", text)
+
+    def test_exact_open_twin_still_refused(self):
+        """Точный дубль — по-прежнему отказ: fuzzy-проверка его не поглотила."""
+        board = [{"id": self.EXIST, "title": "Обновить тесты", "checked": 0}]
+        with quiet(), self.assertRaises(SystemExit):
+            self._run_add(board, "обновить  тесты")
+
+
 class BareTaskIdTest(unittest.TestCase):
     """Голый id задачи в тексте для человека: полный UUID получает ссылку в
     точке, где текст становится заметкой, короткому — предупреждение.
