@@ -1055,5 +1055,65 @@ class UnarchiveLiveTest(LiveBase):
             self.sing.request("GET", f"/task/{tid}").get("journalDate"))
 
 
+class PrefixResolveLiveTest(LiveBase):
+    """Короткий префикс id задачи (T-22e9cfc2) на живом трекере: fast покрывает
+    матчинг на моках, здесь — реальные id сервера и полный цикл команд. UUID
+    генерирует сервер, поэтому неоднозначность строится гарантированно:
+    17 задач > 16 первых hex-символов (принцип голубков)."""
+
+    def _delete_tasks(self, tids):
+        for tid in tids:
+            self.sing.request("DELETE", f"/task/{tid}")
+            self.assertIsNone(
+                self.sing.request("GET", f"/task/{tid}", soft=True),
+                "тестовые данные не убраны")
+
+    def test_unambiguous_prefix_resolves_in_show_report_start_release(self):
+        tids = [self.make_task(f"zz: префикс live {n}") for n in range(3)]
+        ref = tids[0][:10]  # T- + 8 hex
+        self.assertEqual(sum(1 for t in tids if t.startswith(ref)), 1,
+                         "предпосылка: префикс уникален")
+        p = self.cli("show", ref)
+        self.assertIn(f"разрешено как {tids[0]}", p.stderr)
+        self.cli("report", ref, "live-проверка префикса")
+        self.assertIn("live-проверка префикса", self.note_of(tids[0]))
+        p = self.cli("start", ref, "--plan", "план на коротком префиксе")
+        self.assertIn(f"разрешено как {tids[0]}", p.stderr)
+        self.assertEqual(self.column_of(tids[0]), "wip")
+        self.assertIn(f"agent:{AGENT}", self.agent_tags(tids[0]))
+        p = self.cli("release", ref)
+        self.assertIn(f"разрешено как {tids[0]}", p.stderr)
+        self.assertEqual(self.column_of(tids[0]), "todo")
+        self.assertNotIn(f"agent:{AGENT}", self.agent_tags(tids[0]))
+        self._delete_tasks(tids)
+
+    def test_ambiguous_and_unknown_prefixes_refuse(self):
+        tids = [self.make_task(f"zz: префикс номер {n}") for n in range(1, 18)]
+        ids = [t["id"] for t in self.sing.board_tasks(self.proj["id"])
+               if t.get("id")]
+        counts = {}
+        for i in ids:
+            counts[i[2]] = counts.get(i[2], 0) + 1
+        c = next(k for k in sorted(counts) if counts[k] >= 2)
+        pref = "T-" + c
+        cands = [i for i in sorted(ids) if i.startswith(pref)]
+        self.assertGreaterEqual(len(cands), 2, "голубки: 17 задач, 16 hex")
+        p = self.cli("show", pref, expect=1)
+        self.assertIn(f"подходит {len(cands)} задач", p.stderr)
+        for i in cands[:2]:
+            self.assertIn(i, p.stderr)
+        self.assertIn("sing.py list", p.stderr)
+        miss = next("T-" + a + b
+                    for a in "0123456789abcdef" for b in "0123456789abcdef"
+                    if not any(i.startswith("T-" + a + b) for i in ids))
+        p = self.cli("show", miss, expect=1)
+        self.assertIn("задача не найдена среди задач привязанного проекта",
+                      p.stderr)
+        self.assertIn("нужен полный id", p.stderr)
+        p = self.cli("show", tids[0])
+        self.assertNotIn("разрешено как", p.stderr)
+        self._delete_tasks(tids)
+
+
 if __name__ == "__main__":
     unittest.main()
