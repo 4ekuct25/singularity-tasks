@@ -647,6 +647,85 @@ class NotesTest(LiveBase):
         p = self.cli("notes", "--edit", tid, "--text", "текст", expect=1)
         self.assertIn("не заметка", p.stderr)
         self.assertEqual(self.note_of(tid), "", "отказ всё-таки что-то записал")
+
+
+class NoteEditLiveTest(LiveBase):
+    """Write-путь `note-edit` на живом трекере (T-81fd0ddb): сервер берёт новую
+    заметку и отдаёт её побайтово, а бэкап прежней остаётся на диске. На
+    заглушке — tests/test_edit.NoteEditTest (там же команда контрольного
+    красного); живьём — настоящий PATCH и перечитывание: принимает ли сервер
+    посланную форму как есть.
+
+    Один тест на весь путь намеренно: каждая команда здесь — запросы к живому
+    трекеру, а прогоны подряд он не держит (429).
+    """
+
+    BACKUP_DIR = os.path.expanduser("~/.singularity-note-backups")
+
+    def _sweep_backups(self, tid):
+        """Снять только бэкапы ЭТОЙ задачи: каталог общий, чужие файлы не трогать."""
+        if not os.path.isdir(self.BACKUP_DIR):
+            return
+        for name in os.listdir(self.BACKUP_DIR):
+            if name.startswith(f"{tid}-"):
+                os.remove(os.path.join(self.BACKUP_DIR, name))
+
+    def raw_note(self, tid):
+        """Сырая заметка трекера: delta как СТРОКА, а не рендеренный текст (см. api.md)."""
+        note = self.sing.request("GET", f"/task/{tid}")["note"]
+        if isinstance(note, (list, dict)):
+            return json.dumps(note, ensure_ascii=False)
+        return note
+
+    def backup_files(self, tid):
+        """Бэкап-файлы этой задачи; каталога ещё нет — бэкапов нет."""
+        if not os.path.isdir(self.BACKUP_DIR):
+            return []
+        return [n for n in os.listdir(self.BACKUP_DIR)
+                if n.startswith(f"{tid}-")]
+
+    def test_line_rewrite_refusal_and_backup(self):
+        note = ("цель: переписать одну строку заметки\n"
+                "старая строка\n"
+                "контекст: живой трекер")
+        out = self.cli("add", "zz: перепись строки заметки",
+                       "--note", note).stdout
+        line = next(s for s in out.splitlines() if "создана в колонке" in s)
+        tid = line.split(":")[0].strip()
+        self.assertTrue(tid.startswith("T-"), out)
+        self.addCleanup(self._sweep_backups, tid)
+        before = self.raw_note(tid)
+
+        # Несуществующий OLD — отказ ДО запроса: ни записи, ни бэкапа
+        p = self.cli("note-edit", tid, "нет такой строки", "что угодно", expect=1)
+        self.assertIn("не найден", p.stderr)
+        self.assertEqual(self.raw_note(tid), before,
+                         "отказ всё-таки что-то записал")
+        self.assertEqual(self.backup_files(tid), [],
+                         "отказ, ничего не сделавший, оставил файл бэкапа")
+
+        # Строка переписана, остаток заметки побайтово тот же
+        out = self.cli("note-edit", tid, "старая строка", "новая строка").stdout
+        expected = self.sing.note_dump(self.sing.note_replace(
+            self.sing.note_ops(before), "старая строка", "новая строка"))
+        self.assertEqual(self.raw_note(tid), expected,
+                         "остаток заметки изменился — переписывать была только строка")
+
+        # Бэкап в каталоге по умолчанию: один файл, исходная заметка побайтово
+        files = sorted(self.backup_files(tid))
+        self.assertEqual(len(files), 1, "на одну перепись — ровно один файл бэкапа")
+        backup_path = os.path.join(self.BACKUP_DIR, files[0])
+        with open(backup_path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before,
+                             "бэкап не совпадает с исходной заметкой побайтово")
+        self.assertIn(backup_path, out, "человеку не сказали, где бэкап")
+
+        # Уборка в том же заходе: карта удалена и перечитана
+        self.sing.request("DELETE", f"/task/{tid}")
+        self.assertIsNone(self.sing.request("GET", f"/task/{tid}", soft=True),
+                          "тестовые данные не убраны")
+
+
 class FreshProjectKanbanTest(LiveBase):
     """СВЕЖИЙ проект, в приложении не открытый и в канбан руками не переключённый:
     `init --apply` обязан разложить роли по СИСТЕМНЫМ колонкам и не завести ни одной
