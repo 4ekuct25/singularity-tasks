@@ -514,6 +514,28 @@ class CycleTest(LiveBase):
                  agent=OTHER_AGENT)
         self.assertEqual(self.agent_tags(tid), [f"agent:{OTHER_AGENT}"])
 
+    def test_dead_marker_on_a_review_card_does_not_block_start(self):
+        """Метка сессии, завершившейся `done --review`, — след, а не захват:
+        следующий `start` берёт карту без `--take-over` (T-3ef6b167, фикс
+        93cc0bd). Окно на заглушке покрывает tests/test_claim с контролем
+        красного; живьём — метка реально висит на карте, и второй агент
+        перетягивает карту, сняв мёртвую метку.
+        """
+        tid = self.make_task("zz: мёртвая метка на проверке")
+        self.cli("start", tid, "--plan", "первый агент")
+        self.cli("done", tid, "--report", "отправляю на проверку", "--review")
+        self.assertEqual(self.column_of(tid), "review")
+        self.assertEqual(self.agent_tags(tid), [f"agent:{AGENT}"],
+                         "метка завершившейся сессии обязана остаться на карте")
+        self.cli("start", tid, "--plan", "второй агент", agent=OTHER_AGENT)
+        self.assertEqual(self.column_of(tid), "wip",
+                         "карта из «На проверке» обязана уехать в работу")
+        self.assertEqual(self.agent_tags(tid), [f"agent:{OTHER_AGENT}"],
+                         "мёртвая метка не снята вторым агентом")
+        self.sing.request("DELETE", f"/task/{tid}")
+        self.assertIsNone(self.sing.request("GET", f"/task/{tid}", soft=True),
+                          "тестовые данные не убраны")
+
 
 class ReturnPathTest(LiveBase):
 
