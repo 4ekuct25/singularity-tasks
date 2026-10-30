@@ -4148,6 +4148,268 @@ def cmd_ready(args):
         sys.exit(1)
 
 
+# --------------------------------------------------------------------------- сироты
+#
+# Открытая карта без kanban-task-status-связки (сирота) не лежит ни в одной
+# колонке: на одной доске её выдаёт пометка `⚠ ВНЕ КОЛОНОК`, но доска показывает
+# один проект. Рекуррентные серии приложения создаются без связки, поэтому
+# сироты нарастают на всех досках за раз (29.10: 102 из 1032 открытых).
+# Скан — только чтение. `--bind` привязывает кандидатов к «Новые» ЕГО проекта:
+# карты между колонками не двигает, не закрывает, теги/заметки/даты не трогает.
+# Семантика перенесена с проверенных на живом API скриптов 29.10
+# (.qwen/tmp/orphan-bind-20261029/scan.py + bind_one.py).
+
+ORPHAN_TODO_NAME = "Новые"
+# Карты пользовательского списка — не кандидаты на bind, отдельная категория
+# в отчёте.
+ORPHAN_USER_LIST_PREFIXES = ("T-0d4984b3", "T-3d4419ef", "T-9fb5c97f", "T-a9d0c392")
+ORPHAN_BIND_ATTEMPTS = 3
+ORPHAN_PACE_SCAN = 0.5    # с между проектами: выборка каждого — несколько запросов
+ORPHAN_PACE_BIND = 1.5    # с между картами: ~4 запроса на карту, троттл по ручке
+ORPHAN_BIND_SETTLE = 0.5  # с после POST до перечитывания связки
+
+
+def orphan_todo_status(pid, statuses):
+    """Колонка «Новые» проекта: (id, state).
+
+    ok — единственная «Новые» среди живых колонок; id-only — таких колонок
+    нет, но жив системная KS-<pid>-TODO (у проекта из приложения список
+    колонок бывает пустым до первой синхронизации); split — «Новых» несколько,
+    к какой привязывать неясно; missing — ни той, ни другой.
+    """
+    live = [s for s in statuses if not s.get("removed")]
+    novos = [s for s in live if s.get("name") == ORPHAN_TODO_NAME]
+    if len(novos) == 1:
+        return novos[0]["id"], "ok"
+    if len(novos) > 1:
+        return None, "split"
+    st = request("GET", f"/kanban-status/KS-{pid}-TODO", soft=True)
+    if st and not st.get("removed"):
+        return st["id"], "id-only"
+    return None, "missing"
+
+
+def orphan_classify(task, tagmap):
+    """Категория сироты: (категория, agent-теги).
+
+    user-list (id из пользовательского списка) проверяется до agent-тега:
+    более специфичное правило побеждает. Обе категории — «не трогать»,
+    различие только в отчёте.
+    """
+    names = sorted({tagmap.get(x, x) for x in task.get("tags") or []})
+    agent = [n for n in names if n.startswith(AGENT_TAG_PREFIX)]
+    if any(task["id"].startswith(x) for x in ORPHAN_USER_LIST_PREFIXES):
+        return "user-list", agent
+    if agent:
+        return "agent", agent
+    return "bind", agent
+
+
+def orphan_scan(projects, links, tagmap):
+    """Скан сирот по подпроектам: (rows, orphans, offproject).
+
+    Открытая карта — семантика board (board_tasks): либо живая связка на
+    живую колонку СВОЕГО проекта, либо loose (не выполнена, не в дневнике).
+    Сирота — открытая карта без живой kanban-task-status-связки ВООБЩЕ (ни на
+    свой проект, ни на «Сегодня», ни на мёртвую колонку). Связки берутся на
+    весь аккаунт: GET /kanban-task-status не поддерживает ?projectId=.
+    offproject — открытая карта, чьи живые связки смотрят только на колонки
+    не своего проекта: инцидент, а не сирота.
+    """
+    by_task = {}
+    for l in links:
+        if not l.get("removed") and l.get("taskId"):
+            by_task.setdefault(l["taskId"], []).append(l.get("statusId"))
+    linked_any = set(by_task)
+    rows, orphans, offproject = [], [], []
+    for i, p in enumerate(projects):
+        if i:
+            time.sleep(ORPHAN_PACE_SCAN)
+        pid = p["id"]
+        tasks = board_tasks(pid)
+        statuses = project_statuses(pid)
+        todo, todo_state = orphan_todo_status(pid, statuses)
+        own = {c["id"] for c in statuses if not c.get("removed")}
+        open_ids = set()
+        for t in tasks:
+            if any(s in own for s in by_task.get(t["id"], [])):
+                open_ids.add(t["id"])
+            elif int(t.get("checked") or 0) == 0 and not t.get("journalDate"):
+                open_ids.add(t["id"])
+        proj_orphans, off_n = [], 0
+        for t in tasks:
+            if t["id"] not in open_ids:
+                continue
+            if t["id"] in linked_any:
+                if not any(s in own for s in by_task.get(t["id"], [])):
+                    off_n += 1
+                    offproject.append({"task": t, "project": p})
+                continue
+            cat, agent = orphan_classify(t, tagmap)
+            proj_orphans.append({"task": t, "project": p, "category": cat,
+                                 "agentTags": agent})
+        orphans.extend(proj_orphans)
+        rows.append({"project": p, "open": len(open_ids),
+                     "orphans": len(proj_orphans), "todo": todo,
+                     "todoState": todo_state, "offproject": off_n})
+    return rows, orphans, offproject
+
+
+def orphan_bind_one(o, tagmap, todo_by_pid):
+    """Одна карта: пре-чек → POST /kanban-task-status → перечитывание связки.
+
+    Повтор POST безопасен: id связки детерминирован KTS-<taskId>, повтор
+    апсертит, вторую связку не заводит (references/api.md). Слепый POST без
+    пре-чека запрещён: карта не читается или перестала быть сиротой (проект
+    сменился, agent-тег, живая связка, закрыта/дневник) — skip/failed без
+    POST. Успех — ТОЛЬКО по перечитыванию: API умеет ответить 200, ничего
+    не сделав (change-column, инцидент 10-23).
+    """
+    task, p = o["task"], o["project"]
+    pid = p["id"]
+    todo, todo_state = todo_by_pid[pid]
+    rec = {"task": task["id"]}
+    if todo is None:
+        rec.update(result="skip",
+                   reason=f"нет колонки «{ORPHAN_TODO_NAME}» ({todo_state})")
+        return rec
+    last_err = None
+    for attempt in range(1, ORPHAN_BIND_ATTEMPTS + 1):
+        task_now = request("GET", f"/task/{task['id']}", soft=True)
+        if task_now is None:
+            rec.update(result="failed", attempts=attempt,
+                       reason="карта не читается — POST без пре-чека")
+            return rec
+        if task_now.get("projectId") != pid:
+            rec.update(result="skip",
+                       reason=f"проект сменился: {task_now.get('projectId')}")
+            return rec
+        names = sorted({tagmap.get(x, x) for x in task_now.get("tags") or []})
+        agent = [n for n in names if n.startswith(AGENT_TAG_PREFIX)]
+        if agent:
+            rec.update(result="skip",
+                       reason="agent-тег: " + ", ".join(agent))
+            return rec
+        if int(task_now.get("checked") or 0) == 1 or task_now.get("journalDate"):
+            rec.update(result="skip", reason="закрыта или унесена в дневник")
+            return rec
+        links = paged("/kanban-task-status", "kanbanTaskStatuses",
+                      {"taskId": task["id"]})
+        live = [l for l in links if not l.get("removed")]
+        if live:
+            rec.update(result="skip",
+                       reason="живая связка уже есть: " +
+                       ", ".join(sorted({str(l.get("statusId")) for l in live})))
+            return rec
+        try:
+            request("POST", "/kanban-task-status",
+                    body={"taskId": task["id"], "statusId": todo})
+            last_err = None
+        except SystemExit:
+            last_err = "POST отказал (текст в stderr выше)"
+        time.sleep(ORPHAN_BIND_SETTLE)
+        links2 = paged("/kanban-task-status", "kanbanTaskStatuses",
+                       {"taskId": task["id"]})
+        live2 = [l for l in links2 if not l.get("removed")]
+        if any(l.get("statusId") == todo for l in live2):
+            rec.update(result="bound", statusId=todo, attempt=attempt)
+            return rec
+        if attempt < ORPHAN_BIND_ATTEMPTS:
+            time.sleep(5 if last_err else 2 * attempt)
+    rec.update(result="failed", attempts=ORPHAN_BIND_ATTEMPTS,
+               reason=f"связка не появилась за {ORPHAN_BIND_ATTEMPTS} попытки "
+                      "(по перечитыванию)"
+                      + (f"; {last_err}" if last_err else ""))
+    return rec
+
+
+def cmd_orphan(args):
+    """Сироты по всем подпроектам: открытые карты без живой kanban-связки.
+
+    Скан только читает. `--bind` привязывает кандидатов к «Новые» их проекта
+    (см. orphan_bind_one). Код 3 — неполная выборка: выводы из скана делать
+    нельзя, привязка на неполной выборке не выполняется вовсе.
+    """
+    projects = all_projects()
+    scope = sorted(projects_in_scope(projects), key=lambda x: x.get("title", ""))
+    archived = [p for p in scope if p.get("journalDate")]
+    scope = [p for p in scope if not p.get("journalDate")]
+    bound, _ = load_config(required=False, check_scope=False)
+    bound_id = (bound or {}).get("projectId")
+
+    before = len(UNDERFILLED)
+    links = paged("/kanban-task-status", "kanbanTaskStatuses", {})
+    live_n = sum(1 for l in links if not l.get("removed"))
+    tagmap = {t["id"]: (t.get("title") or "") for t in paged("/tag", "tags")}
+    rows, orphans, offproject = orphan_scan(scope, links, tagmap)
+    underfilled = len(UNDERFILLED) > before
+
+    cats = {"bind": [], "user-list": [], "agent": []}
+    for o in orphans:
+        cats[o["category"]].append(o)
+
+    open_total = sum(r["open"] for r in rows)
+    print(f"Сироты: открыты {open_total} на {len(rows)} досках "
+          f"(подпроекты «{ROOT_PROJECT_TITLE}»), "
+          f"связок живых {live_n} из {len(links)}")
+    for r in rows:
+        mark = "  ← этот репозиторий" if r["project"]["id"] == bound_id else ""
+        print(f"  {r['project'].get('title', '')}: open={r['open']} "
+              f"orphans={r['orphans']}  todo={r['todoState']}{mark}")
+    if orphans:
+        labels = {"bind": "кандидаты на привязку",
+                  "user-list": "пользовательский список",
+                  "agent": "agent-тег"}
+        for cat in ("bind", "user-list", "agent"):
+            if not cats[cat]:
+                continue
+            print(f"  {labels[cat]}: {len(cats[cat])}")
+            for o in cats[cat]:
+                extra = "  (" + ", ".join(o["agentTags"]) + ")" \
+                    if o["agentTags"] else ""
+                print(f"    {o['task']['id']}  [{o['project'].get('title', '')}]  "
+                      f"{o['task'].get('title')}{extra}")
+    else:
+        print("  сирот нет: у каждой открытой карты живая kanban-связка")
+    print(f"ИТОГО: открытых {open_total}, сирот {len(orphans)} "
+          f"(bind {len(cats['bind'])} · user-list {len(cats['user-list'])} · "
+          f"agent {len(cats['agent'])}); вне своих колонок: {len(offproject)}")
+    if archived:
+        print(f"Архивных подпроектов пропущено: {len(archived)}")
+    if underfilled:
+        die("Неполная выборка (⚠ в stderr выше) — выводы из скана делать нельзя"
+            + (", привязка не выполнена." if args.bind else "."), 3)
+
+    if args.bind:
+        todo_by_pid = {r["project"]["id"]: (r["todo"], r["todoState"])
+                       for r in rows}
+        print(f"\nПривязка к «{ORPHAN_TODO_NAME}»: кандидатов {len(cats['bind'])}")
+        results = []
+        for i, o in enumerate(cats["bind"]):
+            if i:
+                time.sleep(ORPHAN_PACE_BIND)
+            rec = orphan_bind_one(o, tagmap, todo_by_pid)
+            results.append(rec)
+            if rec["result"] == "bound":
+                detail = f" (попытка {rec['attempt']})"
+            else:
+                detail = f" — {rec['reason']}"
+            print(f"  {rec['task']}  {rec['result']}"
+                  f"  [{o['project'].get('title', '')}]{detail}")
+        n_bound = sum(1 for r in results if r["result"] == "bound")
+        n_fail = sum(1 for r in results if r["result"] == "failed")
+        skips = {}
+        for r in results:
+            if r["result"] == "skip":
+                skips[r["reason"]] = skips.get(r["reason"], 0) + 1
+        print(f"СВОДКА: привязано {n_bound} / пропущено {len(skips)} / "
+              f"не удалось {n_fail} из {len(results)}")
+        for reason, n in sorted(skips.items(), key=lambda x: (-x[1], x[0])):
+            print(f"  пропуск: {reason} — {n}")
+        if n_fail:
+            sys.exit(1)
+
+
 def cmd_list(args):
     cfg, _ = command_config(args)
     if cfg.get("adhoc"):
@@ -5353,6 +5615,13 @@ def build_parser():
                     help="сколько готовых показывать на проект")
     json_flag(sp)
     sp.set_defaults(fn=cmd_ready)
+
+    sp = sub.add_parser("orphan", help="сироты: открытые карты без живой "
+                                       "kanban-связки, по всем подпроектам")
+    sp.add_argument("--bind", action="store_true",
+                    help="привязать кандидатов к «Новые» их проекта "
+                         "(пре-чек на карту, подтверждение перечитыванием)")
+    sp.set_defaults(fn=cmd_orphan)
 
     sp = sub.add_parser("groups", help="секции проекта")
     sp.add_argument("--create", metavar="НАЗВАНИЕ", help="завести секцию")

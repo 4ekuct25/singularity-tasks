@@ -36,6 +36,14 @@ def quiet():
         yield err
 
 
+def _orphan_task(tid, pid, title, checked=0, journal=None, removed=False,
+                 tags=()):
+    """Карта для OrphanCommandTest: только поля, которые читает скан и пре-чек."""
+    return {"id": tid, "title": title, "projectId": pid, "checked": checked,
+            "journalDate": journal, "removed": removed, "deleteDate": None,
+            "isNote": False, "tags": list(tags)}
+
+
 # --------------------------------------------------------------------- заметка
 
 
@@ -3219,3 +3227,313 @@ class ProjectFlagSurfaceTest(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 2)
         self.assertIn("unrecognized arguments", p.stderr)
+
+
+class OrphanCommandTest(unittest.TestCase):
+    """sing.py orphan: сироты — открытые карты без живой kanban-связки.
+
+    Замещена граница сети (paged + request); всё остальное —
+    all_projects/projects_in_scope/board_tasks/project_statuses — работает
+    в бою через тот же paged. Успех bind подтверждается ПЕРЕЧИТЫВАНИЕМ
+    связки, а не кодом POST: в наборе есть и случай, когда API ответил 200,
+    ничего не сделав.
+    """
+
+    ROOT = {"id": "P-root1111-0000-0000-0000-000000000000",
+            "title": "ИИ проекты", "parent": None, "removed": False}
+    PA = {"id": "P-aaaa0000-0000-0000-0000-000000000001", "title": "alpha",
+          "parent": ROOT["id"], "removed": False}
+    PB = {"id": "P-bbbb0000-0000-0000-0000-000000000001", "title": "beta",
+          "parent": ROOT["id"], "removed": False}
+    PC = {"id": "P-cccc0000-0000-0000-0000-000000000001", "title": "archived",
+          "parent": ROOT["id"], "removed": False,
+          "journalDate": "2026-01-01T00:00:00.000Z"}
+    PD = {"id": "P-dddd0000-0000-0000-0000-000000000001", "title": "delta",
+          "parent": ROOT["id"], "removed": False}
+    PE = {"id": "P-eeee0000-0000-0000-0000-000000000001", "title": "eps",
+          "parent": ROOT["id"], "removed": False}
+    PROJECTS = [ROOT, PA, PB, PC, PD, PE]
+
+    PA_TODO = "KS-PA-TODO"
+    PA_WIP = "KS-PA-WIP"
+
+    T_BIND = "T-11111111-0000-0000-0000-000000000001"
+    T_AGENT = "T-22222222-0000-0000-0000-000000000002"
+    T_USER = "T-0d4984b3-0000-0000-0000-000000000003"
+    T_LINKED = "T-33333333-0000-0000-0000-000000000004"
+    T_DONE = "T-44444444-0000-0000-0000-000000000005"
+    T_JOUR = "T-55555555-0000-0000-0000-000000000006"
+    T_REMOVED = "T-66666666-0000-0000-0000-000000000007"
+    T_OFFPRJ = "T-77777777-0000-0000-0000-000000000008"
+    T_TODAY = "T-99999999-0000-0000-0000-000000000009"
+    T_BETA = "T-bbbb0001-0000-0000-0000-000000000001"
+    T_DELTA = "T-bbbb0002-0000-0000-0000-000000000001"
+    T_EPS = "T-bbbb0003-0000-0000-0000-000000000001"
+    T_ARCH = "T-cccc0001-0000-0000-0000-000000000001"
+    T_PRE_AGENT = "T-bbbb0011-0000-0000-0000-000000000001"
+    T_PRE_PROJ = "T-bbbb0012-0000-0000-0000-000000000001"
+    T_PRE_NOREAD = "T-bbbb0013-0000-0000-0000-000000000001"
+
+    TASKS = [
+        _orphan_task(T_BIND, PA["id"], "кандидат на bind", tags=["TG-work"]),
+        _orphan_task(T_AGENT, PA["id"], "агентская карта", tags=["TG-agent"]),
+        _orphan_task(T_USER, PA["id"], "карта из пользовательского списка"),
+        _orphan_task(T_LINKED, PA["id"], "в колонке"),
+        _orphan_task(T_DONE, PA["id"], "выполнена", checked=1),
+        _orphan_task(T_JOUR, PA["id"], "в дневнике", checked=1,
+                     journal="2026-01-02T00:00:00.000Z"),
+        _orphan_task(T_REMOVED, PA["id"], "удалена", removed=True),
+        _orphan_task(T_OFFPRJ, PA["id"], "на колонке чужого проекта"),
+        _orphan_task(T_TODAY, PA["id"], "на «Сегодня»"),
+        _orphan_task(T_BETA, PB["id"], "сирота beta"),
+        _orphan_task(T_DELTA, PD["id"], "сирота delta"),
+        _orphan_task(T_EPS, PE["id"], "сирота eps"),
+        _orphan_task(T_ARCH, PC["id"], "сирота архивного"),
+    ]
+
+    LINKS = [
+        {"id": "KTS-" + T_LINKED, "taskId": T_LINKED, "statusId": PA_TODO,
+         "removed": False},
+        # чужая колонка и системная «Сегодня» — живые связки, но не на свой
+        # проект: это offproject, а не «связана»
+        {"id": "KTS-" + T_OFFPRJ, "taskId": T_OFFPRJ,
+         "statusId": "KS-PB-TODO", "removed": False},
+        {"id": "KTS-" + T_TODAY, "taskId": T_TODAY,
+         "statusId": "KS-P-TODAY-0000", "removed": False},
+        # удалённая связка не спасает карту: T_BIND остаётся сиротой
+        {"id": "KTS-" + T_BIND, "taskId": T_BIND, "statusId": PA_TODO,
+         "removed": True},
+    ]
+
+    STATUSES = {
+        PA["id"]: [
+            {"id": PA_TODO, "name": "Новые", "removed": False},
+            {"id": PA_WIP, "name": "В работе", "removed": False},
+        ],
+        # две «Новые» — split
+        PB["id"]: [
+            {"id": "KS-PB-TODO", "name": "Новые", "removed": False},
+            {"id": "KS-PB-ALT", "name": "Новые", "removed": False},
+        ],
+        # «Новых» нет, системный TODO тоже отсутствует — missing
+        PD["id"]: [
+            {"id": "KS-PD-DONE", "name": "Готово", "removed": False},
+        ],
+        # «Новых» нет, но системный TODO жив — id-only
+        PE["id"]: [
+            {"id": "KS-PE-DONE", "name": "Готово", "removed": False},
+        ],
+        PC["id"]: [
+            {"id": "KS-PC-TODO", "name": "Новые", "removed": False},
+        ],
+    }
+
+    # Ключи — полные пути ручки GET /kanban-status/<id>, как их шлёт sing.py
+    SYS_TODO = {
+        f"/kanban-status/KS-{PD['id']}-TODO": None,
+        f"/kanban-status/KS-{PE['id']}-TODO":
+            {"id": f"KS-{PE['id']}-TODO", "name": "Новые", "removed": False},
+    }
+
+    TAGS = [
+        {"id": "TG-agent", "title": "agent:claude"},
+        {"id": "TG-work", "title": "work"},
+    ]
+
+    def _run(self, argv, tasks=None, links=None, statuses=None,
+             projects=None, tags=None, sys_todo=None, task_by_id=None,
+             race_links=None, posted_visible=True, underfilled=False):
+        """sing.main() с замещённой границей сети. Возвращает
+        (exit_code, stdout, stderr, state)."""
+        tasks = self.TASKS if tasks is None else tasks
+        links = self.LINKS if links is None else links
+        statuses = self.STATUSES if statuses is None else statuses
+        projects = self.PROJECTS if projects is None else projects
+        tags = self.TAGS if tags is None else tags
+        sys_todo = self.SYS_TODO if sys_todo is None else sys_todo
+        race = race_links or []
+        if task_by_id is None:
+            task_by_id = {t["id"]: t for t in tasks}
+        state = {"calls": [], "posted": [], "task_pids": []}
+
+        def fake_request(method, path, query=None, body=None, soft=False):
+            state["calls"].append((method, path))
+            if method == "POST" and path == "/kanban-task-status":
+                state["posted"].append(dict(body))
+                return {}
+            if method == "GET" and path.startswith("/task/"):
+                t = task_by_id.get(path.rsplit("/", 1)[1])
+                if t is None:
+                    return None if soft else {"id": path.rsplit("/", 1)[1]}
+                return dict(t)
+            if method == "GET" and path.startswith("/kanban-status/"):
+                return sys_todo.get(path)
+            return {}
+
+        def fake_paged(path, key, query=None, **kw):
+            q = query or {}
+            if path == "/project":
+                return [dict(p) for p in projects]
+            if path == "/task":
+                pid = q.get("projectId")
+                state["task_pids"].append(pid)
+                return [dict(t) for t in tasks
+                        if t.get("projectId") == pid]
+            if path == "/kanban-task-status":
+                tid = q.get("taskId")
+                if underfilled and tid is None:
+                    # недобор находят ВО ВРЕМЯ скана (перед ним снапшот длины)
+                    sing.UNDERFILLED.append(("/kanban-task-status", 5, 3))
+                out = [dict(l) for l in links
+                       if tid is None or l.get("taskId") == tid]
+                # связь, появившаяся МЕЖДУ сканом и пре-чеком (гонка)
+                out += [dict(l) for l in race
+                        if tid is not None and l.get("taskId") == tid]
+                if posted_visible:
+                    # живое API отдаёт по ?taskId= только связки ЭТОЙ карты
+                    out += [{"id": "KTS-" + b["taskId"], "taskId": b["taskId"],
+                             "statusId": b["statusId"], "removed": False}
+                            for b in state["posted"]
+                            if tid is None or b["taskId"] == tid]
+                return out
+            if path == "/tag":
+                return [dict(t) for t in tags]
+            if path == "/kanban-status":
+                return [dict(s) for s in statuses.get(q.get("projectId"), [])]
+            return []
+
+        out, err = io.StringIO(), io.StringIO()
+        code = None
+        with mock.patch.object(sing, "paged", side_effect=fake_paged), \
+                mock.patch.object(sing, "request", side_effect=fake_request), \
+                mock.patch.object(sing, "_PROJECTS_CACHE", []), \
+                mock.patch.object(sys, "argv", ["sing.py"] + list(argv)), \
+                mock.patch.object(sing, "warn_if_skill_drifted"), \
+                mock.patch("time.sleep"), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            try:
+                sing.main()
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue(), err.getvalue(), state
+
+    def test_scan_counts_and_categories(self):
+        code, out, _err, state = self._run(["orphan"])
+        self.assertIsNone(code)
+        self.assertIn("open=6 orphans=3  todo=ok", out)
+        self.assertIn("open=1 orphans=1  todo=split", out)
+        self.assertIn("open=1 orphans=1  todo=missing", out)
+        self.assertIn("open=1 orphans=1  todo=id-only", out)
+        self.assertIn("связок живых 3 из 4", out)
+        self.assertIn("открытых 9, сирот 6 (bind 4 · user-list 1 · agent 1)", out)
+        self.assertIn("вне своих колонок: 2", out)
+        self.assertIn("Архивных подпроектов пропущено: 1", out)
+        self.assertIn("кандидаты на привязку: 4", out)
+        self.assertIn("пользовательский список: 1", out)
+        self.assertIn("agent-тег: 1", out)
+        # сироты названы полным id с проектом; agent-тег — в скобках
+        self.assertIn(f"{self.T_BIND}  [alpha]", out)
+        self.assertIn(f"{self.T_USER}  [alpha]", out)
+        self.assertIn(f"{self.T_AGENT}  [alpha]  агентская карта  (agent:claude)",
+                      out)
+        # не-сироты в списке нет: выполненная, дневник, удалённая, архивный проект
+        for absent in (self.T_DONE, self.T_JOUR, self.T_REMOVED, self.T_ARCH):
+            self.assertNotIn(absent, out)
+        # скан не пишет: ни одного POST
+        self.assertNotIn("POST", [m for m, _ in state["calls"]])
+        # архивный проект даже не запрашивается
+        self.assertNotIn(self.PC["id"], state["task_pids"])
+
+    def test_scan_no_orphans_line(self):
+        links = self.LINKS + [
+            {"id": "KTS-" + t, "taskId": t, "statusId": self.PA_TODO,
+             "removed": False}
+            for t in (self.T_BIND, self.T_AGENT, self.T_USER)
+        ] + [
+            {"id": "KTS-" + self.T_BETA, "taskId": self.T_BETA,
+             "statusId": "KS-PB-TODO", "removed": False},
+            {"id": "KTS-" + self.T_DELTA, "taskId": self.T_DELTA,
+             "statusId": "KS-PD-DONE", "removed": False},
+            {"id": "KTS-" + self.T_EPS, "taskId": self.T_EPS,
+             "statusId": "KS-PE-DONE", "removed": False},
+        ]
+        code, out, _err, _state = self._run(["orphan"], links=links)
+        self.assertIsNone(code)
+        self.assertIn("сирот нет", out)
+        self.assertIn("сирот 0", out)
+        # offproject при этом остаётся: чужие колонки не делают карту своей
+        self.assertIn("вне своих колонок: 2", out)
+
+    def test_underfilled_refuses_scan_and_bind(self):
+        code, _out, err, state = self._run(["orphan", "--bind"],
+                                           underfilled=True)
+        self.assertEqual(code, 3)
+        self.assertIn("Неполная выборка", err)
+        self.assertIn("привязка не выполнена", err)
+        self.assertEqual(state["posted"], [])
+        self.assertNotIn("POST", [m for m, _ in state["calls"]])
+
+    def test_bind_confirms_by_reread_not_post_status(self):
+        code, out, _err, state = self._run(["orphan", "--bind"])
+        self.assertIsNone(code)
+        self.assertIn(f"{self.T_BIND}  bound  [alpha] (попытка 1)", out)
+        self.assertIn(f"{self.T_EPS}  bound  [eps] (попытка 1)", out)
+        self.assertIn("СВОДКА: привязано 2 / пропущено 2 / не удалось 0 из 4",
+                      out)
+        self.assertIn("пропуск: нет колонки «Новые» (split) — 1", out)
+        self.assertIn("пропуск: нет колонки «Новые» (missing) — 1", out)
+        # POST только у кандидатов: alpha — по единственной «Новые»,
+        # eps — по системному id, которого нет в списке колонок
+        self.assertEqual(state["posted"], [
+            {"taskId": self.T_BIND, "statusId": self.PA_TODO},
+            {"taskId": self.T_EPS,
+             "statusId": f"KS-{self.PE['id']}-TODO"},
+        ])
+
+    def test_bind_fails_when_reread_shows_nothing(self):
+        """API ответил 200, а связка не появилась: успех — только по
+        перечитыванию, 3 попытки, итог failed и код 1."""
+        code, out, _err, state = self._run(["orphan", "--bind"],
+                                           posted_visible=False)
+        self.assertEqual(code, 1)
+        bodies = [(b["taskId"], b["statusId"]) for b in state["posted"]]
+        self.assertEqual(len(bodies), 6)
+        self.assertEqual(bodies.count((self.T_BIND, self.PA_TODO)), 3)
+        self.assertEqual(
+            bodies.count((self.T_EPS, f"KS-{self.PE['id']}-TODO")), 3)
+        self.assertIn("не удалось 2 из 4", out)
+        self.assertIn("связка не появилась за 3 попытки", out)
+
+    def test_bind_prechecks_skip_without_blind_post(self):
+        """Между сканом и bind карта перестала быть сиротой — skip/failed
+        БЕЗ POST: живая связка, agent-тег, чужой проект, не читается."""
+        extra = [
+            _orphan_task(self.T_PRE_AGENT, self.PA["id"], "живой agent-тег"),
+            _orphan_task(self.T_PRE_PROJ, self.PA["id"], "сменила проект"),
+            _orphan_task(self.T_PRE_NOREAD, self.PA["id"], "не читается"),
+        ]
+        tasks = self.TASKS + extra
+        by_id = {t["id"]: t for t in tasks}
+        live_agent = dict(by_id[self.T_PRE_AGENT])
+        live_agent["tags"] = ["TG-agent"]
+        live_moved = dict(by_id[self.T_PRE_PROJ])
+        live_moved["projectId"] = "P-other000-0000-0000-0000-000000000001"
+        by_id[self.T_PRE_AGENT] = live_agent
+        by_id[self.T_PRE_PROJ] = live_moved
+        by_id[self.T_PRE_NOREAD] = None
+        race = [{"id": "KTS-" + self.T_BIND, "taskId": self.T_BIND,
+                 "statusId": self.PA_TODO, "removed": False}]
+        code, out, _err, state = self._run(
+            ["orphan", "--bind"], tasks=tasks, task_by_id=by_id,
+            race_links=race)
+        self.assertEqual(code, 1)   # T_PRE_NOREAD не привязалась
+        self.assertIn("живая связка уже есть", out)
+        self.assertIn("agent-тег: agent:claude", out)
+        self.assertIn("проект сменился", out)
+        self.assertIn("карта не читается", out)
+        # привязана только eps: гонка/тег/проект/нечитаемость — без POST
+        self.assertEqual(state["posted"],
+                         [{"taskId": self.T_EPS,
+                           "statusId": f"KS-{self.PE['id']}-TODO"}])
+        self.assertIn("не удалось 1 из 7", out)
