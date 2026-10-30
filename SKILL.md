@@ -570,8 +570,8 @@ sing.py board --json                       # доска целиком, с бл�
   в `stderr`; пустая очередь у `next --json` — это `null` в stdout и код возврата 2.
 
 `show`/`next` добавляют к объекту `note`, `files`, `checklist` и `appUrl`; `board` и `groups`
-отдают структуру (колонки, `looseTasks`, `deadColumnTasks`, `unboundRoles`,
-`unknownColumns`, секции), `list` и `projects` — массив. В `board` у колонки поле `count` — полный размер
+отдают структуру (колонки, `looseTasks`, `closedInQueue`, `deadColumnTasks`,
+`unboundRoles`, `unknownColumns`, секции), `list` и `projects` — массив. В `board` у колонки поле `count` — полный размер
 колонки, а массив `tasks` в колонке «Готово» урезан `--limit` (дефолт 10, свежие
 задачи): размер читать из `count`, не из `len(tasks)` — разбор по `len(tasks)`
 дал «Готово 10» при `count` 14 (поймано 10-04, ai_tools). В остальных колонках
