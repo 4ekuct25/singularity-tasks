@@ -185,6 +185,47 @@ class AddTest(LiveBase):
         p = self.cli("add", title, "--no-note", expect=1)
         self.assertIn("уже открыта", p.stderr)
 
+    def test_fuzzy_duplicate_warns_before_the_creation_line(self):
+        """Близкий дубль открытого заголовка (переформулировка) — не отказ, а
+        предупреждение с названием и полной ссылкой, напечатанное ДО строки
+        создания (T-09b1cad9). Формат вывода на моках покрывает
+        tests/test_pure.FuzzyAddDupTest; живьём — реальная доска: выборка
+        двойников настоящая, и B обязана создаться.
+
+        Пара — перестановка слов плюс замена одного слова; overlap 15/17
+        (≈ 0.882) выше всего окна, зажатого fast-тестами (0.79, 0.875], —
+        предупреждение сработает при любом пороге в нём.
+
+        Уборка в том же заходе: A и B удаляются и перечитываются.
+        """
+        title_a = ("zz: переписать строку заметки карточки живого трекера "
+                   "на тестовом прогоне, не потеряв форматирования, тегов "
+                   "и связки")
+        title_b = ("zz: строку заметки карточки живого трекера переписать "
+                   "на тестовом прогоне, не потеряв форматирования, тегов "
+                   "и метки")
+        self.assertFalse(self.sing.same_title(title_a, title_b),
+                         "пара обязана быть нечётким дублем, а не точным")
+        tid_a = self.make_task(title_a)
+        out = self.cli(
+            "add", title_b,
+            "--note", "критерий: предупреждение со ссылкой до создания").stdout
+        created = out.index("создана в колонке")
+        warn = out.index("похожая уже открыта")
+        self.assertLess(warn, created,
+                        "предупреждение после строки успеха читается как отказ")
+        self.assertIn(title_a, out[:created], "не названа существующая карточка")
+        self.assertIn(f"https://web.singularity-app.com/#/?&id={tid_a}",
+                      out[:created], "нет полной ссылки на существующую")
+        line = next(s for s in out.splitlines() if "создана в колонке" in s)
+        tid_b = line.split(":")[0].strip()
+        self.assertTrue(tid_b.startswith("T-"), out)
+        self.assertEqual(self.column_of(tid_b), "todo")
+        for tid in (tid_a, tid_b):
+            self.sing.request("DELETE", f"/task/{tid}")
+            self.assertIsNone(self.sing.request("GET", f"/task/{tid}", soft=True),
+                               "тестовые данные не убраны")
+
     def test_add_demands_a_description(self):
         p = self.cli("add", "zz: без описания", expect=1)
         self.assertIn("нужно описание", p.stderr)
