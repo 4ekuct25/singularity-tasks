@@ -2058,6 +2058,19 @@ def task_link_app(task_id):
     return TASK_LINK_APP.format(task_id) if app_installed() else None
 
 
+# «Была ли показана строка карты в человекочитаемом выводе этой команды» — main()
+# по флагу допечатывает на stderr напоминание про «название + ссылка» (11-05: голые
+# T-id из памяти уходили в чат, хотя каждая строка вывода несла название и ссылку).
+# Ставят флаг brief() (строки board/ready/list/next/show), task_head() (отпечат
+# команд-изменений) и отпечат `add` — ровно команды, чей вывод агент пересказывает.
+_CARD_SHOWN = False
+
+
+def mark_card_shown():
+    global _CARD_SHOWN
+    _CARD_SHOWN = True
+
+
 def task_head(task_id, task):
     """Первая строка отчёта команды — название карточки, а не её id.
 
@@ -2065,6 +2078,7 @@ def task_head(task_id, task):
     ему ничего не говорит: открыть карточку по id нечем. Поэтому строка
     начинается с названия, а ссылка (id в ней есть) — следом.
     """
+    mark_card_shown()
     return f"«{task.get('title') or task_id}»"
 
 
@@ -2378,6 +2392,7 @@ def prio_label(p):
 
 
 def brief(t, extra=""):
+    mark_card_shown()
     # Дедлайн — тот же класс, что и `start`: приложение пишет его локальной
     # полночью (замер: `21:00:00Z` и `20:59:59Z` в живой базе), и UTC-срез
     # показывал бы предыдущий день. Дата берётся локальная — см. `local_date`.
@@ -4973,6 +4988,7 @@ def cmd_add(args):
     # и первое «⚠» (поле не взято, стена в заметке) читается как ОТКАЗ — 27.10
     # подсказка о формате заметки заставила агента повторить add, почти заведя
     # дубль (T-12a7842d). Все предупреждения — после строки «создана».
+    mark_card_shown()
     print(f"{tid}: создана в колонке '{args.column}' — {args.title}")
     if not cfg.get("adhoc"):
         print(f"  {task_link(tid)}")
@@ -5802,6 +5818,11 @@ def main():
         if getattr(args, attr, None):
             setattr(args, attr, resolve_task_id(getattr(args, attr)))
     args.fn(args)
+    if _CARD_SHOWN:
+        # Напоминание догоняет вывод, строки которого несут название и ссылку:
+        # пересказывай строку в чат, а не id из памяти (11-05, T-93f70b25).
+        print("⚠ В текст для человека карта — «название + ссылка» из вывода выше; "
+              "голый T-... id — только в командах и --json.", file=sys.stderr)
     warn_if_skill_drifted(args.cmd)
 
 
