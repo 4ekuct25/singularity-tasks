@@ -961,6 +961,73 @@ class DeadBoardLinksTest(unittest.TestCase):
         self.assertEqual([t["id"] for t in pool], ["T-live", "T-app"])
 
 
+class DoctorDeadLinksTest(unittest.TestCase):
+    """T-7232ff76: doctor печатал «мёртвых связок» по таблице связок ВСЕГО
+    АККАУНТА: dead_board_links отбирает только по колонкам, а живые связки
+    всех остальных проектов для колонок привязанного проекта выглядят
+    «мёртвыми» (wt_manager: 1392 вместо 0). Счёт — только по задачам
+    привязанного проекта: своя связка на исчезнувшую колонку видна, чужой
+    проект число не завышает."""
+
+    PID = "P-11111111-0000-0000-0000-000000000001"
+    T_DEAD = "T-dead1111-0000-0000-0000-000000000001"
+    T_LIVE = "T-live1111-0000-0000-0000-000000000001"
+    T_OTHER = "T-other111-0000-0000-0000-000000000001"
+    LINKS = [
+        {"id": f"KTS-{T_DEAD}", "taskId": T_DEAD, "statusId": "KS-1-GONE"},
+        {"id": f"KTS-{T_LIVE}", "taskId": T_LIVE, "statusId": "KS-1-TODO"},
+        # чужой проект: для колонок привязанного проекта эта связка тоже
+        # «на исчезнувшую колонку», а для своего проекта — живая
+        {"id": f"KTS-{T_OTHER}", "taskId": T_OTHER, "statusId": "KS-2-GONE"},
+    ]
+    TASKS = [{"id": T_DEAD, "title": "на исчезнувшей колонке"},
+             {"id": T_LIVE, "title": "в живой колонке"}]
+    STATUSES = [{"id": "KS-1-TODO", "name": "Новые", "removed": False,
+                 "kanbanOrder": 1},
+                {"id": "KS-1-WIP", "name": "В работе", "removed": False,
+                 "kanbanOrder": 2},
+                {"id": "KS-1-DONE", "name": "Готово", "removed": False,
+                 "kanbanOrder": 3}]
+
+    def _run_doctor(self):
+        cfg = {"projectId": self.PID, "projectTitle": "тест",
+               "columns": {"todo": "KS-1-TODO", "wip": "KS-1-WIP",
+                           "done": "KS-1-DONE"}}
+
+        def fake_paged(path, key, query=None, **kw):
+            if path == "/project":
+                return [{"id": self.PID, "title": "тест"}]
+            if path == "/kanban-status":
+                return [dict(s) for s in self.STATUSES]
+            if path == "/kanban-task-status":
+                return [dict(l) for l in self.LINKS]
+            if path == "/task":
+                return [dict(t) for t in self.TASKS]
+            return []
+
+        with mock.patch.object(sing, "token_source",
+                               return_value=("Keychain (fake)", sing.KC_OK)), \
+                mock.patch.object(sing, "load_config",
+                                  return_value=(cfg, None)), \
+                mock.patch.object(sing, "paged", side_effect=fake_paged), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            sing.cmd_doctor(_Args())
+        return out.getvalue()
+
+    def test_counts_only_own_project_tasks(self):
+        text = self._run_doctor()
+        self.assertIn("мёртвых связок: 1", text)
+        self.assertNotIn("мёртвых связок: 2", text)
+
+    def test_other_projects_do_not_warn(self):
+        """Только чужая «мёртвая на чужом проекте» связка — предупреждения
+        по привязанному проекту быть не должно вовсе."""
+        self.LINKS = [l for l in self.LINKS
+                      if l["taskId"] not in (self.T_DEAD, self.T_LIVE)]
+        text = self._run_doctor()
+        self.assertNotIn("мёртвых связок", text)
+
+
 # --------------------------------------------------------------------- приоритет
 
 

@@ -2658,8 +2658,13 @@ def cmd_doctor(args):
         print(f"  {mark} {role:8} -> {live.get(cid, 'КОЛОНКА ПРОПАЛА В ТРЕКЕРЕ')}")
     # Связки на колонку, исчезнувшую из трекера: такие задачи не в «Новые» и
     # next их не выдаёт — доска показывает их отдельно (T-ec4c39e1).
+    # Таблица связок общая на аккаунт, а dead_board_links отбирает только по
+    # колонкам: без пересечения с задачами проекта в счёт попали бы живые
+    # связки ВСЕХ остальных проектов (T-7232ff76: 1392 вместо 0 в wt_manager).
     links = paged("/kanban-task-status", "kanbanTaskStatuses", {})
-    dead = dead_board_links(links, {s["id"] for s in statuses})
+    own_tasks = {t["id"] for t in board_tasks(cfg["projectId"])}
+    dead = {tid: cid for tid, cid in dead_board_links(
+        links, {s["id"] for s in statuses}).items() if tid in own_tasks}
     if dead:
         print(f"  ⚠ мёртвых связок: {len(dead)} — канбан-связка смотрит на колонку, "
               "которой больше нет в трекере."
