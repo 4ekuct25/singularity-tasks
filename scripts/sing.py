@@ -5155,7 +5155,12 @@ def set_task_fields(task_id, fields, task=None, watched=SET_WATCHED):
             "  Различает повтор: та же команда прошла — была очередь; упала "
             "снова — смотри задачу в трекере.")
 
-    touched = [k for k, v in snapshot(fresh).items() if before_guard[k] != v]
+    # Поля тела — намеренная правка: их применимость подтверждена циклом
+    # field_applied выше, в guard они не входят (иначе восстановление watched-
+    # поля ложно падало: «стало» == то, что просили; инцидент 2026-11-15,
+    # восстановление parent после mass-regroup).
+    touched = [k for k, v in snapshot(fresh).items()
+               if k not in fields and before_guard[k] != v]
     if touched:
         die(f"{task_id}: правка задела лишнее — {', '.join(touched)}.\n"
             f"  было { {k: before_guard[k] for k in touched} }, "
