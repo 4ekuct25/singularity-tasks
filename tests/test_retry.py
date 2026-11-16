@@ -15,6 +15,7 @@
 """
 
 import contextlib
+import gc
 import io
 import os
 import socket
@@ -22,6 +23,7 @@ import sys
 import threading
 import time
 import unittest
+import warnings
 from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -217,6 +219,29 @@ class RetryPolicyTest(unittest.TestCase):
         r = self.call([ra(0.05), ra(0.05)], soft=True)
         self.assertEqual(r["attempts"], 3)
         self.assertEqual(r["outcome"], "ok")
+
+    def test_soft_404_closes_the_error_response(self):
+        """Soft-404 возвращал ОТКРЫТЫЙ HTTPError (file-like): GC печатал
+        ResourceWarning на каждый soft-404 — шум в выводе live-прогонов,
+        30.10, четыре live-прогона подряд. e.close() до return (T-d0fec8c8).
+
+        GC-шаг явный (gc.collect) — без него предупреждение могло не
+        наступить и тест зелёный бы ничего не утверждал. Считаются только
+        предупреждения про HTTPError: чужие ресурсы процесса не наша история.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            r = self.call([(404, {}, {"error": "no such task"})], soft=True)
+            gc.collect()
+        self.assertEqual(r["outcome"], "none")
+        # ResourceWarning — встроенный класс (builtins), модуль warnings его
+        # не реэкспортирует.
+        leaked = [w for w in caught
+                  if issubclass(w.category, ResourceWarning)
+                  and "HTTPError" in str(w.message)]
+        self.assertEqual(leaked, [],
+                         "soft-404 оставил незакрытый HTTPError — GC напечатает "
+                         "ResourceWarning")
 
     def test_success_costs_exactly_one_request_and_no_pause(self):
         r = self.call([])

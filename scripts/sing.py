@@ -937,6 +937,9 @@ def request(method, path, query=None, body=None, soft=False):
                 waited += pause
                 continue
             if soft:
+                # Открытый HTTPError (file-like) без close даёт GC
+                # ResourceWarning на каждый soft-404 — шум в выводе live-прогонов.
+                e.close()
                 return None
             if e.code == 401:
                 die("401 Unauthorized: токен недействителен или ему не хватает прав.")
