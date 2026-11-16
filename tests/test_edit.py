@@ -1302,3 +1302,105 @@ class NoteConcurrencyTest(EditBase):
         self.cli("report", "T-loose", "ещё строка")
         self.assertEqual(len(STATE["patches"]), 1)
         self.assertIn("ещё строка", STATE["tasks"]["T-loose"]["note"])
+
+
+class NoteUnloadTest(EditBase):
+    """`note-unload` — разгрузка большой заметки карты (рецепт 11-15,
+    T-7b916cce, как команда — T-e3529fb6): часть строго ДО якоря,
+    встречающегося ровно один раз, уходит в заметку проекта (архив),
+    на карте остаётся хвост с якоря + маркер и ссылка на архив.
+
+    Срез — по сырым Quill-delta ops, а не по пересобранному тексту:
+    форматирование переживает разгрузку (тест 1 — bold-оп в архиве).
+    До любой записи — бэкап сырой заметки в SINGULARITY_NOTE_BACKUP_DIR;
+    колонка, теги и канбан-связка — watched-guard (снимок колонки
+    держит сама команда).
+
+    Контрольный красный (обязателен — проверка, которая не краснеет,
+    не проверка):
+
+        git show 0a94c84:scripts/sing.py > /tmp/sing-old.py
+        SING_UNDER_TEST=/tmp/sing-old.py python3 -m unittest \
+            tests.test_edit.NoteUnloadTest
+
+    Старый код не знает подкоманды: argparse выходит кодом 2, и каждый
+    тест краснеет.
+
+    Запуск: tests/run.py fast
+    """
+
+    def test_unload_moves_the_head_to_the_project_note(self):
+        tmp = tempfile.mkdtemp(prefix="zz-note-backup-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ops = [{"insert": "старая часть\n"},
+               {"insert": "жирный архив", "attributes": {"bold": True}},
+               {"insert": "\n"},
+               {"insert": "Анкер: новый раздел\n"},
+               {"insert": "хвост карточки\n"}]
+        raw = json.dumps(ops, ensure_ascii=False)
+        STATE["tasks"]["T-in-a"]["note"] = raw
+
+        r = self.cli("note-unload", "T-in-a", "--anchor", "Анкер: новый раздел",
+                     extra_env={"SINGULARITY_NOTE_BACKUP_DIR": tmp})
+        card_raw = json.loads(STATE["tasks"]["T-in-a"]["note"])
+        card_text = "".join(o["insert"] for o in card_raw
+                            if isinstance(o.get("insert"), str))
+        self.assertTrue(card_text.startswith("Анкер: новый раздел"),
+                        "на карте должен остаться хвост с якоря")
+        self.assertNotIn("старая часть", card_text,
+                         "архивная часть не должна остаться на карте")
+        self.assertIn("разгружена", card_text, "маркер о разгрузке не записан")
+        self.assertIn("T-note", card_text, "ссылки на архив в маркере нет")
+
+        arch_raw = json.loads(STATE["tasks"]["T-note"]["note"])
+        arch_text = "".join(o["insert"] for o in arch_raw
+                            if isinstance(o.get("insert"), str))
+        self.assertIn("Архив заметки T-in-a", arch_text)
+        self.assertIn("старая часть\nжирный архив\n", arch_text,
+                      "срез до якоря должен уйти в архив целиком, подряд")
+        self.assertIn({"insert": "жирный архив", "attributes": {"bold": True}},
+                      arch_raw, "форматирование должно пережить разгрузку")
+
+        self.assertEqual(len(STATE["patches"]), 2,
+                         "записей ровно две: сначала архив, потом карта")
+        self.assertEqual(STATE["links"]["T-in-a"], COLS["wip"],
+                         "разгрузка заметки сдвинула карточку по доске")
+        self.assertEqual(STATE["tasks"]["T-in-a"]["tags"], [])
+
+        backups = os.listdir(tmp)
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(backups[0].startswith("T-in-a-"))
+        with open(os.path.join(tmp, backups[0]), encoding="utf-8") as f:
+            self.assertEqual(f.read(), raw,
+                             "бэкап — ровно сырая заметка до PATCH")
+        self.assertIn("разгружена", r.stdout)
+
+    def test_missing_anchor_is_refused_before_any_write(self):
+        tmp = tempfile.mkdtemp(prefix="zz-note-backup-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        before_note = STATE["tasks"]["T-note"]["note"]
+        r = self.cli("note-unload", "T-in-a", "--anchor", "якоря тут нет",
+                     code=1, extra_env={"SINGULARITY_NOTE_BACKUP_DIR": tmp})
+        self.assertIn("не найден", r.stderr)
+        self.assertEqual(STATE["patches"], [],
+                         "отказ обязан быть ДО PATCH")
+        self.assertEqual(STATE["tasks"]["T-note"]["note"], before_note)
+        self.assertEqual(os.listdir(tmp), [],
+                         "отказ не должен оставлять бэкап")
+
+    def test_non_unique_anchor_is_refused(self):
+        STATE["tasks"]["T-in-a"]["note"] = json.dumps(
+            [{"insert": "дубль\n"}, {"insert": "дубль\n"}], ensure_ascii=False)
+        r = self.cli("note-unload", "T-in-a", "--anchor", "дубль", code=1)
+        self.assertIn("местах", r.stderr)
+        self.assertEqual(STATE["patches"], [])
+
+    def test_no_project_note_is_refused(self):
+        STATE["tasks"]["T-in-a"]["note"] = json.dumps(
+            [{"insert": "старое\n"}, {"insert": "Анкер\nхвост\n"}],
+            ensure_ascii=False)
+        del STATE["tasks"]["T-note"]
+        r = self.cli("note-unload", "T-in-a", "--anchor", "Анкер", code=1)
+        self.assertIn("нет заметки", r.stderr)
+        self.assertIn("notes --add", r.stderr)
+        self.assertEqual(STATE["patches"], [])

@@ -1629,6 +1629,38 @@ def _note_op(insert, attrs):
     return op
 
 
+def note_slice(ops, offset):
+    """Разрезать ops на (до offset, с offset) по СКЛЕЁННОМУ тексту заметки.
+
+    Тот же принцип, что у note_replace: позиция считается по склейке строковых
+    insert, а встройка/файл текстовой ширины не имеет и лежит в потоке на одной
+    позиции — offset в неё «попасть» не может. Встройка уходит влево, только
+    если точка разреза после её позиции, иначе — вправо. Возвращает два списка
+    ops; что склейка их текстов равна исходной, проверяет вызывающий.
+    """
+    left, right = [], []
+    pos = 0
+    for op in ops:
+        ins = op.get("insert") if isinstance(op, dict) else None
+        if not isinstance(ins, str):
+            (left if pos < offset else right).append(op)
+            continue
+        seg_start, seg_end = pos, pos + len(ins)
+        pos = seg_end
+        if seg_end <= offset:
+            left.append(op)
+        elif seg_start >= offset:
+            right.append(op)
+        else:
+            cut = offset - seg_start
+            attrs = {k: v for k, v in op.items() if k != "insert"}
+            if ins[:cut]:
+                left.append(_note_op(ins[:cut], attrs))
+            if ins[cut:]:
+                right.append(_note_op(ins[cut:], attrs))
+    return left, right
+
+
 def write_note_backup(task_id, note):
     """Сырая заметка до переписи — в файл, путь которого печатает команда.
 
@@ -4778,6 +4810,114 @@ def cmd_note_edit(args):
     print(f"  {task_link(args.id)}")
 
 
+def cmd_note_unload(args):
+    """Разгрузить большую заметку карты (рецепт 11-15, T-7b916cce — как команда).
+
+    report перестаёт писаться, когда сырая Quill-delta заметки упирается в
+    предел записи (~40 КБ, замер в references/api.md). Вместо «пересобрать из
+    текста» (теряет форматирование) — slice сырых ops по текстовому offset:
+    всё ДО якоря (строго одного вхождения) уходит в заметку проекта (архив),
+    на карте остаётся хвост с якоря + маркер и ссылка на архив.
+
+    Данные не теряются: срезы — сырые ops (жирное/ссылки/встройки сохраняются),
+    до любой записи — побайто-сверка «архив+хвост == исходная», бэкап сырой
+    заметки в файл. Колонка, теги и канбан-связка не трогаются: `set_task_fields`
+    с watched-guard плюс снимок колонки до/после (колонка — отдельная связка,
+    полем PATCH она не является).
+    """
+    cfg, _ = load_config()
+    pid = cfg["projectId"]
+    task = assert_task_allowed(args.id, cfg)
+    note = task.get("note")
+    if not note:
+        die(f"{args.id}: заметка пуста — разгружать нечего.")
+    text = note_to_text(note)
+    count = text.count(args.anchor)
+    if count == 0:
+        die(f"{args.id}: якорь «{args.anchor}» не найден в заметке — "
+            "запись не отправлялась.\n"
+            f"  что сейчас в заметке: sing.py show {args.id}")
+    if count > 1:
+        die(f"{args.id}: якорь встречается в {count} местах — непонятно, где "
+            "разрезать. Сделай якорь длиннее, чтобы встречался ровно один раз.")
+    offset = text.index(args.anchor)
+    if offset == 0:
+        die(f"{args.id}: якорь в самом начале заметки — архив будет пустым, "
+            "разгрузка ничего не изменит.")
+    archive_ops, tail_ops = note_slice(note_ops(note), offset)
+    # Побайто, ДО любой записи: склейка архива и хвоста == исходный текст.
+    if note_to_text(archive_ops) + note_to_text(tail_ops) != text:
+        die(f"{args.id}: срез заметки не сходится с исходным текстом — "
+            "внутренний сбой note_slice, запись не отправлялась.")
+
+    if args.note_id:
+        archive_note = note_task(args.note_id, cfg)
+        if archive_note.get("projectId") != pid:
+            die(f"{args.note_id}: это заметка другого проекта — архив туда не "
+                "попадёт в представление привязанного.")
+    else:
+        notes = sorted(project_notes(pid), key=lambda t: t["id"])
+        if not notes:
+            die(f"{args.id}: у проекта нет заметки, куда положить архив.\n"
+                "  создай: sing.py notes --add \"Архив заметок\"")
+        if len(notes) > 1:
+            known = "\n  ".join(f"{n['id']}  {n.get('title', '')}" for n in notes)
+            die(f"{args.id}: у проекта {len(notes)} заметки — не знаю, куда "
+                f"архивировать.\n  {known}\n"
+                "  выбери явно: sing.py note-unload "
+                f"{args.id} --anchor \"...\" --note-id <T-…>")
+        archive_note = notes[0]
+
+    date = time.strftime("%Y-%m-%d", time.gmtime())
+    a_ops = note_ops(archive_note.get("note"))
+    if a_ops:
+        tail = a_ops[-1].get("insert") if isinstance(a_ops[-1], dict) else None
+        sep = "\n" if isinstance(tail, str) and tail.endswith("\n") else "\n\n"
+        a_ops.append({"insert": sep})
+    a_ops.append({"insert": f"Архив заметки {args.id} — {date}",
+                  "attributes": {"bold": True}})
+    a_ops.append({"insert": ": заметка разгружена, на карте остался хвост. "
+                             f"Карточка: {task_link(args.id)}\n"})
+    a_ops.extend(archive_ops)
+    new_archive = note_dump(a_ops)
+
+    c_ops = list(tail_ops)
+    if c_ops:
+        tail = c_ops[-1].get("insert") if isinstance(c_ops[-1], dict) else None
+        sep = "\n" if isinstance(tail, str) and tail.endswith("\n") else "\n\n"
+        c_ops.append({"insert": sep})
+    c_ops.append({"insert": f"⚠ Заметка разгружена {date}: часть до якоря → "
+                  f"архив в заметке проекта ({task_link(archive_note['id'])})."})
+    new_card = note_dump(c_ops)
+
+    for what, dumped in (("архив", new_archive), ("карта", new_card)):
+        if len(dumped.encode()) > NOTE_SIZE_LIMIT:
+            die(f"{args.id}: итоговая заметка ({what}) — {len(dumped.encode())} "
+                f"байт, больше предела записи ~40 КБ — разгрузка остановлена "
+                "до записи.")
+
+    backup_path = write_note_backup(args.id, note)
+    # Сначала архив, потом карта: если вторая запись не дойдёт, данные уже в
+    # архиве, а карта ещё несёт всю заметку — потери нет ни в каком исходе.
+    set_task_fields(archive_note["id"], {"note": new_archive},
+                    archive_note, watched=NOTE_WATCHED)
+    col_before = task_column(args.id, pid)
+    _, fresh_card = set_task_fields(args.id, {"note": new_card}, task,
+                                    watched=SET_WATCHED)
+    col_after = task_column(args.id, pid)
+    if col_before != col_after:
+        die(f"{args.id}: разгрузка заметки задел(а) доску — колонка была "
+            f"{col_before}, стала {col_after}.\n"
+            "  Меняться должна только заметка: проверь задачу в трекере.")
+
+    print(f"{args.id}: заметка разгружена — было {len(text)} символов, на карте "
+          f"осталось {len(note_to_text(fresh_card.get('note')))} (хвост + маркер)")
+    print(f"  архив: {len(note_to_text(archive_ops))} символов → заметка проекта "
+          f"{archive_note['id']} ({task_link(archive_note['id'])})")
+    print(f"  бэкап: {backup_path}")
+    print(f"  {task_link(args.id)}")
+
+
 def cmd_unarchive(args):
     """Восстановить карту из дневника: journalDate=null, checked=0.
 
@@ -5785,6 +5925,18 @@ def build_parser():
                     help="пары OLD NEW: заменить одно вхождение OLD на NEW; "
                          "пары применяются последовательно")
     sp.set_defaults(fn=cmd_note_edit)
+
+    sp = sub.add_parser("note-unload",
+                        help="разгрузить большую заметку карты: архив части до "
+                             "якоря — в заметку проекта, на карте — хвост + маркер")
+    sp.add_argument("id")
+    sp.add_argument("--anchor", required=True, metavar="ТЕКСТ",
+                    help="текст, встречающийся в заметке ровно ОДИН раз: всё до "
+                         "него — в архив, с него — остаётся на карте")
+    sp.add_argument("--note-id", metavar="T-ID",
+                    help="заметка проекта для архива (по умолчанию — "
+                         "единственная заметка проекта)")
+    sp.set_defaults(fn=cmd_note_unload)
 
     sp = sub.add_parser("unarchive",
                         help="восстановить карту из дневника: снять journalDate "
