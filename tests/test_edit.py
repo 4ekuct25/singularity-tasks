@@ -113,6 +113,10 @@ def reset_state():
         "drop_isnote": False,   # сервер теряет признак заметки
         "ignore_unarchive": False,  # сервер отвечает 201, не сняв journalDate
         "next_id": 1,
+        # Параллельный писатель: после каждого PATCH заметки чужая полная запись
+        # затирает её (last write wins, инцидент 11-11) — проверка, что дописи
+        # ловят это по отсутствию собственного маркера (T-1bf1e807).
+        "clobber_after_patch": False,
     })
 
 
@@ -211,6 +215,10 @@ class TrackerStub(BaseHTTPRequestHandler):
             STATE["links"][tid] = "KS-done"
         if STATE["drop_isnote"]:
             task["isNote"] = False
+        if STATE["clobber_after_patch"] and "note" in body:
+            task["note"] = json.dumps(
+                [{"insert": "чужая полная запись заметки (параллельный писатель)\n"}],
+                ensure_ascii=False)
         self._send(task)
 
     def do_POST(self):
@@ -1219,3 +1227,60 @@ class BareIdLinkTest(EditBase):
         note = STATE["tasks"]["T-in-a"]["note"]
         self.assertEqual(note.count(self.LINK), 1,
                          "механизм дописал ссылку второй раз")
+
+
+class NoteConcurrencyTest(EditBase):
+    """Дописи в заметку — read-modify-write, и чужая полная запись заметки
+    перебивает их (last write wins): инцидент 11-11, два `report` с RC=0
+    пропали через минуты (T-1bf1e807). Команды `report`/`done`/`start`
+    перечитывают заметку перед PATCH и после записи сверяют СВОЙ маркер:
+    маркера нет — явный ⚠ в stderr, но команда успешна (повторять и
+    «чинить» работу нечего — надо перепроверить перед закрытием сессии).
+    Заметка, упирающаяся в предел записи (~40 КБ, замер 11-15), отклоняется
+    локально ДО сетевого вызова (T-5e1f3b63).
+
+    Режим `clobber_after_patch` заглушки моделирует параллельного писателя:
+    после каждого PATCH заметки она затирается чужой полной записью.
+
+    Контрольный красный (обязателен — проверка, которая не краснеет,
+    не проверка):
+
+        git show 0a94c84:scripts/sing.py > /tmp/sing-old.py
+        SING_UNDER_TEST=/tmp/sing-old.py python3 -m unittest \
+            tests.test_edit.NoteConcurrencyTest
+
+    Краснеют ⚠-тесты (старый код не верифицирует маркер) и оба теста
+    предела (старый код уводит большой PATCH в сеть); «обычная допись
+    молчит» зелёный и на старом коде — стережёт от ложных тревог.
+
+    Запуск: tests/run.py fast
+    """
+
+    def test_plain_append_is_silent_and_lands(self):
+        # «⚠» в stderr бывает и штатно (футер про формат карты) — стережём
+        # именно маркерное предупреждение.
+        r = self.cli("report", "T-in-a", "промежуточный итог")
+        self.assertNotIn("не подтвердился", r.stderr,
+                         "ложная тревога на штатной дописи")
+        note = STATE["tasks"]["T-in-a"]["note"]
+        self.assertIn("промежуточный итог", note)
+
+    def test_clobbered_report_warns_but_still_succeeds(self):
+        """Два параллельных append: маркер второго не живёт — команда
+        обязана сказать об этом явно, а не рапортовать тихим успехом."""
+        STATE["clobber_after_patch"] = True
+        r = self.cli("report", "T-in-a", "второй append — его перебили")
+        self.assertIn("не подтвердился", r.stderr)
+        self.assertIn("last write wins", r.stderr)
+        self.assertIn("отчёт дописан", r.stdout,
+                      "⚠ не отменяет команду: работа сделана, маркер — нет")
+
+    def test_clobbered_done_warns_but_closes_the_card(self):
+        """done — та же гонка, и та же развилка: карта закрывается, а
+        про возможную потерю РЕЗУЛЬТАТА — явный ⚠."""
+        STATE["clobber_after_patch"] = True
+        r = self.cli("done", "T-in-a", "--report", "готово, проверено")
+        self.assertEqual(STATE["links"]["T-in-a"], COLS["done"],
+                         "⚠ не должен ронять закрытие карты")
+        self.assertEqual(STATE["tasks"]["T-in-a"]["checked"], 1)
+        self.assertIn("не подтвердился", r.stderr)

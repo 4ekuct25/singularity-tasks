@@ -1525,6 +1525,45 @@ def note_append(note, text, label=None):
     return note_dump(ops)
 
 
+# Перечитывания пост-верификации маркера: очередь синхронизации живого трекера
+# догоняет запись за секунды (те же порядки, что у циклов подтверждения полей).
+NOTE_VERIFY_TRIES = 3
+NOTE_VERIFY_PAUSE = 1.0
+
+
+def note_append_fresh(task_id, text, label=None, what="запись"):
+    """Дописать в заметку карты, защищаясь от параллельной записи (T-1bf1e807).
+
+    Инцидент 11-11: два `report` вернули RC=0 и пропали — чужая полная запись
+    заметки (другая сессия или web-UI) перебила read-modify-write, последний
+    писатель победил. Две защиты:
+
+    1. Заметка перечитывается непосредственно ПЕРЕД PATCH, а не на старте
+       команды: между стартом и записью в заметку могли дописать другие.
+    2. После PATCH сверяется СОБСТВЕННЫЙ маркер — первая непустая строка
+       дописанного текста: его нет в перечитанной заметке после
+       NOTE_VERIFY_TRIES перечитываний — явный ⚠ в stderr, но команда
+       успешна (RC=0): перебить дописанное могла параллельная полная запись,
+       и верное действие — перепроверить через `show` перед закрытием сессии,
+       а не молчать об этом.
+    """
+    fresh = request("GET", f"/task/{task_id}")
+    new_note = note_append(fresh.get("note"), text, label=label)
+    request("PATCH", f"/task/{task_id}", body={"note": new_note})
+    marker = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    if not marker:
+        return
+    for _ in range(NOTE_VERIFY_TRIES):
+        fresh = request("GET", f"/task/{task_id}")
+        if marker in note_to_text(fresh.get("note") or ""):
+            return
+        time.sleep(NOTE_VERIFY_PAUSE)
+    print(f"⚠ {task_id}: {what} не подтвердился в заметке после записи — "
+          f"параллельная полная запись заметки могла перебить дописанное "
+          "(last write wins, инцидент 11-11). Перед закрытием сессии "
+          "перепроверь запись через `show`.", file=sys.stderr)
+
+
 def note_replace(ops, old, new):
     """Новые ops, в которых ОДНО вхождение old заменено на new. Иначе None.
 
@@ -4555,10 +4594,8 @@ def cmd_start(args):
     res = move_to_column(args.id, col_id(cfg, "wip"), project_id=cfg["projectId"])
     if args.plan:
         # план пишем после захвата: если задачу перехватили, план не мусорит в чужой карточке
-        fresh = request("GET", f"/task/{args.id}")
-        request("PATCH", f"/task/{args.id}",
-                body={"note": note_append(fresh.get("note"), args.plan,
-                                          label=f"ПЛАН ({AGENT_TAG_PREFIX}{who})")})
+        note_append_fresh(args.id, args.plan,
+                          label=f"ПЛАН ({AGENT_TAG_PREFIX}{who})", what="план")
     print(f"{task_head(args.id, task)} — {res} (в работе), тег {AGENT_TAG_PREFIX}{who}"
           + (", план записан" if args.plan else ", без плана")
           + f"\n  {task_link(args.id)}")
@@ -4595,8 +4632,7 @@ def cmd_release(args):
 def cmd_report(args):
     cfg, _ = load_config(required=False)
     t = assert_task_allowed(args.id, cfg)
-    request("PATCH", f"/task/{args.id}",
-            body={"note": note_append(t.get("note"), args.text)})
+    note_append_fresh(args.id, args.text, what="отчёт")
     mark_agent_off_queue(args.id, t, cfg, getattr(args, "agent", None))
     print(f"{task_head(args.id, t)} — отчёт дописан в заметку\n  {task_link(args.id)}")
     warn_wall(args.text, "запись")
@@ -4629,9 +4665,9 @@ def cmd_done(args):
     if args.report:
         label = "НА ПРОВЕРКУ" if args.review else "РЕЗУЛЬТАТ"
         who = agent_name(cfg, getattr(args, "agent", None))
-        request("PATCH", f"/task/{args.id}",
-                body={"note": note_append(task.get("note"), args.report,
-                                          label=f"{label} ({AGENT_TAG_PREFIX}{who})")})
+        note_append_fresh(args.id, args.report,
+                          label=f"{label} ({AGENT_TAG_PREFIX}{who})",
+                          what="результат")
     mark_agent(args.id, cfg, getattr(args, "agent", None))
     role = "review" if args.review else "done"
     move_to_column(args.id, col_id(cfg, role), project_id=cfg["projectId"])
