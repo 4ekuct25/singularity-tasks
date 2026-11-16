@@ -1284,3 +1284,21 @@ class NoteConcurrencyTest(EditBase):
                          "⚠ не должен ронять закрытие карты")
         self.assertEqual(STATE["tasks"]["T-in-a"]["checked"], 1)
         self.assertIn("не подтвердился", r.stderr)
+
+    def test_oversized_note_is_refused_before_any_network_write(self):
+        STATE["tasks"]["T-loose"]["note"] = json.dumps(
+            [{"insert": "x" * 41000}], ensure_ascii=False)
+        p = self.cli("report", "T-loose", "ещё строка", code=1)
+        self.assertIn("больше предела", p.stderr)
+        self.assertIn("40 КБ", p.stderr)
+        self.assertEqual(STATE["patches"], [],
+                         "отказ обязан быть ДО PATCH: большой запрос ушёл в сеть")
+        self.assertIn("x" * 100, STATE["tasks"]["T-loose"]["note"],
+                      "отказ не имеет права трогать заметку")
+
+    def test_note_under_the_limit_is_written(self):
+        STATE["tasks"]["T-loose"]["note"] = json.dumps(
+            [{"insert": "x" * 39000}], ensure_ascii=False)
+        self.cli("report", "T-loose", "ещё строка")
+        self.assertEqual(len(STATE["patches"]), 1)
+        self.assertIn("ещё строка", STATE["tasks"]["T-loose"]["note"])
