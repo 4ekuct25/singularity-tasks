@@ -2871,6 +2871,24 @@ class EnvRefusalTest(unittest.TestCase):
                 'POST /project -> HTTP 500: {"message":"Sync error: number in queue 7"}\n')
         self.assertEqual(sorted(n for _, n in self.runner.env_refusals(text)), [1, 1])
 
+    def test_network_timeout_is_named_with_a_fork_not_a_cause(self):
+        """Замер 30.10: live-прогон упал на таймауте, набор причину не назвал,
+        развилку разрешал только ручной повтор. Теперь сетевой отказ называется —
+        и как НЕ регрессия скилла, с той же развилкой, что и одиночный лаг."""
+        text = ("FAIL: test_full_cycle_start_report_done (test_live.CycleTest)\n"
+                "AssertionError: 1 != 0 : sing.py done T-7c1f0b2d-9a3e-4c51-8f27-"
+                "63d4a8b9e0c1 -> код 1\n"
+                "stderr: Сеть недоступна для POST /task/T-7c1f0b2d-9a3e-4c51-8f27-"
+                "63d4a8b9e0c1/complete: [Errno 60] Operation timed out\n")
+        found = self.runner.env_refusals(text)
+        self.assertEqual(len(found), 1)
+        why, n = found[0]
+        self.assertEqual(n, 1)
+        self.assertIn("не регрессия", why,
+                      "сетевой отказ назван как подозрение на скилл")
+        self.assertIn("в изоляции", why,
+                      "развилка не говорит, чем её разрешить")
+
     def test_plain_assertion_failure_is_not_blamed_on_the_tracker(self):
         """Контроль: без строк отказа вердикт пуст. Иначе ловушка прикрывала бы
         настоящую регрессию — ровно то, ради чего она и заводилась."""
@@ -2963,6 +2981,14 @@ class UnconfirmedWriteVerdictTest(unittest.TestCase):
             self.assertIn(mark, sources,
                           f"формулировки «{mark}» в коде больше нет — "
                           "классификатор ловит текст, которого никто не печатает")
+        # Сетевой маркер ENV_REFUSALS тоже литерал die() request() (f-строка
+        # собирается в рантайме, префикс «Сеть недоступна» — дословно). Остальные
+        # маркеры ENV_REFUSALS литералами в коде не являются: «HTTP 429»
+        # собирается из номера, «Sync error»/«Default task group not found» —
+        # это текст ОТВЕТА сервера, а не нашей печати.
+        self.assertIn("Сеть недоступна", sources,
+                      "маркера «Сеть недоступна» в коде больше нет — "
+                      "классификатор ловит текст, которого никто не печатает")
 # ------------------------------------------------------- токен: Keychain vs sandbox
 
 
