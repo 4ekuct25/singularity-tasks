@@ -15,11 +15,15 @@ import json
 import os
 import datetime
 import re
+import ssl
 import subprocess
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -3630,3 +3634,139 @@ class OrphanCommandTest(unittest.TestCase):
                          [{"taskId": self.T_EPS,
                            "statusId": f"KS-{self.PE['id']}-TODO"}])
         self.assertIn("не удалось 1 из 7", out)
+
+
+# ----------------------------------------------------------------------- TLS
+
+
+class SslContextTest(unittest.TestCase):
+    """TLS-верификация в sing.py: строгая проверка остаётся всегда, доп. CA-бандл
+    догружается на macOS только при отсутствии SSL_CERT_FILE / SSL_CERT_DIR."""
+
+    @staticmethod
+    def _make_ca_and_leaf(workdir, name):
+        """Создаёт пару (ca_cert, leaf_cert, leaf_key) для 127.0.0.1."""
+        ca_key = os.path.join(workdir, f"{name}_ca.key")
+        ca_crt = os.path.join(workdir, f"{name}_ca.crt")
+        leaf_key = os.path.join(workdir, f"{name}_leaf.key")
+        leaf_csr = os.path.join(workdir, f"{name}_leaf.csr")
+        leaf_crt = os.path.join(workdir, f"{name}_leaf.crt")
+        ext_cfg = os.path.join(workdir, f"{name}_ext.cnf")
+        with open(ext_cfg, "w", encoding="utf-8") as f:
+            f.write(
+                "basicConstraints=CA:FALSE\n"
+                "keyUsage=digitalSignature,keyEncipherment\n"
+                "extendedKeyUsage=serverAuth\n"
+                "subjectKeyIdentifier=hash\n"
+                "authorityKeyIdentifier=keyid,issuer\n"
+                "subjectAltName=IP:127.0.0.1\n"
+            )
+        ca_ext = os.path.join(workdir, f"{name}_ca_ext.cnf")
+        with open(ca_ext, "w", encoding="utf-8") as f:
+            f.write(
+                "[req]\n"
+                "distinguished_name=dn\n"
+                "x509_extensions=v3_ca\n"
+                "prompt=no\n"
+                "[dn]\n"
+                f"CN={name} Root CA\n"
+                "[v3_ca]\n"
+                "basicConstraints=critical,CA:TRUE\n"
+                "keyUsage=critical,keyCertSign,cRLSign\n"
+                "subjectKeyIdentifier=hash\n"
+                "authorityKeyIdentifier=keyid:always,issuer\n"
+            )
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", ca_key, "-out", ca_crt, "-days", "2",
+             "-config", ca_ext],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["openssl", "req", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", leaf_key, "-out", leaf_csr,
+             "-subj", "/CN=127.0.0.1"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["openssl", "x509", "-req", "-in", leaf_csr,
+             "-CA", ca_crt, "-CAkey", ca_key, "-CAcreateserial",
+             "-out", leaf_crt, "-days", "2", "-extfile", ext_cfg],
+            check=True, capture_output=True,
+        )
+        return ca_crt, leaf_crt, leaf_key
+
+    @staticmethod
+    def _start_tls_server(leaf_crt, leaf_key, counter):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                counter[0] += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"projects": []}')
+
+            def log_message(self, *_args):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        srv_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        srv_ctx.load_cert_chain(certfile=leaf_crt, keyfile=leaf_key)
+        srv.socket = srv_ctx.wrap_socket(srv.socket, server_side=True)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def test_defaults_keep_strict_verification(self):
+        sing._SSL_CTX_CACHE.clear()
+        ctx = sing.build_ssl_context(env={}, ca_bundles=())
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(ctx.check_hostname)
+
+    @unittest.skipUnless(shutil.which("openssl"), "нужен openssl для генерации тестовых TLS-сертификатов")
+    def test_extra_bundle_accepts_trusted_and_rejects_untrusted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ca_a, leaf_a, key_a = self._make_ca_and_leaf(tmp, "trusted")
+            ca_b, leaf_b, key_b = self._make_ca_and_leaf(tmp, "other")
+            hits_a = [0]
+            hits_b = [0]
+            srv_a = self._start_tls_server(leaf_a, key_a, hits_a)
+            srv_b = self._start_tls_server(leaf_b, key_b, hits_b)
+            self.addCleanup(lambda: (srv_a.shutdown(), srv_a.server_close()))
+            self.addCleanup(lambda: (srv_b.shutdown(), srv_b.server_close()))
+            url_a = f"https://127.0.0.1:{srv_a.server_address[1]}/project"
+            url_b = f"https://127.0.0.1:{srv_b.server_address[1]}/project"
+
+            sing._SSL_CTX_CACHE.clear()
+            with mock.patch.object(sys, "platform", "darwin"):
+                # 1. Доп. CA-бандл позволяет пройти верификацию против своего сервера
+                ctx_a = sing.build_ssl_context(env={}, ca_bundles=(ca_a,))
+                with urllib.request.urlopen(url_a, timeout=5, context=ctx_a) as resp:
+                    self.assertEqual(resp.status, 200)
+
+                # 2. Недоверенная цепочка по-прежнему отвергается
+                with self.assertRaises(urllib.error.URLError) as cm:
+                    urllib.request.urlopen(url_b, timeout=5, context=ctx_a)
+                self.assertIsInstance(cm.exception.reason, ssl.SSLCertVerificationError)
+
+                # 3. Явный SSL_CERT_FILE не смешивается с ca_bundles
+                ctx_env = sing.build_ssl_context(
+                    env={"SSL_CERT_FILE": ca_b}, ca_bundles=(ca_a,),
+                )
+                with self.assertRaises(urllib.error.URLError) as cm2:
+                    urllib.request.urlopen(url_a, timeout=5, context=ctx_env)
+                self.assertIsInstance(cm2.exception.reason, ssl.SSLCertVerificationError)
+                with urllib.request.urlopen(url_b, timeout=5, context=ctx_env) as resp:
+                    self.assertEqual(resp.status, 200)
+
+            # 4. request() при TLS-ошибке падает сразу без 3 повторов и даёт подсказку
+            s_mod = support.load_sing("sing_tls", api=f"https://127.0.0.1:{srv_a.server_address[1]}")
+            s_mod.get_token = lambda: "stub"
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"SSL_CERT_FILE": ca_b}, clear=False):
+                with contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as ex:
+                        s_mod.request("GET", "/project")
+            self.assertEqual(ex.exception.code, 1)
+            self.assertIn("Сеть недоступна для GET /project", err.getvalue())
+            self.assertIn("TLS-проверка не прошла", err.getvalue())
+            self.assertNotIn("попыток:", err.getvalue())

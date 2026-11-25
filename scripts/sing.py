@@ -25,6 +25,7 @@ import http.client
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import time
@@ -853,6 +854,55 @@ def rate_report():
     return lines
 
 
+# В standalone-сборках Python (uv / python-build-standalone) на macOS OpenSSL по умолчанию
+# читает /private/etc/ssl/cert.pem (~123 CA), где отсутствуют новые корневые сертификаты
+# вроде GlobalSign Root R46, которым подписан api.singularity-app.com. При отсутствии явного
+# SSL_CERT_FILE / SSL_CERT_DIR догружаем актуальный CA-бандл поверх системного, не ослабляя
+# проверку сертификатов (CERT_REQUIRED + check_hostname).
+EXTRA_CA_BUNDLES = (
+    "/opt/homebrew/etc/ca-certificates/cert.pem",
+    "/usr/local/etc/ca-certificates/cert.pem",
+    "/opt/local/share/curl/curl-ca-bundle.crt",
+)
+_SSL_CTX_CACHE = {}
+
+
+def build_ssl_context(env=None, ca_bundles=EXTRA_CA_BUNDLES):
+    """SSLContext с полной проверкой TLS; на macOS догружает актуальный CA-бандл, если не задан env."""
+    env = os.environ if env is None else env
+    cert_file = env.get("SSL_CERT_FILE")
+    cert_dir = env.get("SSL_CERT_DIR")
+    if cert_file or cert_dir:
+        # Явный выбор среды (прокси, sandbox, тест) не перебиваем и не смешиваем с другими бандлами.
+        return ssl.create_default_context(
+            cafile=cert_file or None,
+            capath=cert_dir or None,
+        )
+    key = (sys.platform, tuple(ca_bundles))
+    cached = _SSL_CTX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ctx = ssl.create_default_context()
+    if sys.platform == "darwin":
+        loaded = False
+        for bundle in ca_bundles:
+            if os.path.isfile(bundle):
+                ctx.load_verify_locations(cafile=bundle)
+                loaded = True
+                break
+        if not loaded:
+            try:
+                import certifi
+            except ImportError:
+                pass
+            else:
+                where = certifi.where()
+                if where and os.path.isfile(where):
+                    ctx.load_verify_locations(cafile=where)
+    _SSL_CTX_CACHE[key] = ctx
+    return ctx
+
+
 def request(method, path, query=None, body=None, soft=False):
     """soft=True — вернуть None вместо выхода при HTTP-ошибке."""
     url = API + path
@@ -906,7 +956,9 @@ def request(method, path, query=None, body=None, soft=False):
             rate_pause(bucket)
         rate_spend(bucket)
         try:
-            with urllib.request.urlopen(req, timeout=NET_TIMEOUT) as resp:
+            with urllib.request.urlopen(
+                req, timeout=NET_TIMEOUT, context=build_ssl_context()
+            ) as resp:
                 rate_note(bucket, resp.headers)
                 raw = resp.read().decode()
                 return json.loads(raw) if raw.strip() else {}
@@ -969,16 +1021,21 @@ def request(method, path, query=None, body=None, soft=False):
             # и всего несетевого разом: except OSError проглотил бы и то, что обязано
             # падать. HTTPException же из другой иерархии и HTTPError ему не родня,
             # так что HTTP-ответы по-прежнему разбирает ветка выше.
-            if attempt < net_attempts:
+            reason = getattr(e, "reason", e)     # .reason есть только у URLError
+            if not isinstance(reason, ssl.SSLCertVerificationError) and attempt < net_attempts:
                 pause = NET_BACKOFF * attempt
                 time.sleep(pause)
                 waited += pause
                 continue
             if soft:
                 return None
-            reason = getattr(e, "reason", e)     # .reason есть только у URLError
-            die(f"Сеть недоступна для {method} {path}: {reason}"
-                + (f" (попыток: {attempt})" if attempt > 1 else ""))
+            msg = (f"Сеть недоступна для {method} {path}: {reason}"
+                   + (f" (попыток: {attempt})" if attempt > 1 else ""))
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                msg += ("\n  TLS-проверка не прошла: проверь CA-бандл "
+                        "(brew install ca-certificates), переменную SSL_CERT_FILE "
+                        "или запуск через /usr/bin/python3.")
+            die(msg)
 
 
 PAGE_SIZE = 200          # окно одного запроса
