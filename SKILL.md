@@ -1292,5 +1292,72 @@ complete/uncomplete) и удаляет пробу в том же заходе, �
 форм по живым данным: `tools/db-shapes.py` в репозитории-эталоне, процедура и найденные
 расхождения — в `references/api.md`. База боевая: только чтение.
 
+## Python-модуль
+
+Для пакетной сверки — «колонки × заметки», массовая проверка планов/отчётов —
+читать трекер через модуль, а не парсить текстовый вывод:
+
+```python
+import sys
+sys.path.insert(0, "/Users/s.panchenko/Projects/singularityapp/scripts")
+import sing
+
+cfg = sing.find_config()             # привязка из cwd
+pid = cfg["projectId"]
+tasks = sing.board_tasks(pid)        # сырые task-объекты со всеми полями
+t = tasks[0]
+note = sing.note_to_text(t["note"])  # заметка → строка, как её печатает show
+```
+
+- `live_tasks(pid)` — всё, с чем можно работать (не удалено, не в корзине,
+  не в дневнике); `open_tasks(pid)` — из них без отметки выполнения
+  (`checked=1`); `board_tasks(pid)` = `live_tasks` плюс унесённые в дневник
+  (`journalDate`) — ровно то, что показывает `board`, включая историю
+  «Готово». Удалённое (`removed`/`deleteDate`) и заметки (`isNote`)
+  исключены везде.
+- `column_map(pid)` — `{taskId: statusId}` (роль из привязки, имя — из колонок
+  проекта).
+- `closed_mark(task)` — откуда брать дату «задачу уже закрывали»: момент
+  закрытия трекер не хранит (см. ниже про `complete`).
+
+⚠ **Флаг `complete` в task-объектах — не сигнал закрытия.** На картах, которые
+уже в «Готово», `complete` = 0. Замер 17.11 (волна ai_tools): выборка
+`board_tasks` с фильтром `complete == 0` дала 115 «открытых не датированных»
+карт, из них 100+ уже лежали в «Готово». Замер 19.09 (в `closed_mark`): у всех
+55 закрытых `complete=0`, `completeLast=None`. Состояние закрытия брать из двух
+источников: отметка выполнения — `checked=1` (в `board --json`/`list --json` —
+поле `done`), и позиция — колонка.
+
+**Сверка «колонки × заметки».** `board --json` знает колонки/роли/`start`/
+`notReady`, но не знает заметок (в объекте задачи её нет); `board_tasks` знает
+заметки, но не знает колонок (в task-объекте колонки нет). Сверка — join по id:
+
+```python
+import json, subprocess, sys
+sys.path.insert(0, "/Users/s.panchenko/Projects/singularityapp/scripts")
+import sing
+
+pid = sing.find_config()["projectId"]
+by_id = {t["id"]: t for t in sing.board_tasks(pid)}
+board = json.loads(subprocess.run(
+    [sys.executable,
+     "/Users/s.panchenko/Projects/singularityapp/scripts/sing.py",
+     "board", "--json"], capture_output=True, text=True, check=True).stdout)
+for col in board["columns"]:
+    for row in col["tasks"]:
+        task = by_id[row["id"]]
+        note = sing.note_to_text(task.get("note"))
+        # row["column"] — роль, row["start"] — дата старта,
+        # row["notReady"] — почему пока брать нельзя, row["done"] — отметка
+        ...
+```
+
+Один источник правды на факт: колонка/роль/`start`/`notReady` — только из
+`board --json`, текст заметки — только из `board_tasks` + `note_to_text`.
+`note_to_text` выбрасывает встроенные файлы/картинки — на их месте
+остаются пустые строки (текст соседних операций на месте); для сверки
+текста это правильно, для переписывания заметки на нём не строить
+(операции заметки — `note_ops`).
+
 Справочник по API, формату заметок и подводным камням — `references/api.md`.
 Инструкция для человека (установка, подключение репозитория, команды) — `README.md`.
