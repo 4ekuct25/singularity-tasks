@@ -6,6 +6,23 @@
 > `archive/JOURNAL-2026-11.md`, 2026-11-01 … 2026-11-07, 10 записей) —
 > история не потеряна, ищи там. Порядок записей — сверху новые.
 
+## 2026-11-26 16:29 — Исследование: использование REST API и MCP (запрос из чата)
+
+**Что:** сверка фактического использования `sing.py` с wiki (`<https://singularity-app.com/wiki/api/>`) и живой OpenAPI-схемой (`https://api.singularity-app.com/v2/api-json`); wiki MCP (`<https://singularity-app.com/wiki/mcp/>`) + live-перепроверка OAuth-метаданных MCP-сервера. Только исследование, без правок кода (карточка — задним числом: доска была в 429-окне на `GET /kanban-task-status` 50+ минут, `add`/`board` недоступны).
+
+**Ключевые находки:**
+- Все ~20 пар (метод, путь) `sing.py` есть в официальной схеме; wiki отстаёт от swagger (`GET /kanban-task-status`, `complete`, `batch` — не в wiki).
+- Rate limit официально НЕ задокументирован (ни wiki, ни схема — ни 429, ни rate-заголовков); единственный источник — наши замеры (100/мин, 1000/час на пару (метод, путь без id), окно под нагрузкой до ~7 ч).
+- Новое наблюдение: 429-окно держалось без локальных `sing.py`-процессов и cron при работающем desktop-приложении — счётчик, вероятно, на уровне аккаунта/IP (гипотеза; проверка — в api.md, троттлинг-блок).
+- MCP: сервер переехал на новый OAuth spec (RFC 9728 protected-resource-metadata, DCR `/oauth/register`, CIMD, PKCE S256); grant types и скоупы без изменений; REST-токен 401. Вердикт оценки 2026-09-11 не изменён: не альтернатива (3 блока живы) и не практичный fallback (браузерный OAuth, headless невозможен; троттлинг, судя по окну, на уровне аккаунта).
+
+**Как проверено:** curl + парсинг swagger + `tools/mcp-probe.py` (всё read-only; 2026-11-26 03:00–04:10). Артефакты: `.qwen/tmp/wiki-api.html`, `.qwen/tmp/wiki-mcp.html`, `.qwen/tmp/swagger-v2.json`.
+
+**Попутный фикс гейта:** `tools/audit-secrets.sh` — UUID-проверка краснела на сессийном UUID обязательного `j-sess`-маркера (прецедента в истории нет: маркер до сих пор ни разу не коммитился); добавлено исключение строк-маркеров `j-sess` (тот же класс, что трекеровые id: обязательный локальный идентификатор, не секрет; мотив — как у существующего исключения «гейт, который всегда красный, перестают читать»).
+**Откат:** к коду скилла не применимо (исследование). Документация и `tools/audit-secrets.sh` — `git revert` коммита.
+
+<!-- j-sess: 9224dbd0-c6bf-46a1-8724-bd617cb410e9 -->
+
 ## 2026-11-25 22:59 — TLS в каноническом sing.py под uv/standalone python3 на macOS + порт правки SKILL.md (T-ef81e977)
 **Что:** (1) `scripts/sing.py` — добавлены `EXTRA_CA_BUNDLES` и `build_ssl_context()` (только stdlib `ssl`): при отсутствии `SSL_CERT_FILE` / `SSL_CERT_DIR` на macOS поверх дефолтного хранилища догружается актуальный CA-бандл (Homebrew `/opt/homebrew/etc/ca-certificates/cert.pem`, Intel Homebrew, MacPorts или `certifi`), сохраняя `CERT_REQUIRED` и `check_hostname=True`. При явном `SSL_CERT_FILE`/`SSL_CERT_DIR` внешние бандлы не подмешиваются. На `SSLCertVerificationError` `request()` завершается сразу без 3 сетевых повторов и допечатывает диагностическую подсказку. (2) `SKILL.md` (порт 4 строк 21.11 из `~/.agents/skills/singularity-tasks/SKILL.md` про однократную ссылку на карту + новый пункт TLS в `## Диагностика`) и `README.md` (`## Если что-то не так`). (3) `tests/test_pure.py` — `SslContextTest` (2 теста с локальными TLS-серверами на `127.0.0.1`).
 **Почему:** `uv`-управляемый `~/.local/bin/python3` (CPython 3.13.14) на macOS привязан к `/private/etc/ssl/cert.pem` (123 корневых CA), где отсутствует `GlobalSign Root R46`, которым подписан `api.singularity-app.com` (`GlobalSign GCC R46 AlphaSSL CA 2025`), из-за чего канонический запуск падал с `CERTIFICATE_VERIFY_FAILED: self-signed certificate in certificate chain`, тогда как `/opt/homebrew/etc/ca-certificates/cert.pem` (191 CA), `certifi` и `/usr/bin/python3` цепочке доверяют.
