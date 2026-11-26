@@ -5840,6 +5840,13 @@ def build_parser():
     выполняя команд."""
     p = argparse.ArgumentParser(prog="sing.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Глобальный флаг перед подкомандой — канон `sing.py --agent <имя> <cmd>`
+    # (брифы суб-сессий). Субкомандные --agent объявлены с
+    # default=argparse.SUPPRESS: иначе дефолт None субпарсера затер бы
+    # значение глобального флага (поведение argparse < 3.13).
+    p.add_argument("--agent",
+                   help="имя агента (по умолчанию $SINGULARITY_AGENT); "
+                        "канон — перед подкомандой: sing.py --agent <имя> <cmd>")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("doctor", help="проверить токен и привязку репо")
@@ -5921,13 +5928,14 @@ def build_parser():
     sp.add_argument("--column", default="todo", choices=COLUMN_ORDER)
     sp.add_argument("--group", help="только из секции (название или Q-id)")
     sp.add_argument("--mine", action="store_true", help="только со своим agent-тегом")
-    sp.add_argument("--agent", help="имя агента (по умолчанию $SINGULARITY_AGENT)")
+    sp.add_argument("--agent", default=argparse.SUPPRESS,
+                    help="имя агента (по умолчанию $SINGULARITY_AGENT)")
     sp.add_argument("--project", metavar="ПРОЕКТ", help=PROJECT_REF)
     json_flag(sp)
     sp.set_defaults(fn=cmd_list)
 
     sp = sub.add_parser("whoami", help="под каким тегом работает этот агент")
-    sp.add_argument("--agent")
+    sp.add_argument("--agent", default=argparse.SUPPRESS)
     sp.set_defaults(fn=cmd_whoami)
 
     sp = sub.add_parser("show", help="карточка задачи")
@@ -5942,13 +5950,14 @@ def build_parser():
                     help="осознанно без плана (задача на одно движение)")
     sp.add_argument("--take-over", action="store_true",
                     help="забрать задачу, занятую другим агентом (снимет его метку)")
-    sp.add_argument("--agent", help="имя агента (по умолчанию $SINGULARITY_AGENT)")
+    sp.add_argument("--agent", default=argparse.SUPPRESS,
+                    help="имя агента (по умолчанию $SINGULARITY_AGENT)")
     sp.set_defaults(fn=cmd_start)
 
     sp = sub.add_parser("report", help="дописать отчёт в заметку задачи")
     sp.add_argument("id")
     sp.add_argument("text")
-    sp.add_argument("--agent")
+    sp.add_argument("--agent", default=argparse.SUPPRESS)
     sp.set_defaults(fn=cmd_report)
 
     sp = sub.add_parser("done", help="закрыть задачу (или отправить на проверку)")
@@ -5959,19 +5968,19 @@ def build_parser():
     sp.add_argument("--review", action="store_true", help="в колонку review, не закрывать")
     sp.add_argument("--no-plan", action="store_true",
                     help="закрыть задачу, которую не брали через start")
-    sp.add_argument("--agent")
+    sp.add_argument("--agent", default=argparse.SUPPRESS)
     sp.set_defaults(fn=cmd_done)
 
     sp = sub.add_parser("release", help="вернуть задачу в очередь и снять свой тег")
     sp.add_argument("id")
     sp.add_argument("--report", help="объяснение, почему возвращена")
-    sp.add_argument("--agent")
+    sp.add_argument("--agent", default=argparse.SUPPRESS)
     sp.set_defaults(fn=cmd_release)
 
     sp = sub.add_parser("block", help="пометить задачу заблокированной")
     sp.add_argument("id")
     sp.add_argument("reason")
-    sp.add_argument("--agent")
+    sp.add_argument("--agent", default=argparse.SUPPRESS)
     sp.set_defaults(fn=cmd_block)
 
     sp = sub.add_parser("note-edit",
