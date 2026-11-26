@@ -2129,20 +2129,25 @@ def open_tasks(project_id):
 def column_map(project_id, statuses=None, links=None):
     """taskId -> statusId для проекта.
 
-    Запрос на колонку давал 8 обращений на пятиколоночной доске (`board` — 12
-    запросов, 2.4 с). Без фильтра эндпоинт отдаёт связки всего аккаунта одним
-    заходом (проверено: 46 штук, из них 8 этого проекта), и мы отбираем свои по
-    statusId. ⚠️ `?projectId=` он НЕ поддерживает: возвращает пустой список, а не
-    отказ, — фильтр, которого нет, выглядит как «связок нет».
+    Без фильтра эндпоинт отдаёт связки ВСЕГО аккаунта (замер 26.11: 2870
+    связок = 15 запросов), и мы отбираем свои по statusId. ⚠️ `?projectId=` он
+    НЕ поддерживает: возвращает пустой список, а не отказ, — фильтр, которого
+    нет, выглядит как «связок нет». С 26.11 вместо этого — `statusId.in` по id
+    колонок проекта (замер live: 77 связок за 1 запрос, совпадение с полным
+    сканом точное; проба .qwen/tmp/probe-statusid-result.txt). Мёртвые связки
+    этим фильтром невидимы (их statusId не в живых колонках) — на них
+    dead_link_check() по задачам без живой связки.
 
     statuses/links — уже полученные колонки проекта и связки аккаунта. Раз
     связки общие на аккаунт, команде, обходящей несколько проектов (`ready`),
     незачем тянуть их заново на каждый: один запрос вместо N.
     """
     statuses = project_statuses(project_id) if statuses is None else statuses
-    links = (paged("/kanban-task-status", "kanbanTaskStatuses", {})
-             if links is None else links)
     mine = {s["id"] for s in statuses}
+    if links is None:
+        links = ([] if not mine else paged(
+            "/kanban-task-status", "kanbanTaskStatuses",
+            {"statusId.in": ",".join(sorted(mine))}))
     return {link["taskId"]: link["statusId"]
             for link in links
             if not link.get("removed") and link.get("statusId") in mine}
@@ -2169,6 +2174,26 @@ def dead_board_links(links, own_status_ids):
             for l in links
             if not l.get("removed") and l.get("statusId") not in own
             and l.get("id") == f"KTS-{l['taskId']}"}
+
+
+def dead_link_check(tasks, cmap, own_status_ids):
+    """dead_board_links поверх ФИЛЬТРОВАННОГО скана (statusId.in), 26.11.
+
+    Фильтр по живым колонкам не видит мёртвых связок — их statusId в живых
+    колонках нет, и в отфильтрованный ответ они не попадают. Канбан-связка
+    имеет детерминированный id `KTS-<taskId>`, поэтому подозрительных — задачи
+    без живой связки в cmap — проверяем поимённо: ОДИН запрос `taskId.in` на
+    всех (замер live 26.11: отвечает 200 со связками перечисленных задач,
+    на несуществующем id — пусто; TODAY-связки отсекает id-паттерн
+    dead_board_links). Бывает, что таких задач нет вообще — тогда запросов
+    ноль.
+    """
+    missing = [t["id"] for t in tasks if t["id"] not in cmap]
+    if not missing:
+        return {}
+    links = paged("/kanban-task-status", "kanbanTaskStatuses",
+                  {"taskId.in": ",".join(missing)})
+    return dead_board_links(links, own_status_ids)
 
 
 # Голый `T-...` человеку бесполезен: открыть его нечем. Форматов два, оба
@@ -3532,10 +3557,13 @@ def cmd_board(args):
     cfg, _ = command_config(args)
     statuses_list = project_statuses(cfg["projectId"])
     statuses = {s["id"]: s["name"] for s in statuses_list}
-    links = paged("/kanban-task-status", "kanbanTaskStatuses", {})
-    cmap = column_map(cfg["projectId"], statuses=statuses_list, links=links)
-    dead = dead_board_links(links, {s["id"] for s in statuses_list})
     tasks = board_tasks(cfg["projectId"])
+    # Project-scoped скан (26.11): statusId.in вместо всего аккаунта — 15
+    # запросов свелось к 1. Мёртвые связки в фильтре невидимы: поимённый
+    # dead-check по задачам без живой связки (T-ec4c39e1), диагностический
+    # полный скан остался в doctor.
+    cmap = column_map(cfg["projectId"], statuses=statuses_list)
+    dead = dead_link_check(tasks, cmap, {s["id"] for s in statuses_list})
     by_col = {}
     for t in tasks:
         by_col.setdefault(effective_column(t, cmap, cfg, dead), []).append(t)
@@ -3814,12 +3842,13 @@ def _pick_pool(cfg, role, include_done=False, group=None, ready_only=False,
     """
     cid = col_id(cfg, role)
     statuses = project_statuses(cfg["projectId"])
-    links = paged("/kanban-task-status", "kanbanTaskStatuses", {})
-    cmap = column_map(cfg["projectId"], statuses=statuses, links=links)
-    # Связки на мёртвые колонки из очереди исключаются, а не падают в «Новые»
-    # (T-ec4c39e1): без этой карты effective_column принял бы их за «связки нет».
-    dead = dead_board_links(links, {s["id"] for s in statuses})
     source = board_tasks(cfg["projectId"]) if include_done else open_tasks(cfg["projectId"])
+    # Project-scoped скан (26.11): statusId.in вместо всего аккаунта (15
+    # запросов → 1). Связки на мёртвые колонки из очереди исключаются, а не
+    # падают в «Новые» (T-ec4c39e1): в фильтре они невидимы, поэтому —
+    # поимённый dead-check по задачам без живой связки, один запрос taskId.in.
+    cmap = column_map(cfg["projectId"], statuses=statuses)
+    dead = dead_link_check(source, cmap, {s["id"] for s in statuses})
     gid = resolve_group(cfg["projectId"], group) if group else None
     return pool_from(source, cmap, cfg, cid, gid=gid, ready_only=ready_only,
                      reasons=reasons, children=children, dead=dead)
