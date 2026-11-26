@@ -1064,7 +1064,7 @@ OAuth-сессии») подтверждена, а не унаследована
   `~/.qwen/mcp-oauth-tokens.json` (plaintext, 0600; по умолчанию без шифрования);
   после согласия `qwen mcp list` — `singularity: Connected`. Выдал ли сервер
   `refresh_token` — не проверено (содержимое файла токена не аудировалось).
-- **`tools/list` — 54 инструмента.** CRUD сущностей один в один с REST v2:
+- **`tools/list` — 52 инструмента (23 read / 29 write).** CRUD сущностей один в один с REST v2:
   `project_*`, `task_*` (включая `task_list_today`/`task_list_overdue`/
   `task_list_inbox`/`task_change_column`), `kanban_status_*`, `tag_*`,
   `checklist_item_*`, `habit_*` (+`habit_progress_*`), `time_stat_*`, плюс
