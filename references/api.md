@@ -1064,7 +1064,7 @@ OAuth-сессии») подтверждена, а не унаследована
   `~/.qwen/mcp-oauth-tokens.json` (plaintext, 0600; по умолчанию без шифрования);
   после согласия `qwen mcp list` — `singularity: Connected`. Выдал ли сервер
   `refresh_token` — не проверено (содержимое файла токена не аудировалось).
-- **`tools/list` — 52 инструмента (23 read / 29 write).** CRUD сущностей один в один с REST v2:
+- **`tools/list` — 52 инструмента (22 read / 30 write).** CRUD сущностей один в один с REST v2:
   `project_*`, `task_*` (включая `task_list_today`/`task_list_overdue`/
   `task_list_inbox`/`task_change_column`), `kanban_status_*`, `tag_*`,
   `checklist_item_*`, `habit_*` (+`habit_progress_*`), `time_stat_*`, плюс
@@ -1082,10 +1082,10 @@ OAuth-сессии») подтверждена, а не унаследована
   `group`/`checked`/`priority`/`state`/`tags`/`start`/`deadline`/…; нет
   `statusId.in`/`taskId.in`, нет sparse-полей, `maxCount ≤ 1000`.
 - **Риск:** write-инструменты (`task_create`/`task_update`/`task_complete`/
-  `task_change_column`, `project_archive`, …) видны ЛЮБОЙ сессии ЛЮБОГО проекта
-  машины без дисциплины skill (карточки, перечитывание, rate). При сохранении
-  подключения сужать `excludeTools` на все мутающие инструменты; решение —
-  за пользователем.
+  `task_change_column`, `project_archive`, …) без дисциплины skill (карточки,
+  перечитывание, rate) — обход `assert_allowed()` (§ AGENTS.md 3). **Применено
+  (2026-11-26, решение пользователя):** в `~/.qwen/settings.json` у сервера
+  `excludeTools` на все 30 write-инструментов — подключение read-only.
 
 **Пересмотреть, если** вендор добавит `client_credentials`/device-flow (снимет п. 2) **и**
 скоуп или настройку с ограничением по проекту (снимет п. 3). Проверяется повторным
